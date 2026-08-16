@@ -1,0 +1,236 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..900,0..100&family=JetBrains+Mono:wght@400;500;700&family=Instrument+Serif:ital@0;1&display=swap');
+@import url('https://api.fontshare.com/v2/css?f[]=satoshi@900,700,500,400&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Legenddary's SparkPrep — Brand Tokens */
+:root {
+  /* Primary — matte black + real gold */
+  --ink-black: #0A0A0A;
+  --matte-black: #0A0A0A;
+  --brand-gold: #D4AF37;
+  --brand-gold-deep: #B8933E;
+  --brand-gold-hi: #E5C158;
+  /* Secondary pop (used sparingly — 99¢ audit + season campaign) */
+  --spark-orange: #FF6A00;
+  /* Paper / surfaces */
+  --paper-white: #F7F7F5;
+  --slate-gray: #3A3F47;
+  --electric-blue: #007BFF;
+  --crimson-proof: #C62828;
+
+  /* Semantic mappings */
+  --bg-marketing: var(--matte-black);
+  --surface-marketing: #131313;
+  --border-marketing: #262421;
+  --text-primary-dark: #FAFAFA;
+  --text-secondary-dark: #8A8580;
+
+  --bg-app: var(--paper-white);
+  --surface-app: #FFFFFF;
+  --canvas-app: #EDEDE9;
+  --border-app: #D6D6D0;
+
+  /* Overlay colors — keep CMYK-inspired for print visibility */
+  --overlay-bleed: #007BFF;
+  --overlay-trim: #D4AF37;
+  --overlay-safe: #E5C158;
+  --overlay-barcode: #22C55E;
+
+  --dpi-pass: #16A34A;
+  --dpi-warn: #D4AF37;
+  --dpi-fail: #C62828;
+}
+
+@layer base {
+  :root {
+    --background: 60 8% 97%;
+    --foreground: 0 0% 5%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 5%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 5%;
+    --primary: 0 0% 5%;
+    --primary-foreground: 60 8% 97%;
+    --secondary: 60 6% 92%;
+    --secondary-foreground: 0 0% 5%;
+    --muted: 60 6% 92%;
+    --muted-foreground: 218 8% 44%;
+    --accent: 24 100% 50%;
+    --accent-foreground: 0 0% 5%;
+    --destructive: 0 66% 46%;
+    --destructive-foreground: 60 8% 97%;
+    --border: 60 4% 84%;
+    --input: 60 4% 84%;
+    --ring: 24 100% 50%;
+    --radius: 0.25rem;
+  }
+  * { @apply border-border; }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Satoshi', 'Helvetica', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+.font-display {
+  font-family: 'Fraunces', 'Instrument Serif', 'Times New Roman', serif;
+  font-optical-sizing: auto;
+  letter-spacing: -0.025em;
+  font-variation-settings: "SOFT" 30, "opsz" 144;
+}
+.font-serif-alt {
+  font-family: 'Instrument Serif', 'Fraunces', 'Times New Roman', serif;
+  letter-spacing: -0.01em;
+}
+.font-mono-spec { font-family: 'JetBrains Mono', monospace; letter-spacing: 0.05em; }
+
+/* Marketing theme */
+.marketing {
+  background-color: var(--bg-marketing);
+  color: var(--text-primary-dark);
+}
+.marketing-surface {
+  background-color: var(--surface-marketing);
+  border: 1px solid var(--border-marketing);
+}
+
+/* Brand utilities */
+.text-spark { color: var(--spark-orange); }
+.bg-spark { background-color: var(--spark-orange); }
+.border-spark { border-color: var(--spark-orange); }
+.text-gold { color: var(--brand-gold); }
+.bg-gold { background-color: var(--brand-gold); }
+.border-gold { border-color: var(--brand-gold); }
+.bg-ink { background-color: var(--matte-black); }
+.text-ink { color: var(--matte-black); }
+
+/* Noise texture */
+.noise-overlay { position: relative; }
+.noise-overlay::before {
+  content: '';
+  position: absolute; inset: 0;
+  pointer-events: none;
+  opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* Editor canvas dot grid */
+.dot-grid {
+  background-image: radial-gradient(circle, #B8B8B0 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* Compliance pill */
+.pill-pass { background: rgba(22,163,74,0.1); color: #15803D; border: 1px solid rgba(22,163,74,0.3); }
+.pill-warn { background: rgba(212,168,87,0.14); color: #92700A; border: 1px solid rgba(212,168,87,0.4); }
+.pill-fail { background: rgba(198,40,40,0.1); color: #B91C1C; border: 1px solid rgba(198,40,40,0.35); }
+
+/* Overlays */
+.overlay-bleed { border: 2px solid var(--overlay-bleed); }
+.overlay-trim { border: 2px dashed var(--overlay-trim); }
+.overlay-safe { border: 2px dotted var(--overlay-safe); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 4px; }
+.marketing ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); }
+
+.btn-industrial {
+  position: relative;
+  border-radius: 2px;
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.15s ease;
+}
+.btn-industrial:active { transform: translateY(1px); }
+
+/* Bright Spark button (Orange — reserved for 99¢ Audit / Season campaign) */
+.btn-spark {
+  background: var(--spark-orange);
+  color: #FFFFFF;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  transition: filter 0.2s ease, transform 0.15s ease;
+}
+.btn-spark:hover { filter: brightness(1.08); }
+.btn-spark:active { transform: translateY(1px); }
+.btn-spark:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Gold button — CORE brand primary (matte black + real gold) */
+.btn-gold {
+  background: linear-gradient(180deg, var(--brand-gold-hi) 0%, var(--brand-gold) 55%, var(--brand-gold-deep) 100%);
+  color: var(--matte-black);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  border: 1px solid var(--brand-gold-deep);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 1px 0 rgba(0,0,0,0.35);
+  transition: filter 0.2s ease, transform 0.15s ease, box-shadow 0.2s ease;
+}
+.btn-gold:hover { filter: brightness(1.06); }
+.btn-gold:active { transform: translateY(1px); box-shadow: inset 0 1px 3px rgba(0,0,0,0.3); }
+.btn-gold:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Gold outline variant */
+.btn-gold-outline {
+  background: transparent;
+  color: var(--brand-gold);
+  border: 1.5px solid var(--brand-gold);
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+.btn-gold-outline:hover { background: rgba(212,175,55,0.1); }
+
+/* Section header pill */
+.section-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.6rem;
+  background: var(--ink-black);
+  color: var(--paper-white);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+/* Grid lines for hero (removed — was creating visible squares) */
+.grid-lines {
+  background-image: none;
+}
+
+/* Book 3D flat mockup (legacy) */
+.book-mockup {
+  transform: perspective(1200px) rotateY(-22deg) rotateX(4deg);
+  box-shadow: 24px 30px 60px rgba(0,0,0,0.4), 2px 0 0 rgba(0,0,0,0.2) inset;
+  transition: transform 0.4s ease;
+}
+
+/* Slider (native) restyle */
+input[type=range].spark-range {
+  -webkit-appearance: none;
+  height: 3px;
+  background: #D6D6D0;
+  outline: none;
+  border-radius: 2px;
+}
+input[type=range].spark-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: var(--brand-gold);
+  cursor: pointer;
+  border-radius: 999px;
+  box-shadow: 0 0 0 2px #fff;
+}
+input[type=range].spark-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: var(--brand-gold);
+  cursor: pointer;
+  border-radius: 999px;
+  border: 2px solid #fff;
+}

@@ -1,0 +1,39 @@
+# Secrets and local environment
+.env
+.env.*
+*.env
+backend/.env
+frontend/.env
+frontend/.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+backend/.venv/
+backend/.venv-1/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+dist/
+build/
+coverage/
+
+# Logs and local junk
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+
+# Archives and generated bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Stray local worktree/cache folders
+*.worktrees/
+legenddary-spark-prep.worktrees/

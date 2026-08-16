@@ -1,0 +1,38 @@
+.git
+.gitignore
+.dockerignore
+
+# Secrets and local environment
+.env
+.env.*
+*.env
+backend/.env
+frontend/.env
+frontend/.env.*
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+backend/.venv/
+backend/.venv-1/
+
+# Local runtime data
+backend/uploads/
+backend/exports/
+
+# Frontend dependencies and build output
+node_modules/
+frontend/node_modules/
+dist/
+build/
+coverage/
+
+# Archives, logs, and local-only folders
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.log
+legenddary-spark-prep.worktrees/
