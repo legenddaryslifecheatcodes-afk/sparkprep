@@ -115,3 +115,86 @@ def generate_audit_report_pdf(
 
     doc.build(story)
     return output_path
+
+
+def generate_audit_brief_pdf(
+    findings: list,
+    summary: dict,
+    project_meta: dict,
+    output_path: str,
+) -> str:
+    """Writes a condensed, one-page PDF audit brief and returns the output
+    path. This is the $0.99 unlock artifact -- summary table plus a
+    severity+title-only findings list, no why_it_fails/publisher_rule/
+    fix_steps detail (that level of depth is reserved for the full report).
+    """
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("BriefTitle", parent=styles["Title"], fontSize=18, spaceAfter=4)
+    body_style = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=14)
+    small_style = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, textColor=colors.grey)
+    finding_line_style = ParagraphStyle("FindingLine", parent=styles["BodyText"], fontSize=10, leading=15, spaceAfter=3)
+
+    doc = SimpleDocTemplate(
+        output_path, pagesize=letter,
+        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
+        leftMargin=0.75 * inch, rightMargin=0.75 * inch,
+    )
+    story = []
+
+    story.append(Paragraph("SparkPrep Audit Brief", title_style))
+    story.append(Paragraph(
+        f"{project_meta.get('title', 'Untitled project')} — "
+        f"{project_meta.get('platform', 'Unknown platform')} — "
+        f"{project_meta.get('trim_size', 'Unknown trim size')}",
+        body_style,
+    ))
+    story.append(Paragraph(
+        f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        small_style,
+    ))
+    story.append(Spacer(1, 0.2 * inch))
+
+    risk = summary.get("rejection_risk", "unknown")
+    risk_color = {"high": _SEVERITY_COLOR["fail"], "medium": _SEVERITY_COLOR["warning"],
+                  "low": _SEVERITY_COLOR["warning"], "minimal": _SEVERITY_COLOR["pass"]}.get(risk, colors.grey)
+    summary_data = [
+        ["Critical failures", "Warnings", "Est. fix time", "Rejection risk"],
+        [
+            str(summary.get("critical_failures", 0)),
+            str(summary.get("warnings", 0)),
+            f"{summary.get('estimated_fix_minutes', 0)} min",
+            risk.upper(),
+        ],
+    ]
+    summary_table = Table(summary_data, colWidths=[1.6 * inch] * 4)
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1efe8")),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("TEXTCOLOR", (3, 1), (3, 1), risk_color),
+        ("FONTNAME", (3, 1), (3, 1), "Helvetica-Bold"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 0.25 * inch))
+
+    order = {"fail": 0, "warning": 1, "pass": 2}
+    sorted_findings = sorted(findings, key=lambda f: order.get(f.get("severity"), 3))
+
+    if not sorted_findings:
+        story.append(Paragraph("No issues found. This file is ready for print submission.", body_style))
+    else:
+        story.append(Paragraph("Issues found (upgrade for full fix instructions):", body_style))
+        story.append(Spacer(1, 0.1 * inch))
+        for f in sorted_findings:
+            severity = f.get("severity", "warning")
+            color = _SEVERITY_COLOR.get(severity, colors.grey)
+            badge = f'<font color="{color.hexval()}">[{severity.upper()}]</font>'
+            story.append(Paragraph(f"{badge} {f.get('title', 'Untitled finding')}", finding_line_style))
+
+    doc.build(story)
+    return output_path

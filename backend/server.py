@@ -57,7 +57,7 @@ from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
 from pdfx_validator import run_pdf_structure_audit
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
-from report_export import generate_audit_report_pdf
+from report_export import generate_audit_report_pdf, generate_audit_brief_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
 from manuscript_composer import compose_manuscript_pdf, list_templates as list_manuscript_templates, TEMPLATES as MANUSCRIPT_TEMPLATES
@@ -203,12 +203,13 @@ TIERS = {
     "author": {
         "name": "Author",
         "books_per_month": 1,
-        "monthly_exports": 15,
+        "monthly_exports": 8,
         "max_file_mb": 100,
         "price_cents": 1999,
+        "price_cents_annual": 19999,
         "features": [
             "1 full book / month (cover + spine + back + interior)",
-            "15 print-ready exports / month",
+            "8 print-ready exports / month",
             "Uploads up to 100 MB",
             "All distributor templates",
             "AI Blurb Writer",
@@ -217,12 +218,13 @@ TIERS = {
     "creator_pro": {
         "name": "Creator Pro",
         "books_per_month": 3,
-        "monthly_exports": 45,
+        "monthly_exports": 24,
         "max_file_mb": 250,
         "price_cents": 3999,
+        "price_cents_annual": 39999,
         "features": [
             "3 full books / month",
-            "45 exports / month",
+            "24 exports / month",
             "Uploads up to 250 MB",
             "Priority AI blurb + 3D mockup",
             "All distributor templates",
@@ -231,13 +233,14 @@ TIERS = {
     },
     "publisher": {
         "name": "Publisher",
-        "books_per_month": 5,
-        "monthly_exports": 100,
+        "books_per_month": 7,
+        "monthly_exports": 56,
         "max_file_mb": 500,
-        "price_cents": 9900,
+        "price_cents": 6999,
+        "price_cents_annual": 69999,
         "features": [
-            "5 full books / month",
-            "100 exports / month",
+            "7 full books / month",
+            "56 exports / month",
             "Team seats (up to 3)",
             "Uploads up to 500 MB",
             "Bulk audit + batch export",
@@ -246,13 +249,14 @@ TIERS = {
     },
     "studio": {
         "name": "Studio",
-        "books_per_month": 15,
-        "monthly_exports": 300,
+        "books_per_month": 30,
+        "monthly_exports": 240,
         "max_file_mb": 1024,
-        "price_cents": 24900,
+        "price_cents": 19999,
+        "price_cents_annual": 199999,
         "features": [
-            "15 full books / month",
-            "300 exports / month",
+            "30 full books / month",
+            "240 exports / month",
             "Team seats (up to 10)",
             "Uploads up to 1 GB",
             "Advanced color profiles + white-label",
@@ -1552,7 +1556,7 @@ async def audit_download_report(audit_id: str):
         raise HTTPException(402, "Unlock the full report ($0.99) to download the PDF.")
 
     report_path = UPLOAD_DIR.parent / "exports" / f"{audit_id}_report.pdf"
-    generate_audit_report_pdf(
+    generate_audit_brief_pdf(
         findings=a["full_findings"],
         summary=a.get("summary") or {},
         project_meta={
