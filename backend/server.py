@@ -1866,7 +1866,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=[
-        os.environ.get("FRONTEND_URL", "*"),
+        os.environ.get("FRONTEND_URL", "https://sparkprep.legenddary.com"),
+        "https://sparkprepfinal.pages.dev",
         "https://sparkprep-print.preview.emergentagent.com",
         "http://localhost:3000",
     ],
