@@ -5,7 +5,6 @@ import Landing from "@/pages/Landing";
 import Login from "@/pages/Login";
 import Register from "@/pages/Register";
 import Pricing from "@/pages/Pricing";
-import Templates from "@/pages/Templates";
 import AuditLanding from "@/pages/AuditLanding";
 import AuditPreview from "@/pages/AuditPreview";
 import AuditReport from "@/pages/AuditReport";
@@ -43,7 +42,6 @@ export default function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
           <Route path="/pricing" element={<Pricing />} />
-          <Route path="/templates" element={<Templates />} />
           <Route path="/audit" element={<AuditLanding />} />
           <Route path="/audit/:id/preview" element={<AuditPreview />} />
           <Route path="/audit/:id/report" element={<AuditReport />} />

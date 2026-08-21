@@ -150,7 +150,14 @@ export default function Editor() {
     try {
       const { data } = await api.post(`/projects/${id}/autofix`);
       setProject((p) => ({ ...p, file_metadata: data.file_metadata, compliance: data.compliance }));
-      toast.success("Auto-Fix complete: CMYK + 300 DPI + flattened");
+      // Only claim success when the fix actually resolved everything it
+      // attempted -- ghostscript_fix is only present when a gs-level fix
+      // (transparency/layers/PDF-X1a declaration) was needed at all.
+      if (data.ghostscript_fix && !data.ghostscript_fix.succeeded) {
+        toast.warning("Autofix attempted. Manual correction required.");
+      } else {
+        toast.success("Auto-Fix complete: CMYK + 300 DPI + flattened");
+      }
     } catch (e) { toast.error(fmtErr(e.response?.data?.detail)); }
     finally { setFixing(false); }
   };

@@ -203,13 +203,13 @@ TIERS = {
     "author": {
         "name": "Author",
         "books_per_month": 1,
-        "monthly_exports": 8,
+        "monthly_exports": 15,
         "max_file_mb": 100,
         "price_cents": 1999,
         "price_cents_annual": 19999,
         "features": [
             "1 full book / month (cover + spine + back + interior)",
-            "8 print-ready exports / month",
+            "15 print-ready exports / month",
             "Uploads up to 100 MB",
             "All distributor templates",
             "AI Blurb Writer",
@@ -218,13 +218,13 @@ TIERS = {
     "creator_pro": {
         "name": "Creator Pro",
         "books_per_month": 3,
-        "monthly_exports": 24,
+        "monthly_exports": 45,
         "max_file_mb": 250,
         "price_cents": 3999,
         "price_cents_annual": 39999,
         "features": [
             "3 full books / month",
-            "24 exports / month",
+            "45 exports / month",
             "Uploads up to 250 MB",
             "Priority AI blurb + 3D mockup",
             "All distributor templates",
@@ -234,13 +234,13 @@ TIERS = {
     "publisher": {
         "name": "Publisher",
         "books_per_month": 7,
-        "monthly_exports": 56,
+        "monthly_exports": 100,
         "max_file_mb": 500,
         "price_cents": 6999,
         "price_cents_annual": 69999,
         "features": [
             "7 full books / month",
-            "56 exports / month",
+            "100 exports / month",
             "Team seats (up to 3)",
             "Uploads up to 500 MB",
             "Bulk audit + batch export",
@@ -250,13 +250,13 @@ TIERS = {
     "studio": {
         "name": "Studio",
         "books_per_month": 30,
-        "monthly_exports": 240,
+        "monthly_exports": 300,
         "max_file_mb": 1024,
         "price_cents": 19999,
         "price_cents_annual": 199999,
         "features": [
             "30 full books / month",
-            "240 exports / month",
+            "300 exports / month",
             "Team seats (up to 10)",
             "Uploads up to 1 GB",
             "Advanced color profiles + white-label",
@@ -866,6 +866,117 @@ async def download_export(project_id: str, export_name: str, request: Request):
     return FileResponse(str(fp), media_type="application/pdf", filename=f"sparkprep_{export_name}")
 
 
+# ---- Advanced Interior Check (one-time paid add-on, distinct from the
+# $0.99 anonymous Print Failure Audit) ----
+ADVANCED_INTERIOR_PRICE_CENTS = {
+    "free": 4999,
+    "author": 3999,
+    "creator_pro": 3499,
+    "publisher": 2999,
+    "studio": 2999,
+}
+ADVANCED_INTERIOR_MAX_PAGES = 300
+
+
+class InteriorCheckCheckoutIn(BaseModel):
+    origin_url: str
+
+
+@api_router.post("/projects/{project_id}/interior-check/checkout")
+async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckoutIn, user: dict = Depends(get_current_user)):
+    """One-time purchase for a full structural interior check, up to
+    ADVANCED_INTERIOR_MAX_PAGES pages. Priced by the buyer's current
+    subscription tier. This is a one-time purchase, not a lifetime license --
+    it unlocks full findings for this project's current interior file only,
+    and is intentionally separate from the $0.99 anonymous audit flow.
+    """
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    if p.get("project_type") != "interior":
+        raise HTTPException(400, "Advanced Interior Check only applies to interior projects")
+    if not p.get("uploaded_file"):
+        raise HTTPException(404, "No interior file uploaded yet")
+    if (p.get("page_count") or 0) > ADVANCED_INTERIOR_MAX_PAGES:
+        raise HTTPException(400, f"Advanced Interior Check supports up to {ADVANCED_INTERIOR_MAX_PAGES} pages")
+
+    tier = user.get("tier", "free")
+    price_cents = ADVANCED_INTERIOR_PRICE_CENTS.get(tier, ADVANCED_INTERIOR_PRICE_CENTS["free"])
+    if not stripe.api_key or stripe.api_key in ("sk_test_emergent", ""):
+        raise HTTPException(503, "Payments not configured — Stripe key missing")
+    origin = payload.origin_url.rstrip("/")
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": "SparkPrep Advanced Interior Check",
+                        "description": f"Full structural interior check, up to {ADVANCED_INTERIOR_MAX_PAGES} pages. One-time purchase, not a lifetime license.",
+                    },
+                    "unit_amount": price_cents,
+                },
+                "quantity": 1,
+            }],
+            success_url=f"{origin}/editor/{project_id}?interior_check_session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{origin}/editor/{project_id}",
+            metadata={"project_id": project_id, "user_id": user["id"], "purpose": "advanced_interior_check"},
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(500, f"Stripe error: {e}")
+
+    await db.interior_checks.insert_one({
+        "project_id": project_id,
+        "user_id": user["id"],
+        "session_id": session.id,
+        "price_cents": price_cents,
+        "tier_at_purchase": tier,
+        "paid": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await db.payment_transactions.insert_one({
+        "session_id": session.id,
+        "project_id": project_id,
+        "user_id": user["id"],
+        "amount": price_cents,
+        "currency": "usd",
+        "status": "initiated",
+        "payment_status": "pending",
+        "product": "advanced_interior_check",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"checkout_url": session.url, "session_id": session.id}
+
+
+@api_router.get("/projects/{project_id}/interior-check/verify")
+async def interior_check_verify(project_id: str, session_id: str, user: dict = Depends(get_current_user)):
+    check = await db.interior_checks.find_one({"project_id": project_id, "session_id": session_id, "user_id": user["id"]})
+    if not check:
+        raise HTTPException(404, "Interior check purchase not found")
+    if not check.get("paid"):
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+        except stripe.error.StripeError as e:
+            raise HTTPException(500, f"Stripe error: {e}")
+        if session.payment_status == "paid":
+            await db.interior_checks.update_one({"_id": check["_id"]}, {"$set": {"paid": True}})
+            check["paid"] = True
+    if not check.get("paid"):
+        return {"paid": False}
+
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p or not p.get("uploaded_file"):
+        raise HTTPException(404, "Interior file not found")
+    file_path = UPLOAD_DIR / p["uploaded_file"]
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    findings = []
+    if p.get("file_metadata", {}).get("is_pdf"):
+        findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"))
+    return {"paid": True, "findings": findings}
+
+
 # ---- Stripe Payments ----
 @api_router.post("/payments/checkout")
 async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_user)):
@@ -1129,6 +1240,11 @@ class ComposeIn(BaseModel):
 
 @api_router.post("/manuscript/compose")
 async def manuscript_compose(payload: ComposeIn, user: dict = Depends(get_current_user)):
+    # Free tier gets audit/testing only -- composing a full interior PDF is a
+    # production deliverable, so it must not be free (matches the same rule
+    # already enforced on /export).
+    if user.get("tier", "free") == "free" and not user.get("beta_active"):
+        raise HTTPException(402, "Interior composition isn't included in the Free plan. Upgrade to Author or higher.")
     if payload.template not in MANUSCRIPT_TEMPLATES:
         raise HTTPException(400, "Unknown template")
     if payload.trim_size not in TRIM_SIZES:

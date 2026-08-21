@@ -61,9 +61,9 @@ const TIERS = [
     key: "publisher",
     name: "Publisher",
     tag: "For small imprints",
-    price: 99,
-    price_label: "$99",
-    books: "5 full books / month",
+    price: 69.99,
+    price_label: "$69.99",
+    books: "7 full books / month",
     features: [
       "Everything in Creator Pro",
       "100 exports / month",
@@ -78,9 +78,9 @@ const TIERS = [
     key: "studio",
     name: "Studio",
     tag: "For prepress studios",
-    price: 249,
-    price_label: "$249",
-    books: "15 full books / month",
+    price: 199.99,
+    price_label: "$199.99",
+    books: "30 full books / month",
     gold: true,
     features: [
       "Everything in Publisher",
@@ -216,8 +216,8 @@ export default function Pricing() {
               { books: "0", best: "Trying it out" },
               { books: "1 /mo", best: "New author with 1 title" },
               { books: "3 /mo", best: "Author with a series or trilogy" },
-              { books: "5 /mo", best: "Small imprint or ghost-writer" },
-              { books: "15 /mo", best: "Prepress studio / packager" },
+              { books: "7 /mo", best: "Small imprint or ghost-writer" },
+              { books: "30 /mo", best: "Prepress studio / packager" },
             ].map((row, i) => (
               <div key={i} className="border border-neutral-800 p-3">
                 <div className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">Books</div>

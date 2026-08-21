@@ -28,7 +28,6 @@ export default function Nav({ dark = true }) {
           <Link to="/audit" className="font-mono-spec text-[10px] tracking-widest uppercase text-white bg-[#FF6A00] px-2.5 py-1.5 hover:brightness-110 btn-industrial" data-testid="nav-audit">
             99¢ Audit
           </Link>
-          <Link to="/templates" className={linkCls} data-testid="nav-templates">Specs</Link>
           <Link to="/pricing" className={linkCls} data-testid="nav-pricing">Pricing</Link>
           {user ? (
             <>

@@ -6,7 +6,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { api, fmtErr } from "@/lib/api";
 import { toast } from "sonner";
 
-export default function NewProjectDialog({ open, onOpenChange, onCreated, preset }) {
+export default function NewProjectDialog({ open, onOpenChange, onCreated }) {
   const [specs, setSpecs] = useState(null);
   const [form, setForm] = useState({
     name: "Untitled Book", platform: "kdp", trim_size: "6x9",
@@ -17,18 +17,7 @@ export default function NewProjectDialog({ open, onOpenChange, onCreated, preset
   useEffect(() => {
     if (!open) return;
     api.get("/specs").then(({ data }) => setSpecs(data)).catch(() => {});
-    if (preset) {
-      setForm((f) => ({
-        ...f,
-        name: preset.name || f.name,
-        platform: preset.platform || f.platform,
-        trim_size: preset.trim || f.trim_size,
-        paper_type: preset.paper || f.paper_type,
-        binding: preset.binding || f.binding,
-        page_count: preset.pages || f.page_count,
-      }));
-    }
-  }, [open, preset]);
+  }, [open]);
 
   const submit = async () => {
     setBusy(true);

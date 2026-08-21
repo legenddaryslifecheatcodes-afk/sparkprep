@@ -5,7 +5,6 @@ import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import Nav from "@/components/Nav";
 import NewProjectDialog from "@/components/NewProjectDialog";
-import TemplateReader from "@/components/TemplateReader";
 import BrandWatermark from "@/components/BrandWatermark";
 import { Plus, FileText, Trash2 } from "lucide-react";
 
@@ -14,7 +13,6 @@ export default function Dashboard() {
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(false);
-  const [preset, setPreset] = useState(null);
   const nav = useNavigate();
 
   const load = async () => {
@@ -26,18 +24,7 @@ export default function Dashboard() {
     finally { setLoading(false); }
   };
 
-  useEffect(() => {
-    load();
-    // Auto-open dialog if arriving from public templates page with a preset
-    try {
-      const stored = sessionStorage.getItem("sp_preset");
-      if (stored) {
-        setPreset(JSON.parse(stored));
-        setOpen(true);
-        sessionStorage.removeItem("sp_preset");
-      }
-    } catch {}
-  }, []);
+  useEffect(() => { load(); }, []);
 
   const remove = async (id) => {
     if (!window.confirm("Delete this project?")) return;
@@ -53,26 +40,21 @@ export default function Dashboard() {
   const limits = { free: 3, author: 15, creator_pro: 45, publisher: 100, studio: 300 };
   const limit = limits[tier] || 3;
   const booksUsed = user?.books_this_month ?? 0;
-  const bookLimits = { free: 0, author: 1, creator_pro: 3, publisher: 5, studio: 15 };
+  const bookLimits = { free: 0, author: 1, creator_pro: 3, publisher: 7, studio: 30 };
   const bookLimit = bookLimits[tier] ?? 0;
 
   return (
     <div className="min-h-screen bg-[#F7F7F9]">
       <Nav dark={false} />
       <div className="max-w-7xl mx-auto px-6 py-12">
-        {/* Distributor Spec Templates — Step 01 */}
-        <TemplateReader
-          onSelect={(t) => { setPreset(t); setOpen(true); }}
-        />
-
-        <div className="flex items-start justify-between flex-wrap gap-4 mt-16">
+        <div className="flex items-start justify-between flex-wrap gap-4">
           <div>
-            <span className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">[ Step 02 · Workspace ]</span>
+            <span className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">[ Workspace ]</span>
             <h1 className="font-display font-black text-5xl tracking-tighter mt-2">Your projects.</h1>
             <p className="text-neutral-600 mt-2">Signed in as <span className="font-mono-spec text-xs">{user?.email}</span></p>
           </div>
-          <button onClick={() => { setPreset(null); setOpen(true); }} className="btn-gold px-6 py-3 font-mono-spec text-xs tracking-widest uppercase flex items-center gap-2 btn-industrial" data-testid="new-project-btn">
-            <Plus className="w-4 h-4" /> Blank Project
+          <button onClick={() => setOpen(true)} className="btn-gold px-6 py-3 font-mono-spec text-xs tracking-widest uppercase flex items-center gap-2 btn-industrial" data-testid="new-project-btn">
+            <Plus className="w-4 h-4" /> New Project
           </button>
         </div>
 
@@ -150,7 +132,7 @@ export default function Dashboard() {
           )}
         </div>
       </div>
-      <NewProjectDialog open={open} onOpenChange={setOpen} preset={preset} onCreated={(p) => { setOpen(false); setPreset(null); nav(`/editor/${p.id}`); }} />
+      <NewProjectDialog open={open} onOpenChange={setOpen} onCreated={(p) => { setOpen(false); nav(`/editor/${p.id}`); }} />
     </div>
   );
 }

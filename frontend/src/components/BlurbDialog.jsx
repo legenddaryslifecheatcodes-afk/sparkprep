@@ -55,7 +55,12 @@ export default function BlurbDialog({ open, onOpenChange, defaultTitle = "" }) {
           </div>
           <div>
             <Label className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">Page Count</Label>
-            <Input type="number" value={form.page_count} onChange={e=>setForm({...form, page_count: e.target.value})} className="mt-1" data-testid="blurb-pages" placeholder="320" />
+            <Input type="number" value={form.page_count} onChange={e=>{
+              const raw = e.target.value;
+              if (raw === "") { setForm({...form, page_count: ""}); return; }
+              const value = parseInt(raw, 10);
+              setForm({...form, page_count: isNaN(value) ? "" : value.toString()});
+            }} className="mt-1" data-testid="blurb-pages" placeholder="320" />
           </div>
           <div className="col-span-2">
             <Label className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">Themes / Hooks</Label>
