@@ -165,6 +165,19 @@ api_router = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("sparkprep")
 
+# ---- Interior check scope ----
+# Basic Interior Check (page 1 only) is what every free/subscription audit
+# and autofix gets by default. The paid Advanced Interior Check (up to
+# ADVANCED_INTERIOR_MAX_PAGES, defined below near its checkout endpoint) is
+# the only thing allowed to scan beyond page 1 -- these must never be mixed.
+BASIC_CHECK_MAX_PAGES = 1
+
+# Flat per-book export cap, independent of (layered on top of) the
+# tier-based monthly account limits below -- prevents a single book from
+# burning an entire month's export allowance on repeated re-exports of
+# itself instead of the account actually shipping multiple books.
+EXPORTS_PER_BOOK = 5
+
 # ---- Subscription tiers ----
 TIERS = {
     "free": {
@@ -509,6 +522,7 @@ async def create_project(payload: ProjectCreate, user: dict = Depends(get_curren
         "uploaded_file": None,
         "file_metadata": None,
         "compliance": [],
+        "exports_used": 0,
         "created_at": now,
         "updated_at": now,
     }
@@ -638,7 +652,7 @@ async def autofix(project_id: str, user: dict = Depends(get_current_user)):
         # flattens transparency and forces CMYK/PDF-X metadata in the same
         # pass). Font embedding and missing ICC profiles aren't safely
         # auto-fixable this way, so those are left as manual guidance.
-        structure_findings = run_pdf_structure_audit(str(file_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"))
+        structure_findings = run_pdf_structure_audit(str(file_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
         fixable_ids = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent"}
         needs_gs_fix = any(f["id"] in fixable_ids for f in structure_findings)
 
@@ -670,7 +684,7 @@ async def autofix(project_id: str, user: dict = Depends(get_current_user)):
                     metadata["autofixed"] = True
                     # Re-run the structural audit against the fixed file so the
                     # response reflects what's actually true now, not a promise.
-                    after_findings = run_pdf_structure_audit(str(fixed_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"))
+                    after_findings = run_pdf_structure_audit(str(fixed_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
                     still_broken = [f["id"] for f in after_findings if f["id"] in fixable_ids]
                     ghostscript_result = {
                         "attempted": True,
@@ -712,7 +726,7 @@ async def autofix(project_id: str, user: dict = Depends(get_current_user)):
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }},
     )
-    return {"file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result}
+    return {"file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "check_type": "basic"}
 
 
 # ---- Export ----
@@ -722,6 +736,12 @@ async def export_project(project_id: str, user: dict = Depends(get_current_user)
     if not p or not p.get("uploaded_file"):
         raise HTTPException(404, "No uploaded file to export")
 
+    # Mandatory book title -- required before any export so exports are
+    # traceable to a real book, not left on a never-renamed placeholder.
+    title = (p.get("name") or "").strip()
+    if not title or title.lower() == "untitled book":
+        raise HTTPException(400, "Please set a title for this book before exporting.")
+
     # Check usage limits (bypassed entirely for active beta testers)
     tier = user.get("tier", "free")
     tier_info = TIERS.get(tier, TIERS["free"])
@@ -730,6 +750,12 @@ async def export_project(project_id: str, user: dict = Depends(get_current_user)
     beta_bypass = bool(user.get("beta_active"))
     if not beta_bypass and used >= export_limit:
         raise HTTPException(402, f"Monthly export limit reached ({used}/{export_limit}). Upgrade to continue.")
+
+    # Per-book export cap -- flat 5 exports per book, independent of the
+    # account's monthly allowance above.
+    book_exports_used = p.get("exports_used", 0)
+    if not beta_bypass and book_exports_used >= EXPORTS_PER_BOOK:
+        raise HTTPException(402, f"You have reached the {EXPORTS_PER_BOOK}-export limit for this book.")
 
     # Book counter — this project counts as a "book" the first time it's exported this period
     books_used = user.get("books_this_month", 0)
@@ -791,16 +817,17 @@ async def export_project(project_id: str, user: dict = Depends(get_current_user)
     inc_fields = {"exports_this_month": 1}
     if is_new_book:
         inc_fields["books_this_month"] = 1
-        await db.projects.update_one(
-            {"_id": ObjectId(project_id)},
-            {"$set": {"first_exported_at": datetime.now(timezone.utc).isoformat()}},
-        )
+    project_update = {"$inc": {"exports_used": 1}}
+    if is_new_book:
+        project_update["$set"] = {"first_exported_at": datetime.now(timezone.utc).isoformat()}
+    await db.projects.update_one({"_id": ObjectId(project_id)}, project_update)
     await db.users.update_one(
         {"_id": ObjectId(user["id"])},
         {"$inc": inc_fields},
     )
     new_used = used + 1
     new_books_used = books_used + (1 if is_new_book else 0)
+    new_book_exports_used = book_exports_used + 1
     # Record export
     await db.exports.insert_one({
         "project_id": project_id,
@@ -817,6 +844,8 @@ async def export_project(project_id: str, user: dict = Depends(get_current_user)
         "books_this_month": new_books_used,
         "books_limit": books_limit,
         "counted_as_new_book": is_new_book,
+        "book_exports_used": new_book_exports_used,
+        "book_exports_limit": EXPORTS_PER_BOOK,
         **result,
     }
 
@@ -930,6 +959,29 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
     return {"checkout_url": session.url, "session_id": session.id}
 
 
+@api_router.get("/projects/{project_id}/interior-check/status")
+async def interior_check_status(project_id: str, user: dict = Depends(get_current_user)):
+    """Lets the UI show the unlocked report again on a page reload/revisit,
+    without needing the Stripe session_id to still be in the URL.
+    """
+    check = await db.interior_checks.find_one(
+        {"project_id": project_id, "user_id": user["id"], "paid": True},
+        sort=[("created_at", -1)],
+    )
+    if not check:
+        return {"paid": False}
+
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p or not p.get("uploaded_file"):
+        raise HTTPException(404, "Interior file not found")
+    file_path = UPLOAD_DIR / p["uploaded_file"]
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    findings = []
+    if p.get("file_metadata", {}).get("is_pdf"):
+        findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+    return {"paid": True, "findings": findings, "check_type": "advanced"}
+
+
 @api_router.get("/projects/{project_id}/interior-check/verify")
 async def interior_check_verify(project_id: str, session_id: str, user: dict = Depends(get_current_user)):
     check = await db.interior_checks.find_one({"project_id": project_id, "session_id": session_id, "user_id": user["id"]})
@@ -953,8 +1005,12 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
     findings = []
     if p.get("file_metadata", {}).get("is_pdf"):
-        findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"))
-    return {"paid": True, "findings": findings}
+        # The only call site allowed to scan beyond page 1 -- explicitly
+        # capped at ADVANCED_INTERIOR_MAX_PAGES regardless of the file's
+        # actual page count, enforcing the 300-page limit defense-in-depth
+        # (on top of the page_count check already done at checkout time).
+        findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+    return {"paid": True, "findings": findings, "check_type": "advanced"}
 
 
 # ---- Stripe Payments ----
@@ -1561,7 +1617,7 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
     # embedded fonts, ICC output intent. Only applies to PDFs -- an image
     # upload has none of this structure yet.
     if metadata.get("is_pdf"):
-        findings += run_pdf_structure_audit(str(file_path), plat["name"])
+        findings += run_pdf_structure_audit(str(file_path), plat["name"], max_pages=BASIC_CHECK_MAX_PAGES)
     summary = audit_summary(findings)
 
     preview = [
@@ -1585,7 +1641,7 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
             "summary": summary,
         }},
     )
-    return {"audit_id": audit_id, "summary": summary, "preview": preview}
+    return {"audit_id": audit_id, "summary": summary, "preview": preview, "check_type": "basic"}
 
 
 @api_router.get("/audit/{audit_id}/report")

@@ -1,6 +1,7 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { api, fmtErr, API_URL } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -11,6 +12,7 @@ import Book3DPro from "@/components/Book3DPro";
 import BlurbDialog from "@/components/BlurbDialog";
 import ManuscriptComposerDialog from "@/components/ManuscriptComposerDialog";
 import IsbnBarcodePanel from "@/components/IsbnBarcodePanel";
+import AdvancedInteriorCheckCard from "@/components/AdvancedInteriorCheckCard";
 import { Logo } from "@/components/Logo";
 import {
   Upload, Download, Wand2, ArrowLeft, Eye, EyeOff, Check, AlertTriangle, XCircle,
@@ -48,6 +50,7 @@ function InfoTip({ children, text }) {
 export default function Editor() {
   const { id } = useParams();
   const nav = useNavigate();
+  const { user } = useAuth();
   const [project, setProject] = useState(null);
   const [specs, setSpecs] = useState(null);
   const [spine, setSpine] = useState(null);
@@ -167,11 +170,13 @@ export default function Editor() {
     try {
       const { data } = await api.post(`/projects/${id}/export`);
       toast.success("PDF/X-1a ready");
+      setProject((p) => ({ ...p, exports_used: data.book_exports_used }));
       const token = localStorage.getItem("sp_token");
       window.open(`${API_URL}${data.download_url.replace("/api", "")}${token ? `?token=${token}` : ""}`, "_blank");
     } catch (e) {
       const msg = fmtErr(e.response?.data?.detail);
-      if (e.response?.status === 402) { toast.error(msg + " — Redirecting to pricing"); setTimeout(() => nav("/pricing"), 1500); }
+      const isBookLimit = msg?.includes("export limit for this book");
+      if (e.response?.status === 402 && !isBookLimit) { toast.error(msg + " — Redirecting to pricing"); setTimeout(() => nav("/pricing"), 1500); }
       else toast.error(msg);
     } finally { setExporting(false); }
   };
@@ -215,7 +220,17 @@ export default function Editor() {
             <Logo compact />
             <div className="w-px h-6 bg-neutral-200 mx-2" />
             <div>
-              <div className="font-display font-bold text-sm tracking-tight">{project.name}</div>
+              <input
+                defaultValue={project.name}
+                onBlur={(e) => {
+                  const next = e.target.value.trim();
+                  if (next && next !== project.name) updateSpec({ name: next });
+                  else e.target.value = project.name;
+                }}
+                className="font-display font-bold text-sm tracking-tight bg-transparent border-b border-transparent hover:border-neutral-300 focus:border-black outline-none w-48"
+                data-testid="project-title-input"
+                title="Book title — required before you can export"
+              />
               <div className="font-mono-spec text-[10px] tracking-widest text-neutral-500 uppercase">{plat.name} · {trim.label} · {project.page_count}pp</div>
             </div>
           </div>
@@ -424,9 +439,14 @@ export default function Editor() {
 
           {/* SECTION 4 · ONE-CLICK FIXES */}
           <section className="bg-white border border-neutral-200" data-testid="section-fixes">
-            <div className="p-5 border-b border-neutral-200 flex items-center gap-3">
-              <span className="section-header">04 · One-Click Fixes</span>
-              <p className="text-sm text-neutral-600">Big, bright buttons that do the heavy lifting.</p>
+            <div className="p-5 border-b border-neutral-200 flex items-center gap-3 flex-wrap justify-between">
+              <div className="flex items-center gap-3">
+                <span className="section-header">04 · One-Click Fixes</span>
+                <p className="text-sm text-neutral-600">Big, bright buttons that do the heavy lifting.</p>
+              </div>
+              <span className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500" data-testid="book-export-counter">
+                Exports remaining for this book: {Math.max(0, 5 - (project.exports_used || 0))} of 5
+              </span>
             </div>
             <div className="p-5 grid md:grid-cols-4 gap-3">
               <BigButton
@@ -498,6 +518,10 @@ export default function Editor() {
               />
             </div>
           </section>
+
+          {(project.project_type === "interior" || project.project_type === "combined") && (
+            <AdvancedInteriorCheckCard project={project} user={user} projectId={id} />
+          )}
 
           {/* SECTION 5 · MANUAL EDITING */}
           <section className="bg-white border border-neutral-200" data-testid="section-manual">

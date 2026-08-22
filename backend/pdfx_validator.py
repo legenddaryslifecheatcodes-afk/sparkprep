@@ -82,13 +82,18 @@ def check_pdfx1a_declared(pdf: pikepdf.Pdf, platform_name: str) -> Optional[dict
     return None
 
 
-def check_transparency(pdf: pikepdf.Pdf) -> Optional[dict]:
+def check_transparency(pdf: pikepdf.Pdf, max_pages: Optional[int] = None) -> Optional[dict]:
     """Checks the PDF's actual page content for live transparency groups,
     soft masks, or non-opaque ExtGState entries -- not just whether the
     *source image* had an alpha channel before the PDF was built.
+
+    max_pages limits the scan to the first N pages -- this is what makes
+    the Basic (page-1-only) check distinct from the paid Advanced Interior
+    Check (up to 300 pages). None means no limit.
     """
+    pages_to_scan = pdf.pages[:max_pages] if max_pages is not None else pdf.pages
     found = []
-    for page_num, page in enumerate(pdf.pages, start=1):
+    for page_num, page in enumerate(pages_to_scan, start=1):
         if "/Group" in page and page.Group.get("/S") == pikepdf.Name("/Transparency"):
             found.append(page_num)
             continue
@@ -166,7 +171,7 @@ def check_layers(pdf: pikepdf.Pdf) -> Optional[dict]:
     )
 
 
-def check_fonts_embedded(pdf: pikepdf.Pdf) -> Optional[dict]:
+def check_fonts_embedded(pdf: pikepdf.Pdf, max_pages: Optional[int] = None) -> Optional[dict]:
     """Walks every font actually USED to draw text -- not merely declared
     in a page's font resource dictionary -- and checks its FontDescriptor
     for an embedded font program (FontFile/FontFile2/FontFile3).
@@ -187,7 +192,8 @@ def check_fonts_embedded(pdf: pikepdf.Pdf) -> Optional[dict]:
     missing = set()
     show_text_ops = {pikepdf.Operator("Tj"), pikepdf.Operator("TJ"), pikepdf.Operator("'"), pikepdf.Operator('"')}
 
-    for page in pdf.pages:
+    pages_to_scan = pdf.pages[:max_pages] if max_pages is not None else pdf.pages
+    for page in pages_to_scan:
         resources = page.get("/Resources", {})
         fonts = resources.get("/Font", {})
         if "/Font" not in resources:
@@ -289,20 +295,28 @@ def check_icc_output_intent(pdf: pikepdf.Pdf, platform_name: str) -> Optional[di
     )
 
 
-def run_pdf_structure_audit(pdf_path: str, platform_name: str = "your distributor") -> List[dict]:
+def run_pdf_structure_audit(pdf_path: str, platform_name: str = "your distributor", max_pages: Optional[int] = None) -> List[dict]:
     """Runs all structural checks against a real PDF file and returns
     the combined findings list, ready to merge into deep_audit()'s
     output. Non-PDF files should never reach this -- callers should
     only invoke it when file_metadata['is_pdf'] is true.
+
+    max_pages=1 (or omitted -> defaults applied by callers) is the Basic
+    Interior Check -- first page only, what every free/subscription audit
+    gets. max_pages=None here means unlimited, which callers should only
+    pass for the paid Advanced Interior Check, explicitly capped by the
+    caller at ADVANCED_INTERIOR_MAX_PAGES. Layer/PDFX1a-declaration/ICC
+    checks are document-level flags, not per-page, so max_pages doesn't
+    apply to them.
     """
     findings = []
     try:
         with pikepdf.open(pdf_path) as pdf:
             for check in (
                 lambda: check_pdfx1a_declared(pdf, platform_name),
-                lambda: check_transparency(pdf),
+                lambda: check_transparency(pdf, max_pages=max_pages),
                 lambda: check_layers(pdf),
-                lambda: check_fonts_embedded(pdf),
+                lambda: check_fonts_embedded(pdf, max_pages=max_pages),
                 lambda: check_icc_output_intent(pdf, platform_name),
             ):
                 result = check()
