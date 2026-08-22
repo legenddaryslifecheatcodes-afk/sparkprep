@@ -15,26 +15,6 @@ from typing import Optional, List
 import bcrypt
 import jwt
 import stripe
-try:
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
-except Exception:  # pragma: no cover - fallback for local/dev environments
-    from types import SimpleNamespace
-
-    class UserMessage:
-        def __init__(self, text: str):
-            self.text = text
-
-    class LlmChat:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-
-        def with_model(self, *args, **kwargs):
-            return self
-
-        async def send_message(self, *_args, **_kwargs):
-            raise RuntimeError("emergentintegrations is not installed in this local environment")
-
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
@@ -177,7 +157,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 EXPORT_DIR.mkdir(exist_ok=True)
 
 JWT_ALGORITHM = "HS256"
-stripe.api_key = os.environ.get("STRIPE_API_KEY") or "sk_test_emergent"
+stripe.api_key = os.environ.get("STRIPE_API_KEY") or "sk_test_not_configured"
 
 app = FastAPI(title="SparkPrep API")
 api_router = APIRouter(prefix="/api")
@@ -902,7 +882,7 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
 
     tier = user.get("tier", "free")
     price_cents = ADVANCED_INTERIOR_PRICE_CENTS.get(tier, ADVANCED_INTERIOR_PRICE_CENTS["free"])
-    if not stripe.api_key or stripe.api_key in ("sk_test_emergent", ""):
+    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
         raise HTTPException(503, "Payments not configured — Stripe key missing")
     origin = payload.origin_url.rstrip("/")
     try:
@@ -985,7 +965,7 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
         raise HTTPException(400, "Invalid tier")
     tier_info = TIERS[tier]
     origin = payload.origin_url.rstrip("/")
-    if not stripe.api_key or stripe.api_key in ("sk_test_emergent", ""):
+    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
         raise HTTPException(
             status_code=503,
             detail="Payments not configured yet. Add a valid STRIPE_API_KEY to backend/.env to enable checkout.",
@@ -1285,61 +1265,13 @@ async def manuscript_preview(file_id: str, request: Request):
 
 
 # ---- AI Blurb Writer ----
+# No LLM provider is currently wired up (the previous emergentintegrations/
+# Emergent-platform dependency was removed since it required a key that
+# isn't available and can't be used). This always reports unconfigured
+# until a real provider (e.g. a direct Anthropic API key) is wired in.
 @api_router.post("/ai/blurb")
 async def generate_blurb(payload: BlurbIn, user: dict = Depends(get_current_user)):
-    key = os.environ.get("EMERGENT_LLM_KEY")
-    if not key:
-        raise HTTPException(503, "AI not configured")
-    system = (
-        "You are a professional book-jacket copywriter for indie authors. "
-        "Given a title and metadata, produce compelling back-cover copy suitable for print. "
-        "Respond in strict JSON matching this schema exactly and nothing else:\n"
-        '{"tagline": "string (max 12 words, punchy hook)", '
-        '"variations": [ {"tone": "string", "copy": "string 100-160 words"} ]}'
-        "\nProvide EXACTLY 3 variations with tones: 'Punchy', 'Literary', 'Commercial'."
-    )
-    prompt = (
-        f"Title: {payload.title}\n"
-        f"Genre: {payload.genre or 'general'}\n"
-        f"Page count: {payload.page_count or 'unknown'}\n"
-        f"Themes: {payload.themes or 'not specified'}\n"
-        f"Target audience: {payload.audience or 'general adult'}\n"
-        "Write back-cover copy variations now. Return only the JSON object."
-    )
-    try:
-        chat = LlmChat(
-            api_key=key,
-            session_id=f"blurb-{user['id']}-{uuid.uuid4().hex[:6]}",
-            system_message=system,
-        ).with_model("anthropic", "claude-sonnet-4-6")
-        response = await chat.send_message(UserMessage(text=prompt))
-    except Exception as e:
-        logger.exception("blurb generation failed")
-        raise HTTPException(500, f"AI generation failed: {e}")
-
-    # Best-effort parse of JSON from the response
-    import json as _json
-    text = str(response).strip()
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip("` \n")
-    try:
-        data = _json.loads(text)
-    except Exception:
-        # Fall back — try to slice the JSON object out
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                data = _json.loads(text[start:end+1])
-            except Exception:
-                data = {"tagline": "", "variations": [{"tone": "Raw", "copy": text}]}
-        else:
-            data = {"tagline": "", "variations": [{"tone": "Raw", "copy": text}]}
-    return data
+    raise HTTPException(503, "AI Blurb Writer isn't configured yet")
 
 
 # ---- Publisher Template Upload ----
@@ -1717,7 +1649,7 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
         raise HTTPException(404, "Audit not found")
     if a.get("paid"):
         return {"already_paid": True}
-    if not stripe.api_key or stripe.api_key in ("sk_test_emergent", ""):
+    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
         raise HTTPException(503, "Payments not configured — Stripe key missing")
     origin = payload.origin_url.rstrip("/")
     try:
@@ -1984,7 +1916,6 @@ app.add_middleware(
     allow_origins=[
         os.environ.get("FRONTEND_URL", "https://sparkprep.legenddary.com"),
         "https://sparkprepfinal.pages.dev",
-        "https://sparkprep-print.preview.emergentagent.com",
         "http://localhost:3000",
     ],
     allow_methods=["*"],
@@ -2035,7 +1966,7 @@ async def on_startup():
         logger.warning("STRIPE_WEBHOOK_SECRET is not set — webhook accepts unsigned JSON. Do NOT ship to production without it.")
     if stripe.api_key and (stripe.api_key.startswith("sk_live_") or stripe.api_key.startswith("rk_live_")):
         logger.info("Stripe is in LIVE mode.")
-    elif stripe.api_key and (stripe.api_key.startswith("sk_test_") or stripe.api_key.startswith("rk_test_")) and stripe.api_key != "sk_test_emergent":
+    elif stripe.api_key and (stripe.api_key.startswith("sk_test_") or stripe.api_key.startswith("rk_test_")) and stripe.api_key != "sk_test_not_configured":
         logger.info("Stripe is in TEST mode.")
     logger.info("SparkPrep API ready")
 
