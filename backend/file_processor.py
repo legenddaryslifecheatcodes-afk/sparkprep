@@ -9,6 +9,8 @@ from reportlab.lib.units import inch
 from pypdf import PdfReader
 import pikepdf
 
+from print_specs import COLOR_PROFILES, DEFAULT_COLOR_PROFILE
+
 # Enable large images
 Image.MAX_IMAGE_PIXELS = None
 
@@ -122,6 +124,8 @@ def build_interior_pdf_x1a(
     bleed: float,
     title: str = "SparkPrep Interior",
     author: str = "",
+    color_profile: str = DEFAULT_COLOR_PROFILE,
+    producer_name: str = "SparkPrep",
 ) -> dict:
     """Stream a multi-page manuscript PDF into a real PDF/X-1a:2001 output.
 
@@ -139,6 +143,7 @@ def build_interior_pdf_x1a(
     trim_bottom_pts = bleed * 72
     trim_right_pts = (bleed + trim_w) * 72
     trim_top_pts = (bleed + trim_h) * 72
+    profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
 
     with pikepdf.open(source_pdf_path, allow_overwriting_input=False) as src:
         page_count = len(src.pages)
@@ -156,10 +161,10 @@ def build_interior_pdf_x1a(
                 meta["dc:title"] = title
                 if author:
                     meta["dc:creator"] = [author]
-                meta["xmp:CreatorTool"] = "SparkPrep Book Production Engine"
+                meta["xmp:CreatorTool"] = f"{producer_name} Book Production Engine"
                 meta["pdfx:GTS_PDFXVersion"] = "PDF/X-1a:2001"
                 meta["pdfx:GTS_PDFXConformance"] = "PDF/X-1a:2001"
-                meta["pdf:Producer"] = "SparkPrep (pikepdf)"
+                meta["pdf:Producer"] = f"{producer_name} (pikepdf)"
                 meta["pdf:Trapped"] = "False"
         except Exception:
             pass
@@ -173,9 +178,9 @@ def build_interior_pdf_x1a(
             Type=pikepdf.Name.OutputIntent,
             S=pikepdf.Name("/GTS_PDFX"),
             OutputCondition=pikepdf.String("CMYK"),
-            OutputConditionIdentifier=pikepdf.String("CGATS TR 001 (SWOP)"),
-            RegistryName=pikepdf.String("http://www.color.org"),
-            Info=pikepdf.String("U.S. Web Coated (SWOP) v2"),
+            OutputConditionIdentifier=pikepdf.String(profile["condition_identifier"]),
+            RegistryName=pikepdf.String(profile["registry"]),
+            Info=pikepdf.String(profile["info"]),
         )
         src.Root.OutputIntents = pikepdf.Array([output_intent])
 
@@ -200,9 +205,63 @@ def build_interior_pdf_x1a(
         "pdf_standard": "PDF/X-1a:2001",
         "vector_preserved": True,
         "fonts_preserved": True,
-        "output_intent": "CGATS TR 001 (SWOP) — U.S. Web Coated SWOP v2",
+        "output_intent": f"{profile['condition_identifier']} — {profile['info']}",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _declare_pdfx1a(pdf_path: str, title: str, author: str, bleed_pts: float, total_w_pts: float, total_h_pts: float,
+                     color_profile: str = DEFAULT_COLOR_PROFILE, producer_name: str = "SparkPrep") -> None:
+    """Stamps real PDF/X-1a:2001 compliance (GTS_PDFXVersion, TrimBox,
+    OutputIntents, XMP) onto an already-rendered single-page PDF in place.
+
+    Before this existed, build_print_ready_pdf() below returned a PDF whose
+    metadata *claimed* pdf_standard: "PDF/X-1a:2001" but never actually set
+    /GTS_PDFXVersion, an /OutputIntents entry, or a correct /TrimBox
+    (reportlab leaves TrimBox defaulting to the full MediaBox, i.e. the
+    bleed area, not the actual trim line) -- so a cover exported through
+    the "Generate PDF/X-1a" button would fail pdfx_validator's own
+    check_pdfx1a_declared() if run against itself. This closes that gap
+    the same way build_interior_pdf_x1a() already does it for interiors.
+    """
+    profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
+    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        for page in pdf.pages:
+            page.mediabox = [0, 0, total_w_pts, total_h_pts]
+            page.trimbox = [bleed_pts, bleed_pts, total_w_pts - bleed_pts, total_h_pts - bleed_pts]
+            page.bleedbox = [0, 0, total_w_pts, total_h_pts]
+            page.cropbox = [0, 0, total_w_pts, total_h_pts]
+
+        try:
+            with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+                meta["dc:title"] = title
+                if author:
+                    meta["dc:creator"] = [author]
+                meta["xmp:CreatorTool"] = f"{producer_name} Book Production Engine"
+                meta["pdfx:GTS_PDFXVersion"] = "PDF/X-1a:2001"
+                meta["pdfx:GTS_PDFXConformance"] = "PDF/X-1a:2001"
+                meta["pdf:Producer"] = f"{producer_name} (pikepdf)"
+                meta["pdf:Trapped"] = "False"
+        except Exception:
+            pass
+
+        pdf.Root.GTS_PDFXVersion = pikepdf.String("PDF/X-1a:2001")
+        pdf.Root.Trapped = pikepdf.Name("/False")
+        pdf.Root.OutputIntents = pikepdf.Array([pikepdf.Dictionary(
+            Type=pikepdf.Name.OutputIntent,
+            S=pikepdf.Name("/GTS_PDFX"),
+            OutputCondition=pikepdf.String("CMYK"),
+            OutputConditionIdentifier=pikepdf.String(profile["condition_identifier"]),
+            RegistryName=pikepdf.String(profile["registry"]),
+            Info=pikepdf.String(profile["info"]),
+        )])
+        if "/AA" in pdf.Root:
+            del pdf.Root["/AA"]
+        try:
+            pdf.pdf_version = "1.4"
+        except Exception:
+            pass
+        pdf.save(pdf_path, linearize=False, min_version="1.4")
 
 
 def build_print_ready_pdf(
@@ -214,9 +273,12 @@ def build_print_ready_pdf(
     spine_w: float = 0.0,
     is_cover: bool = True,
     title: str = "SparkPrep Export",
+    author: str = "",
     barcode_png_bytes: bytes = None,
+    color_profile: str = DEFAULT_COLOR_PROFILE,
+    producer_name: str = "SparkPrep",
 ) -> dict:
-    """Build PDF/X-1a-ish flattened print-ready PDF from a source image.
+    """Build a real PDF/X-1a:2001 print-ready PDF from a source image.
     If is_cover and barcode_png_bytes provided, composite the barcode into the
     reserved back-cover barcode zone (bottom-left area, 2" x 1.2")."""
     if is_cover and spine_w > 0:
@@ -232,9 +294,9 @@ def build_print_ready_pdf(
     c = canvas.Canvas(output_pdf_path, pagesize=(page_w, page_h))
     # PDF/X-1a metadata
     c.setTitle(title)
-    c.setAuthor("SparkPrep")
+    c.setAuthor(author or producer_name)
     c.setSubject("Print-Ready PDF/X-1a")
-    c.setCreator("SparkPrep Book Production Engine")
+    c.setCreator(f"{producer_name} Book Production Engine")
 
     # Draw image scaled to full canvas
     try:
@@ -294,11 +356,19 @@ def build_print_ready_pdf(
         except Exception as e:
             print(f"barcode overlay failed: {e}")
 
+    profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
+    _declare_pdfx1a(
+        output_pdf_path, title=title, author=author,
+        bleed_pts=bleed * inch, total_w_pts=page_w, total_h_pts=page_h,
+        color_profile=color_profile, producer_name=producer_name,
+    )
+
     return {
         "output_path": output_pdf_path,
         "page_size_inches": [round(total_w, 4), round(total_h, 4)],
         "page_size_points": [round(page_w, 2), round(page_h, 2)],
         "pdf_standard": "PDF/X-1a:2001",
+        "output_intent": f"{profile['condition_identifier']} — {profile['info']}",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 

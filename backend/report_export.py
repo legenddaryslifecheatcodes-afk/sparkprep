@@ -24,6 +24,7 @@ def generate_audit_report_pdf(
     summary: dict,
     project_meta: dict,
     output_path: str,
+    brand_name: str = "SparkPrep",
 ) -> str:
     """Writes a formatted PDF report and returns the output path.
 
@@ -48,7 +49,7 @@ def generate_audit_report_pdf(
     story = []
 
     # Header
-    story.append(Paragraph("SparkPrep Print-Readiness Audit Report", title_style))
+    story.append(Paragraph(f"{brand_name} Print-Readiness Audit Report", title_style))
     story.append(Paragraph(
         f"{project_meta.get('title', 'Untitled project')} — "
         f"{project_meta.get('platform', 'Unknown platform')} — "
@@ -122,6 +123,7 @@ def generate_audit_brief_pdf(
     summary: dict,
     project_meta: dict,
     output_path: str,
+    brand_name: str = "SparkPrep",
 ) -> str:
     """Writes a condensed, one-page PDF audit brief and returns the output
     path. This is the $0.99 unlock artifact -- summary table plus a
@@ -141,7 +143,7 @@ def generate_audit_brief_pdf(
     )
     story = []
 
-    story.append(Paragraph("SparkPrep Audit Brief", title_style))
+    story.append(Paragraph(f"{brand_name} Audit Brief", title_style))
     story.append(Paragraph(
         f"{project_meta.get('title', 'Untitled project')} — "
         f"{project_meta.get('platform', 'Unknown platform')} — "

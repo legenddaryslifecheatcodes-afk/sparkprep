@@ -11,6 +11,7 @@ export default function NewProjectDialog({ open, onOpenChange, onCreated }) {
   const [form, setForm] = useState({
     name: "Untitled Book", platform: "kdp", trim_size: "6x9",
     paper_type: "white_50lb", binding: "paperback", page_count: 200, project_type: "cover",
+    series_name: "",
   });
   const [busy, setBusy] = useState(false);
 
@@ -100,6 +101,17 @@ export default function NewProjectDialog({ open, onOpenChange, onCreated }) {
                 </SelectContent>
               </Select>
             </div>
+          </div>
+          <div>
+            <Label className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">Series (optional)</Label>
+            <Input
+              value={form.series_name}
+              onChange={e => setForm({ ...form, series_name: e.target.value })}
+              className="mt-1"
+              placeholder="e.g. The Print Trilogy"
+              data-testid="np-series"
+            />
+            <p className="text-[11px] text-neutral-500 mt-1">Books sharing a series name get checked for consistent trim/binding/paper from the dashboard.</p>
           </div>
           <button onClick={submit} disabled={busy} className="w-full bg-black text-white py-3 font-mono-spec text-xs tracking-widest uppercase hover:bg-neutral-800 disabled:opacity-50 btn-industrial" data-testid="np-submit">
             {busy ? "Creating…" : "Create Project"}

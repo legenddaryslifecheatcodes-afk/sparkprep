@@ -1,18 +1,24 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, fmtErr } from "@/lib/api";
+import { api, fmtErr, API_URL } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import Nav from "@/components/Nav";
 import NewProjectDialog from "@/components/NewProjectDialog";
 import BrandWatermark from "@/components/BrandWatermark";
-import { Plus, FileText, Trash2 } from "lucide-react";
+import { Plus, FileText, Trash2, Layers, ShieldAlert, PackageCheck, Download, ChevronDown } from "lucide-react";
 
 export default function Dashboard() {
   const { user } = useAuth();
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState(() => new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchResult, setBatchResult] = useState(null);
+  const [series, setSeries] = useState([]);
+  const [seriesOpen, setSeriesOpen] = useState(null);
+  const [seriesFindings, setSeriesFindings] = useState(null);
   const nav = useNavigate();
 
   const load = async () => {
@@ -22,9 +28,44 @@ export default function Dashboard() {
       setProjects(data.projects);
     } catch (e) { toast.error(fmtErr(e.response?.data?.detail)); }
     finally { setLoading(false); }
+    api.get("/series").then(({ data }) => setSeries(data.series)).catch(() => {});
   };
 
   useEffect(() => { load(); }, []);
+
+  const toggleSelect = (id) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const runBatch = async (kind) => {
+    if (selected.size < 2) { toast.error("Select at least 2 books first"); return; }
+    setBatchBusy(true);
+    setBatchResult(null);
+    try {
+      const { data } = await api.post(`/projects/batch-${kind}`, { project_ids: Array.from(selected) });
+      setBatchResult({ kind, data });
+      if (kind === "export" && data.download_url) {
+        const token = localStorage.getItem("sp_token");
+        window.open(`${API_URL}${data.download_url.replace("/api", "")}${token ? `?token=${token}` : ""}`, "_blank");
+      }
+      toast.success(kind === "export" ? "Batch export ready" : "Batch audit complete");
+    } catch (e) { toast.error(fmtErr(e.response?.data?.detail)); }
+    finally { setBatchBusy(false); }
+  };
+
+  const checkSeries = async (name) => {
+    if (seriesOpen === name) { setSeriesOpen(null); return; }
+    setSeriesOpen(name);
+    setSeriesFindings(null);
+    try {
+      const { data } = await api.get(`/series/${encodeURIComponent(name)}/consistency`);
+      setSeriesFindings(data.findings);
+    } catch (e) { toast.error(fmtErr(e.response?.data?.detail)); }
+  };
 
   const remove = async (id) => {
     if (!window.confirm("Delete this project?")) return;
@@ -42,6 +83,7 @@ export default function Dashboard() {
   const booksUsed = user?.books_this_month ?? 0;
   const bookLimits = { free: 0, author: 1, creator_pro: 3, publisher: 7, studio: 30 };
   const bookLimit = bookLimits[tier] ?? 0;
+  const batchEnabled = tier === "publisher" || tier === "studio";
 
   return (
     <div className="min-h-screen bg-[#F7F7F9]">
@@ -90,6 +132,94 @@ export default function Dashboard() {
           </div>
         </div>
 
+        {/* Series consistency */}
+        {series.length > 0 && (
+          <div className="mt-10 bg-white border border-neutral-200" data-testid="series-panel">
+            <div className="p-4 border-b border-neutral-200 flex items-center gap-2">
+              <Layers className="w-4 h-4 text-neutral-500" />
+              <span className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">Series consistency</span>
+            </div>
+            <div className="divide-y divide-neutral-100">
+              {series.map((s) => (
+                <div key={s.name}>
+                  <button
+                    onClick={() => checkSeries(s.name)}
+                    className="w-full flex items-center justify-between px-4 py-3 hover:bg-neutral-50 text-left"
+                    data-testid={`series-row-${s.name}`}
+                  >
+                    <span className="text-sm font-medium">{s.name} <span className="text-neutral-400 font-normal">· {s.book_count} books</span></span>
+                    <ChevronDown className={`w-4 h-4 text-neutral-400 transition-transform ${seriesOpen === s.name ? "rotate-180" : ""}`} />
+                  </button>
+                  {seriesOpen === s.name && (
+                    <div className="px-4 pb-4">
+                      {seriesFindings === null ? (
+                        <p className="text-xs text-neutral-500">Checking…</p>
+                      ) : seriesFindings.length === 0 ? (
+                        <p className="text-xs text-emerald-700">No consistency issues found across this series.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {seriesFindings.map((f, i) => (
+                            <div key={i} className={`border p-3 text-xs ${f.severity === "fail" ? "border-red-200 bg-red-50" : "border-amber-200 bg-amber-50"}`} data-testid={`series-finding-${f.id}`}>
+                              <div className="font-semibold">{f.title}</div>
+                              <div className="text-neutral-600 mt-1">{f.why_it_fails}</div>
+                              <div className="text-neutral-500 mt-1">Odd one out: {f.outliers.map(o => o.name).join(", ")}</div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Batch audit + batch export (Publisher/Studio) */}
+        {batchEnabled && projects.length >= 2 && (
+          <div className="mt-6 bg-white border border-neutral-200 p-4 flex flex-wrap items-center justify-between gap-3" data-testid="batch-toolbar">
+            <div className="text-xs text-neutral-600">
+              <span className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500 mr-2">Bulk audit + batch export</span>
+              {selected.size > 0 ? `${selected.size} book${selected.size === 1 ? "" : "s"} selected` : "Select books below with the checkbox to run these"}
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => runBatch("audit")} disabled={batchBusy || selected.size < 2} className="px-4 py-2 border border-neutral-300 font-mono-spec text-[10px] tracking-widest uppercase hover:border-black disabled:opacity-40 flex items-center gap-1.5 btn-industrial" data-testid="batch-audit-btn">
+                <ShieldAlert className="w-3.5 h-3.5" /> Batch Audit
+              </button>
+              <button onClick={() => runBatch("export")} disabled={batchBusy || selected.size < 2} className="px-4 py-2 bg-black text-white font-mono-spec text-[10px] tracking-widest uppercase hover:bg-neutral-800 disabled:opacity-40 flex items-center gap-1.5 btn-industrial" data-testid="batch-export-btn">
+                <PackageCheck className="w-3.5 h-3.5" /> {batchBusy ? "Working…" : "Batch Export"}
+              </button>
+            </div>
+          </div>
+        )}
+        {batchResult?.kind === "audit" && (
+          <div className="mt-3 bg-white border border-neutral-200 p-4 space-y-2" data-testid="batch-audit-results">
+            {batchResult.data.results.map((r) => (
+              <div key={r.project_id} className="flex items-center justify-between text-xs border-b border-neutral-100 pb-2 last:border-0">
+                <span>{r.name || r.project_id}</span>
+                {r.ok ? (
+                  <span className={r.critical_failures > 0 ? "text-red-600" : "text-emerald-700"}>
+                    {r.critical_failures} critical · {r.warnings} warning{r.warnings === 1 ? "" : "s"}
+                  </span>
+                ) : (
+                  <span className="text-red-600">{r.error}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {batchResult?.kind === "export" && batchResult.data.zip_name && (
+          <div className="mt-3 bg-white border border-neutral-200 p-4 flex items-center justify-between text-xs" data-testid="batch-export-results">
+            <span>{batchResult.data.results.filter(r => r.ok).length} of {batchResult.data.results.length} books exported</span>
+            <a
+              href={`${API_URL}${batchResult.data.download_url.replace("/api", "")}?token=${localStorage.getItem("sp_token") || ""}`}
+              className="flex items-center gap-1.5 underline hover:no-underline"
+            >
+              <Download className="w-3.5 h-3.5" /> Download zip again
+            </a>
+          </div>
+        )}
+
         {/* Projects grid */}
         <div className="mt-12">
           {loading ? (
@@ -107,11 +237,22 @@ export default function Dashboard() {
           ) : (
             <div className="grid md:grid-cols-3 gap-4">
               {projects.map(p => (
-                <div key={p.id} className="bg-white border border-neutral-200 p-6 hover:border-black transition-colors group" data-testid={`project-${p.id}`}>
+                <div key={p.id} className={`bg-white border p-6 transition-colors group ${selected.has(p.id) ? "border-black" : "border-neutral-200 hover:border-black"}`} data-testid={`project-${p.id}`}>
                   <div className="flex items-start justify-between">
-                    <div>
-                      <span className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">{p.platform} · {p.trim_size}</span>
-                      <h3 className="font-display font-bold text-xl tracking-tight mt-2">{p.name}</h3>
+                    <div className="flex items-start gap-3">
+                      {batchEnabled && (
+                        <input
+                          type="checkbox"
+                          checked={selected.has(p.id)}
+                          onChange={() => toggleSelect(p.id)}
+                          className="mt-1.5"
+                          data-testid={`select-${p.id}`}
+                        />
+                      )}
+                      <div>
+                        <span className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">{p.platform} · {p.trim_size}{p.series_name ? ` · ${p.series_name}` : ""}</span>
+                        <h3 className="font-display font-bold text-xl tracking-tight mt-2">{p.name}</h3>
+                      </div>
                     </div>
                     <button onClick={() => remove(p.id)} className="opacity-0 group-hover:opacity-100 transition-opacity text-neutral-400 hover:text-red-500" data-testid={`delete-${p.id}`}>
                       <Trash2 className="w-4 h-4" />

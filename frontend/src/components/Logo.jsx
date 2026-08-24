@@ -51,6 +51,21 @@ export function Logo({ compact = false, dark = false }) {
   );
 }
 
+/** SparkPrep's own main logo (distinct from the Legenddary parent-brand mark above) --
+ * shown top-center in the nav alongside the existing Legenddary lockup, not in place of it. */
+export function SparkPrepLogo({ height = 40, className = "" }) {
+  return (
+    <img
+      src="/brand/sparkprep-logo.png"
+      alt="SparkPrep — Print Right. Every Time."
+      className={`block object-contain ${className}`}
+      style={{ height, width: "auto" }}
+      draggable={false}
+      data-testid="sparkprep-main-logo"
+    />
+  );
+}
+
 /** Full brand lockup image (mark + "LEGENDDARY" + tagline). Use for hero/marketing/emails. */
 export function LogoLockup({ className = "", width }) {
   return (

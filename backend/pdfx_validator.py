@@ -14,8 +14,21 @@ Each check returns a finding in the same shape audit_engine.py uses
 fix_tools, est_fix_minutes, one_click_fix) or a list of findings, so
 these can be merged directly into the existing deep_audit() output.
 """
+import io
 from typing import List, Optional
 import pikepdf
+
+try:
+    from fontTools.ttLib import TTFont
+except Exception:  # pragma: no cover - fonttools should always be installed, but degrade gracefully
+    TTFont = None
+
+# OS/2.fsType bit values (OpenType spec) that matter for print embedding.
+# Bit 1 (0x0002) = Restricted License: the font may not be embedded at all.
+# Bits 2-3 (0x0004 / 0x0008) = Preview & Print / Editable embedding: embedding
+# is allowed but only for those specific uses -- print-ready PDF export is
+# exactly the "Preview & Print" use case, so those two are NOT flagged.
+FS_TYPE_RESTRICTED = 0x0002
 
 
 def _finding(**kwargs) -> dict:
@@ -256,6 +269,102 @@ def check_fonts_embedded(pdf: pikepdf.Pdf, max_pages: Optional[int] = None) -> O
     )
 
 
+def check_font_licensing(pdf: pikepdf.Pdf, max_pages: Optional[int] = None) -> Optional[dict]:
+    """Checks the embedding-permission flag (OS/2.fsType) carried inside
+    every embedded TrueType/OpenType font program in the PDF.
+
+    This is a different question from check_fonts_embedded(): that check
+    asks "is a font program present at all". This one asks "does the font's
+    own license metadata say it's legally allowed to be embedded in a
+    document like this at all". A font with fsType's Restricted License
+    bit set was never licensed for embedding -- most desktop font EULAs
+    (many free-for-personal-use or trial fonts) set this bit deliberately,
+    and print distributors have been known to reject or pull titles over
+    it, since the file itself carries a machine-readable "do not embed"
+    flag that most authors never see.
+
+    Only /FontFile2 (TrueType) and /FontFile3 (OpenType/CFF) programs carry
+    an OS/2 table with fsType -- legacy /FontFile (Type1) programs don't
+    use this mechanism at all, so they're skipped rather than flagged.
+    """
+    if TTFont is None:
+        return None
+
+    restricted = set()
+    pages_to_scan = pdf.pages[:max_pages] if max_pages is not None else pdf.pages
+    seen_descriptors = set()
+
+    for page in pages_to_scan:
+        resources = page.get("/Resources", {})
+        if "/Font" not in resources:
+            continue
+        for key, font in resources["/Font"].items():
+            base_font = str(font.get("/BaseFont", "unknown")).lstrip("/")
+            descriptor = font.get("/FontDescriptor")
+            if descriptor is None:
+                descendants = font.get("/DescendantFonts")
+                if descendants:
+                    descriptor = descendants[0].get("/FontDescriptor")
+            if descriptor is None:
+                continue
+
+            # objgen makes a stable per-PDF identity so a font embedded
+            # once but referenced on many pages is only parsed once.
+            try:
+                identity = descriptor.objgen
+            except AttributeError:
+                identity = id(descriptor)
+            if identity in seen_descriptors:
+                continue
+            seen_descriptors.add(identity)
+
+            font_stream = None
+            for key_name in ("/FontFile2", "/FontFile3"):
+                if key_name in descriptor:
+                    font_stream = descriptor[key_name]
+                    break
+            if font_stream is None:
+                continue  # Type1 (/FontFile) or no embedded program -- not this check's job
+
+            try:
+                raw = bytes(font_stream.read_bytes())
+                tt = TTFont(io.BytesIO(raw), lazy=True, fontNumber=0)
+                fs_type = tt["OS/2"].fsType
+                tt.close()
+            except Exception:
+                continue  # malformed/unreadable font program -- leave it to check_fonts_embedded
+
+            if fs_type & FS_TYPE_RESTRICTED:
+                restricted.add(base_font)
+
+    if not restricted:
+        return None
+
+    names = sorted(restricted)
+    return _finding(
+        id="font_license_restricted",
+        severity="fail",
+        title=f"{len(names)} embedded font{'s' if len(names) != 1 else ''} block print licensing: {', '.join(names[:5])}{'...' if len(names) > 5 else ''}",
+        why_it_fails=(
+            "These fonts have their embedding-permission flag (OS/2 fsType) set to "
+            "'Restricted License' -- the font file itself declares it must not be embedded "
+            "in any document, print or otherwise. This is common with free-for-personal-use "
+            "or trial fonts downloaded outside a proper commercial license. Distributors and "
+            "print vendors can reject or pull a title over this, and it's a real licensing "
+            "risk to the author, not just a technical preflight nitpick."
+        ),
+        publisher_rule="PDF/X-1a & most distributor font policies — 'embedded fonts must be licensed for embedding'",
+        pinpoint={"region": "font resources", "restricted_fonts": names},
+        fix_steps=[
+            "Buy a commercial/print license for each flagged font from its foundry, or",
+            "Replace the flagged font with one that explicitly permits embedding (most Google Fonts / SIL OFL fonts do), then re-export.",
+        ],
+        fix_tools=["Font foundry's license page", "Google Fonts", "Adobe Fonts (with a print-embedding license)"],
+        est_fix_minutes=15,
+        one_click_fix=False,
+    )
+
+
 def check_icc_output_intent(pdf: pikepdf.Pdf, platform_name: str) -> Optional[dict]:
     """Checks whether the declared OutputIntent actually carries an
     embedded ICC profile (not just a named condition string). A
@@ -317,6 +426,7 @@ def run_pdf_structure_audit(pdf_path: str, platform_name: str = "your distributo
                 lambda: check_transparency(pdf, max_pages=max_pages),
                 lambda: check_layers(pdf),
                 lambda: check_fonts_embedded(pdf, max_pages=max_pages),
+                lambda: check_font_licensing(pdf, max_pages=max_pages),
                 lambda: check_icc_output_intent(pdf, platform_name),
             ):
                 result = check()

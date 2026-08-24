@@ -13,6 +13,8 @@ import BlurbDialog from "@/components/BlurbDialog";
 import ManuscriptComposerDialog from "@/components/ManuscriptComposerDialog";
 import IsbnBarcodePanel from "@/components/IsbnBarcodePanel";
 import AdvancedInteriorCheckCard from "@/components/AdvancedInteriorCheckCard";
+import CoverTemplateDialog from "@/components/CoverTemplateDialog";
+import AICoverDialog from "@/components/AICoverDialog";
 import { Logo } from "@/components/Logo";
 import {
   Upload, Download, Wand2, ArrowLeft, Eye, EyeOff, Check, AlertTriangle, XCircle,
@@ -58,6 +60,8 @@ export default function Editor() {
   const [viewMode, setViewMode] = useState("flat");
   const [blurbOpen, setBlurbOpen] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
+  const [coverTemplateOpen, setCoverTemplateOpen] = useState(false);
+  const [aiCoverOpen, setAiCoverOpen] = useState(false);
   const [uploadingSlot, setUploadingSlot] = useState(null);
   const [uploadingTemplate, setUploadingTemplate] = useState(false);
   const [fixing, setFixing] = useState(false);
@@ -137,6 +141,18 @@ export default function Editor() {
     finally { setUploadingSlot(null); }
   };
 
+  // Shared by CoverTemplateDialog + AICoverDialog -- both hand back the same
+  // {slot, file_metadata, compliance} shape slot_upload does.
+  const applySlotResult = (data) => {
+    setProject((p) => ({
+      ...p,
+      slots: { ...(p.slots || {}), [data.slot]: { ...data.file_metadata, compliance: data.compliance } },
+      ...(data.slot === "full_wrap"
+        ? { uploaded_file: data.file_metadata.stored_filename, file_metadata: data.file_metadata, compliance: data.compliance }
+        : {}),
+    }));
+  };
+
   const deleteSlot = async (slot) => {
     try {
       await api.delete(`/projects/${id}/slot/${slot}`);
@@ -209,6 +225,10 @@ export default function Editor() {
   const plat = specs.platforms[project.platform] || {};
   const compliance = project.slots?.full_wrap?.compliance || project.compliance || [];
   const hasAnyUpload = Object.values(project.slots || {}).length > 0 || !!project.uploaded_file;
+  // Free plan is preview + compliance only -- TIERS.free.monthly_exports is 0 on the
+  // backend, which is the actual enforcement; this just avoids sending a free user
+  // into a doomed export click instead of straight to the upgrade page.
+  const isFreeTier = (user?.tier || "free") === "free";
 
   return (
     <TooltipProvider delayDuration={200}>
@@ -240,11 +260,25 @@ export default function Editor() {
                 <BookOpen className="w-3.5 h-3.5" /> Compose Interior
               </button>
             </InfoTip>
-            <InfoTip text="Generate 3 AI back-cover blurb variations with Claude Sonnet.">
-              <button onClick={() => setBlurbOpen(true)} className="px-3 py-2 border border-neutral-300 font-mono-spec text-[10px] tracking-widest uppercase hover:border-black flex items-center gap-1.5 btn-industrial" data-testid="blurb-btn">
-                <Sparkles className="w-3.5 h-3.5" /> AI Blurb
+            <InfoTip text={isFreeTier ? "AI Blurb Writer requires the Author plan or higher." : "Generate 3 AI back-cover blurb variations with Claude Sonnet."}>
+              <button onClick={() => isFreeTier ? nav("/pricing") : setBlurbOpen(true)} className="px-3 py-2 border border-neutral-300 font-mono-spec text-[10px] tracking-widest uppercase hover:border-black flex items-center gap-1.5 btn-industrial" data-testid="blurb-btn">
+                <Sparkles className="w-3.5 h-3.5" /> AI Blurb{isFreeTier && " 🔒"}
               </button>
             </InfoTip>
+            {isCover && (
+              <InfoTip text="Start from a typographic cover template — replaces the full cover wrap, fully editable after.">
+                <button onClick={() => setCoverTemplateOpen(true)} className="px-3 py-2 border border-neutral-300 font-mono-spec text-[10px] tracking-widest uppercase hover:border-black flex items-center gap-1.5 btn-industrial" data-testid="cover-template-btn">
+                  <Palette className="w-3.5 h-3.5" /> Cover Templates
+                </button>
+              </InfoTip>
+            )}
+            {isCover && (
+              <InfoTip text={isFreeTier ? "AI Cover Generation requires the Author plan or higher." : "Generate cover art from a text description (Google Imagen)."}>
+                <button onClick={() => isFreeTier ? nav("/pricing") : setAiCoverOpen(true)} className="px-3 py-2 border border-neutral-300 font-mono-spec text-[10px] tracking-widest uppercase hover:border-black flex items-center gap-1.5 btn-industrial" data-testid="ai-cover-btn">
+                  <ImageIcon className="w-3.5 h-3.5" /> AI Cover{isFreeTier && " 🔒"}
+                </button>
+              </InfoTip>
+            )}
           </div>
         </div>
 
@@ -300,6 +334,17 @@ export default function Editor() {
                     <SelectItem value="combined">Cover + Interior</SelectItem>
                   </SelectContent>
                 </Select>
+              </SpecField>
+              <SpecField label="Series (optional)" tooltip="Books sharing a series name get checked for consistent trim/binding/paper together from the dashboard.">
+                <Input
+                  defaultValue={project.series_name || ""}
+                  onBlur={(e) => {
+                    const next = e.target.value.trim();
+                    if (next !== (project.series_name || "")) updateSpec({ series_name: next || null });
+                  }}
+                  placeholder="e.g. The Print Trilogy"
+                  data-testid="spec-series"
+                />
               </SpecField>
             </div>
             {/* Publisher template upload — auto-detect trim from a real distributor file instead of guessing from the presets above */}
@@ -493,9 +538,11 @@ export default function Editor() {
               />
               <BigButton
                 icon={Download}
-                label="Generate PDF/X-1a"
-                tooltip="Exports a print-ready PDF/X-1a:2001 with correct trim, bleed, spine, embedded fonts and flattened transparency."
-                onClick={exportPdf}
+                label={isFreeTier ? "Generate PDF/X-1a — Upgrade Required" : "Generate PDF/X-1a"}
+                tooltip={isFreeTier
+                  ? "Free plan includes preview and compliance checks only. Upgrade to Author or higher to export a print-ready production PDF."
+                  : "Exports a print-ready PDF/X-1a:2001 with correct trim, bleed, spine, embedded fonts and flattened transparency."}
+                onClick={isFreeTier ? () => nav("/pricing") : exportPdf}
                 busy={exporting}
                 disabled={!hasAnyUpload}
                 primary
@@ -587,6 +634,8 @@ export default function Editor() {
 
         <BlurbDialog open={blurbOpen} onOpenChange={setBlurbOpen} defaultTitle={project.name} />
         <ManuscriptComposerDialog open={composerOpen} onOpenChange={setComposerOpen} defaultProject={project} />
+        <CoverTemplateDialog open={coverTemplateOpen} onOpenChange={setCoverTemplateOpen} projectId={id} onApplied={applySlotResult} />
+        <AICoverDialog open={aiCoverOpen} onOpenChange={setAiCoverOpen} projectId={id} onGenerated={applySlotResult} />
       </div>
     </TooltipProvider>
   );

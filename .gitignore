@@ -21,6 +21,10 @@ dist/
 build/
 coverage/
 
+# Runtime upload/export storage (user files -- never commit these)
+backend/uploads/
+backend/exports/
+
 # Logs and local junk
 *.log
 npm-debug.log*

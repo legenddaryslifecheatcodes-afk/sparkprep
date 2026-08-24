@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
-import { Logo } from "@/components/Logo";
+import { Logo, SparkPrepLogo } from "@/components/Logo";
 
 export default function Nav({ dark = true }) {
   const { user, logout } = useAuth();
@@ -10,9 +10,18 @@ export default function Nav({ dark = true }) {
   const linkCls = dark ? "text-neutral-400 hover:text-white transition-colors" : "text-neutral-600 hover:text-neutral-900 transition-colors";
   return (
     <nav className={`sticky top-0 z-50 ${base}`} data-testid="top-nav">
-      <div className="max-w-7xl mx-auto flex items-center justify-between px-6 py-4">
+      <div className="max-w-7xl mx-auto relative flex items-center justify-between px-6 py-4">
         <Link to="/" data-testid="nav-logo">
-          <Logo dark={dark} />
+          <Logo dark={dark} compact />
+        </Link>
+        {/* SparkPrep's own main logo -- the brand being promoted, so it gets
+            the dead-center spot at a larger size than the Legenddary mark. */}
+        <Link
+          to="/"
+          className="hidden md:block absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
+          data-testid="nav-sparkprep-logo"
+        >
+          <SparkPrepLogo height={64} />
         </Link>
         <div className="flex items-center gap-5 text-sm">
           {user?.beta_active && (
@@ -28,6 +37,7 @@ export default function Nav({ dark = true }) {
           <Link to="/audit" className="font-mono-spec text-[10px] tracking-widest uppercase text-white bg-[#FF6A00] px-2.5 py-1.5 hover:brightness-110 btn-industrial" data-testid="nav-audit">
             99¢ Audit
           </Link>
+          <Link to="/specs" className={linkCls} data-testid="nav-specs">Specs</Link>
           <Link to="/pricing" className={linkCls} data-testid="nav-pricing">Pricing</Link>
           {user ? (
             <>

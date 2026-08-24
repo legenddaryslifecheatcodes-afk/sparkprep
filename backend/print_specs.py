@@ -31,6 +31,42 @@ BINDING_TYPES = {
     "hardcover_jacket": {"label": "Hardcover with Dust Jacket", "bleed": 0.125, "safe_margin": 0.5, "flap": 3.5},
 }
 
+# Named CMYK output conditions selectable from the Editor's "Color profile"
+# dropdown. NOTE: these are metadata-level (OutputConditionIdentifier/Info
+# registry declarations in the PDF's OutputIntent), not embedded binary ICC
+# profiles -- the actual .icc profile files for GRACoL/FOGRA/Japan Color are
+# distributed under IDEAlliance/Japan Color Committee terms that don't
+# clearly permit bundling and redistributing them in a SaaS product, so we
+# don't ship them. A well-known registry name without an embedded profile
+# is still accepted as PDF/X-1a compliant by pdfx_validator.check_icc_output_intent
+# (mirroring how most distributor preflight tools treat it) -- it's the
+# correct, legally-safe middle ground until real licensed ICC binaries are
+# sourced and bundled.
+COLOR_PROFILES = {
+    "US Web Coated SWOP v2": {
+        "condition_identifier": "CGATS TR 001 (SWOP)",
+        "info": "U.S. Web Coated (SWOP) v2",
+        "registry": "http://www.color.org",
+    },
+    "GRACoL 2013": {
+        "condition_identifier": "CGATS TR 006 (GRACoL2013)",
+        "info": "Coated GRACoL 2013",
+        "registry": "http://www.color.org",
+    },
+    "FOGRA39": {
+        "condition_identifier": "FOGRA39L",
+        "info": "ISO Coated v2 (FOGRA39)",
+        "registry": "http://www.color.org",
+    },
+    "Japan Color 2001 Coated": {
+        "condition_identifier": "JC200103",
+        "info": "Japan Color 2001 Coated",
+        "registry": "http://www.color.org",
+    },
+}
+DEFAULT_COLOR_PROFILE = "US Web Coated SWOP v2"
+
+
 # Platform rules
 PLATFORMS = {
     "kdp": {
