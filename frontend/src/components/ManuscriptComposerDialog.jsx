@@ -16,6 +16,10 @@ as if the room had exhaled.
 
 Her father used to say the shop had two hearts. One belonged to the press.
 
+***
+
+Three streets over, in an office that still smelled of fresh paint, a different machine was about to fail her.
+
 # Chapter Two: The Rejection
 
 The letter came on a Tuesday. It was two lines long.
@@ -102,7 +106,7 @@ export default function ManuscriptComposerDialog({ open, onOpenChange, defaultPr
         <div className="mt-3">
           <div className="flex items-center justify-between mb-1">
             <Label className="font-mono-spec text-[10px] tracking-widest uppercase text-neutral-500">
-              Manuscript source · Use <span className="font-bold text-black">"# Chapter Title"</span> to mark chapter breaks
+              Manuscript source · Use <span className="font-bold text-black">"# Chapter Title"</span> for chapter breaks, <span className="font-bold text-black">"***"</span> on its own line for a scene/section break
             </Label>
             <button onClick={() => setForm({ ...form, source_text: SAMPLE_SOURCE })} className="font-mono-spec text-[10px] tracking-widest uppercase text-[#D4AF37] hover:underline" data-testid="composer-sample">Load sample</button>
           </div>

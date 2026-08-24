@@ -2,10 +2,12 @@
 from a template + user text. Beats InDesign for straightforward fiction / workbook / poetry books."""
 import io
 import re
+import types
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, PageBreak, Frame, PageTemplate,
     BaseDocTemplate, KeepTogether,
 )
+from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
@@ -27,7 +29,8 @@ TEMPLATES = {
         "description": "Classic novel layout — justified body, drop caps on chapter openers, running heads",
         "body_font": "Times-Roman", "body_size": 11, "leading": 15,
         "chapter_font": "Times-Bold", "chapter_size": 22, "chapter_align": TA_CENTER,
-        "drop_caps": True, "running_head": True,
+        "drop_caps": True, "running_head": True, "chapter_ornament": "•  •  •",
+        "section_break_ornament": "•  •  •",
         "chapter_start_page": "right",  # chapters always start on recto (right-hand page)
         "first_para_indent": 0,
         "para_indent": 0.25 * inch,
@@ -37,7 +40,8 @@ TEMPLATES = {
         "description": "Extra whitespace, larger body text, room for annotation — great for guided journals",
         "body_font": "Helvetica", "body_size": 12, "leading": 18,
         "chapter_font": "Helvetica-Bold", "chapter_size": 20, "chapter_align": TA_LEFT,
-        "drop_caps": False, "running_head": False,
+        "drop_caps": False, "running_head": False, "chapter_ornament": None,
+        "section_break_ornament": None,
         "chapter_start_page": "any",
         "first_para_indent": 0,
         "para_indent": 0,
@@ -47,38 +51,56 @@ TEMPLATES = {
         "description": "Ragged-right, centered short lines, generous vertical rhythm — for verse collections",
         "body_font": "Times-Italic", "body_size": 11, "leading": 17,
         "chapter_font": "Times-Bold", "chapter_size": 18, "chapter_align": TA_CENTER,
-        "drop_caps": False, "running_head": False,
+        "drop_caps": False, "running_head": False, "chapter_ornament": "•  •  •",
+        "section_break_ornament": "•  •  •",
         "chapter_start_page": "any",
         "first_para_indent": 0,
         "para_indent": 0,
     },
 }
 
+# Sentinel marking a mid-chapter section/scene break in a chapter's parsed
+# paragraph list -- distinct from a chapter break (new page + heading).
+# Source text marks one with a line containing exactly "***".
+SECTION_BREAK = "\x00SECTION_BREAK\x00"
+
 
 def parse_source_text(text: str):
     """Split source text on '# Chapter Title' markers. Everything before the first marker
-    is treated as front matter body (no chapter title)."""
+    is treated as front matter body (no chapter title). A line containing exactly '***'
+    marks a mid-chapter section/scene break (SECTION_BREAK sentinel), distinct from a
+    chapter break -- it doesn't start a new page or heading, just a visual gap."""
     chapters = []
     current = {"title": None, "paragraphs": []}
     for line in text.splitlines():
         line = line.rstrip()
+        stripped = line.strip()
         if line.startswith("# "):
             if current["title"] is not None or current["paragraphs"]:
                 chapters.append(current)
             current = {"title": line[2:].strip(), "paragraphs": []}
-        elif line.strip() == "":
-            if current["paragraphs"] and current["paragraphs"][-1] != "":
+        elif stripped == "***":
+            if current["paragraphs"] and current["paragraphs"][-1] != SECTION_BREAK:
+                current["paragraphs"].append(SECTION_BREAK)
+        elif stripped == "":
+            if current["paragraphs"] and current["paragraphs"][-1] not in ("", SECTION_BREAK):
                 current["paragraphs"].append("")
         else:
-            if not current["paragraphs"] or current["paragraphs"][-1] == "":
+            if not current["paragraphs"] or current["paragraphs"][-1] in ("", SECTION_BREAK):
                 current["paragraphs"].append(line)
             else:
                 current["paragraphs"][-1] += " " + line
     if current["title"] is not None or current["paragraphs"]:
         chapters.append(current)
-    # Filter out empty paragraph strings and empty chapters
+    # Filter out empty paragraph strings and empty chapters; drop a section
+    # break left dangling at the very start/end of a chapter (nothing to
+    # visually separate there).
     for c in chapters:
         c["paragraphs"] = [p for p in c["paragraphs"] if p.strip()]
+        while c["paragraphs"] and c["paragraphs"][0] == SECTION_BREAK:
+            c["paragraphs"].pop(0)
+        while c["paragraphs"] and c["paragraphs"][-1] == SECTION_BREAK:
+            c["paragraphs"].pop()
     chapters = [c for c in chapters if c["title"] or c["paragraphs"]]
     return chapters
 
@@ -171,6 +193,21 @@ def compose_manuscript_pdf(
         fontName=tpl["body_font"], fontSize=14, alignment=TA_CENTER,
         spaceBefore=0.5 * inch, textColor=(0.2, 0.2, 0.2),
     )
+    ornament_style = ParagraphStyle(
+        "Ornament", parent=styles["Normal"],
+        fontName=tpl["body_font"], fontSize=13, alignment=TA_CENTER,
+        spaceBefore=0, spaceAfter=0.3 * inch, textColor=(0.35, 0.35, 0.35),
+    )
+    section_break_style = ParagraphStyle(
+        "SectionBreak", parent=styles["Normal"],
+        fontName=tpl["body_font"], fontSize=12, alignment=TA_CENTER,
+        spaceBefore=0.25 * inch, spaceAfter=0.25 * inch, textColor=(0.35, 0.35, 0.35),
+    )
+    toc_title_style = ParagraphStyle(
+        "TOCTitle", parent=styles["Title"],
+        fontName=tpl["chapter_font"], fontSize=24, alignment=TA_CENTER,
+        spaceBefore=0.5 * inch, spaceAfter=0.4 * inch, textColor=(0, 0, 0),
+    )
 
     # Build flowables
     story = []
@@ -188,19 +225,68 @@ def compose_manuscript_pdf(
     story.append(PageBreak())
 
     chapters = parse_source_text(source_text)
+    has_titled_chapters = any(ch["title"] for ch in chapters)
+
+    # Auto-generated Table of Contents -- entries are collected via the
+    # afterFlowable hook below (which watches for paragraphs using the
+    # "Chapter" style) and only resolve to correct page numbers because
+    # doc.multiBuild() below runs the layout twice: pass 1 discovers where
+    # each chapter actually lands, pass 2 renders the TOC with those page
+    # numbers already known. A single build() pass can't do this -- the
+    # TOC page itself shifts every later page number by however many pages
+    # the TOC takes up.
+    if has_titled_chapters:
+        toc = TableOfContents()
+        toc.levelStyles = [
+            ParagraphStyle(
+                "TOCLevel0", fontName=tpl["body_font"], fontSize=12, leading=18,
+                leftIndent=20, firstLineIndent=-20,
+            ),
+        ]
+        story.append(Paragraph("Contents", toc_title_style))
+        story.append(toc)
+        story.append(PageBreak())
+
     for ci, ch in enumerate(chapters):
         if ci > 0 and tpl["chapter_start_page"] == "right":
             # Ensure chapter starts on recto — insert a blank if we're currently on recto
             story.append(PageBreak())
         if ch["title"]:
             story.append(Paragraph(ch["title"], chapter_style))
+            if tpl.get("chapter_ornament"):
+                story.append(Paragraph(tpl["chapter_ornament"], ornament_style))
         for pi, para in enumerate(ch["paragraphs"]):
+            if para == SECTION_BREAK:
+                ornament = tpl.get("section_break_ornament")
+                if ornament:
+                    story.append(Paragraph(ornament, section_break_style))
+                else:
+                    story.append(Spacer(1, 0.35 * inch))
+                continue
             # Escape HTML-ish characters
             safe = para.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             style = body_first_para if pi == 0 else body_style
+            if pi == 0 and tpl.get("drop_caps") and safe:
+                # Simplified drop cap: an enlarged first letter set inline via
+                # ReportLab's mini-markup. This is not a true multi-line
+                # magazine-style wrap (platypus paragraphs can't flow text
+                # around an oversized inline glyph the way InDesign does),
+                # but it's the standard lightweight approximation most
+                # auto-typesetting tools use, and it's a real visual effect,
+                # not just a declared-but-unrendered template flag.
+                drop_size = int(tpl["body_size"] * 3.1)
+                safe = f'<font size="{drop_size}">{safe[0]}</font>{safe[1:]}'
             story.append(Paragraph(safe, style))
 
-    doc.build(story)
+    if has_titled_chapters:
+        def _after_flowable(self, flowable):
+            if isinstance(flowable, Paragraph) and getattr(flowable.style, "name", "") == "Chapter":
+                self.notify("TOCEntry", (0, flowable.getPlainText(), self.page))
+
+        doc.afterFlowable = types.MethodType(_after_flowable, doc)
+        doc.multiBuild(story)
+    else:
+        doc.build(story)
 
     # Read back page count
     from pypdf import PdfReader
