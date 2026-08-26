@@ -871,15 +871,37 @@ async def preview_file(project_id: str, request: Request):
 
 
 @api_router.post("/projects/{project_id}/autofix")
-async def autofix(project_id: str, user: dict = Depends(get_current_user)):
+async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_current_user)):
     """Run all auto-fixes (convert to CMYK, upscale, flatten transparency,
-    declare PDF/X-1a)."""
+    declare PDF/X-1a) and re-check the result in one pass, so the response
+    reflects what's actually true now rather than a promise -- this is the
+    fix-then-rescan step the guided workflow relies on for every slot.
+
+    `slot` selects which uploaded file to fix (e.g. "interior" for a
+    combined project's interior PDF); omitting it preserves the original
+    behavior of fixing the legacy uploaded_file/file_metadata pair (the
+    cover / full_wrap file), so existing callers don't need to change."""
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
-    if not p or not p.get("uploaded_file"):
-        raise HTTPException(404, "No uploaded file")
-    file_path = UPLOAD_DIR / p["uploaded_file"]
+    if not p:
+        raise HTTPException(404, "Project not found")
+
+    if slot:
+        if slot not in ALLOWED_SLOTS:
+            raise HTTPException(400, f"Unknown slot: {slot}")
+        slot_data = (p.get("slots") or {}).get(slot)
+        if not slot_data or not slot_data.get("stored_filename"):
+            raise HTTPException(404, f"No uploaded file in slot '{slot}'")
+        stored_filename = slot_data["stored_filename"]
+        current_metadata = slot_data
+    else:
+        if not p.get("uploaded_file"):
+            raise HTTPException(404, "No uploaded file")
+        stored_filename = p["uploaded_file"]
+        current_metadata = p.get("file_metadata", {})
+
+    file_path = UPLOAD_DIR / stored_filename
     ghostscript_result = None
-    if p.get("file_metadata", {}).get("is_pdf"):
+    if current_metadata.get("is_pdf"):
         # Check what actually needs fixing before touching the file --
         # only PDF/X-1a declaration, live transparency, and layers are
         # things Ghostscript's -dPDFX pipeline can genuinely repair (it
@@ -899,7 +921,7 @@ async def autofix(project_id: str, user: dict = Depends(get_current_user)):
                 }
                 metadata = analyze_file(str(file_path))
             else:
-                fixed_name = f"{project_id}_gsfixed_{uuid.uuid4().hex[:6]}.pdf"
+                fixed_name = f"{project_id}_{slot or 'cover'}_gsfixed_{uuid.uuid4().hex[:6]}.pdf"
                 fixed_path = UPLOAD_DIR / fixed_name
                 try:
                     convert_to_pdfx1a(str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
@@ -907,13 +929,9 @@ async def autofix(project_id: str, user: dict = Depends(get_current_user)):
                         os.remove(file_path)
                     except OSError:
                         pass
-                    await db.projects.update_one(
-                        {"_id": ObjectId(project_id)},
-                        {"$set": {"uploaded_file": fixed_name}},
-                    )
                     file_path = fixed_path
                     metadata = analyze_file(str(fixed_path))
-                    metadata["original_filename"] = p.get("file_metadata", {}).get("original_filename")
+                    metadata["original_filename"] = current_metadata.get("original_filename")
                     metadata["stored_filename"] = fixed_name
                     metadata["autofixed"] = True
                     # Re-run the structural audit against the fixed file so the
@@ -935,39 +953,106 @@ async def autofix(project_id: str, user: dict = Depends(get_current_user)):
             metadata = analyze_file(str(file_path))
     else:
         # Convert to CMYK TIFF
-        fixed_name = f"{project_id}_fixed_{uuid.uuid4().hex[:6]}.tif"
+        fixed_name = f"{project_id}_{slot or 'cover'}_fixed_{uuid.uuid4().hex[:6]}.tif"
         fixed_path = UPLOAD_DIR / fixed_name
         try:
             convert_to_cmyk(str(file_path), str(fixed_path), 300)
         except Exception as e:
             await log_failure(db, "autofix_cmyk", e, project_id=project_id, user_id=user["id"],
-                               context={"file_ext": Path(file_path).suffix.lower()})
+                               context={"file_ext": Path(file_path).suffix.lower(), "slot": slot})
             raise HTTPException(500, f"CMYK conversion failed: {e}")
-        # Update project to use the fixed file
         try:
             os.remove(file_path)
         except OSError:
             pass
-        await db.projects.update_one(
-            {"_id": ObjectId(project_id)},
-            {"$set": {"uploaded_file": fixed_name}},
-        )
         metadata = analyze_file(str(fixed_path))
-        metadata["original_filename"] = p.get("file_metadata", {}).get("original_filename")
+        metadata["original_filename"] = current_metadata.get("original_filename")
         metadata["stored_filename"] = fixed_name
         metadata["autofixed"] = True
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
     compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
-    await db.projects.update_one(
-        {"_id": ObjectId(project_id)},
-        {"$set": {
+    # Branches above that didn't actually replace the file (no fix needed, or
+    # Ghostscript unavailable) don't set stored_filename on the fresh
+    # metadata -- fall back to the file we started with so it doesn't go
+    # missing from the project record.
+    metadata.setdefault("stored_filename", stored_filename)
+
+    if slot:
+        metadata["slot"] = slot
+        slots = p.get("slots") or {}
+        slots[slot] = {**metadata, "compliance": compliance}
+        update = {"slots": slots, "updated_at": datetime.now(timezone.utc).isoformat()}
+        if slot == "full_wrap":
+            update["uploaded_file"] = metadata["stored_filename"]
+            update["file_metadata"] = metadata
+            update["compliance"] = compliance
+    else:
+        update = {
+            "uploaded_file": metadata["stored_filename"],
             "file_metadata": metadata, "compliance": compliance,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-        }},
+        }
+    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
+    return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "check_type": "basic"}
+
+
+@api_router.post("/projects/{project_id}/final-review")
+async def final_review(project_id: str, user: dict = Depends(get_current_user)):
+    """One last combined check across every file the project actually
+    needs (cover for cover/combined projects, interior for interior/combined
+    projects) before export -- the guided workflow's last step. Re-runs
+    compliance fresh against whatever's currently uploaded rather than
+    trusting stale results from an earlier upload/autofix call, and reduces
+    everything to a single stoplight verdict:
+      - red: at least one section has a hard failure -- must not export yet
+      - yellow: no failures, but some warnings remain -- exportable but worth reviewing
+      - green: every required section passed clean
+    """
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    project_type = p.get("project_type", "cover")
+    needs_cover = project_type in ("cover", "combined")
+    needs_interior = project_type in ("interior", "combined")
+
+    sections = {}
+    if needs_cover:
+        cover_meta = (p.get("slots") or {}).get("full_wrap") or p.get("file_metadata")
+        if not cover_meta:
+            sections["cover"] = {"uploaded": False, "compliance": []}
+        else:
+            sections["cover"] = {"uploaded": True, "compliance": run_compliance_checks(cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"])}
+    if needs_interior:
+        interior_meta = (p.get("slots") or {}).get("interior")
+        if not interior_meta:
+            sections["interior"] = {"uploaded": False, "compliance": []}
+        else:
+            sections["interior"] = {"uploaded": True, "compliance": run_compliance_checks(interior_meta, trim["w"], trim["h"], plat["bleed"], p["platform"])}
+
+    all_checks = [c for s in sections.values() for c in s["compliance"]]
+    any_missing = any(not s["uploaded"] for s in sections.values())
+    any_fail = any(c["status"] == "fail" for c in all_checks)
+    any_warning = any(c["status"] == "warning" for c in all_checks)
+
+    if any_missing:
+        status, message = "red", "Not every required file has been uploaded yet."
+    elif any_fail:
+        status, message = "red", "One or more sections still have a failing check -- fix those before exporting."
+    elif any_warning:
+        status, message = "yellow", "No failures, but some warnings remain -- you can export, but review them first."
+    else:
+        status, message = "green", "Every check passed. Ready to export."
+
+    await db.projects.update_one(
+        {"_id": ObjectId(project_id)},
+        {"$set": {"last_final_review": {"status": status, "message": message, "checked_at": datetime.now(timezone.utc).isoformat()}}},
     )
-    return {"file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "check_type": "basic"}
+    return {"status": status, "message": message, "sections": sections}
 
 
 # ---- Export ----
