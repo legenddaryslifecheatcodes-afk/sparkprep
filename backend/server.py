@@ -39,6 +39,7 @@ from pdfx_validator import run_pdf_structure_audit
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
 from report_export import generate_audit_report_pdf, generate_audit_brief_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
+from failure_log import log_failure
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
 from manuscript_composer import compose_manuscript_pdf, list_templates as list_manuscript_templates, TEMPLATES as MANUSCRIPT_TEMPLATES
 from beta_engine import (
@@ -823,14 +824,19 @@ async def upload_file(project_id: str, file: UploadFile = File(...), user: dict 
                 raise HTTPException(413, f"File exceeds {max_mb}MB limit for {tier} tier")
             f.write(chunk)
 
-    metadata = analyze_file(str(file_path))
-    metadata["original_filename"] = file.filename
-    metadata["stored_filename"] = file_id
+    try:
+        metadata = analyze_file(str(file_path))
+        metadata["original_filename"] = file.filename
+        metadata["stored_filename"] = file_id
 
-    # Run compliance checks
-    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
-    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
+        # Run compliance checks
+        trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+        plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+        compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
+    except Exception as e:
+        await log_failure(db, "upload_analyze", e, project_id=project_id, user_id=user["id"],
+                           context={"filename": file.filename, "ext": ext})
+        raise HTTPException(500, f"Couldn't analyze this file: {e}. It may be corrupted or an unsupported variant of {ext}.")
 
     await db.projects.update_one(
         {"_id": ObjectId(project_id)},
@@ -923,13 +929,20 @@ async def autofix(project_id: str, user: dict = Depends(get_current_user)):
                 except RuntimeError as e:
                     ghostscript_result = {"attempted": True, "succeeded": False, "reason": str(e)}
                     metadata = analyze_file(str(file_path))
+                    await log_failure(db, "autofix_ghostscript", e, project_id=project_id, user_id=user["id"],
+                                       context={"fixable_ids": [f["id"] for f in structure_findings if f["id"] in fixable_ids]})
         else:
             metadata = analyze_file(str(file_path))
     else:
         # Convert to CMYK TIFF
         fixed_name = f"{project_id}_fixed_{uuid.uuid4().hex[:6]}.tif"
         fixed_path = UPLOAD_DIR / fixed_name
-        convert_to_cmyk(str(file_path), str(fixed_path), 300)
+        try:
+            convert_to_cmyk(str(file_path), str(fixed_path), 300)
+        except Exception as e:
+            await log_failure(db, "autofix_cmyk", e, project_id=project_id, user_id=user["id"],
+                               context={"file_ext": Path(file_path).suffix.lower()})
+            raise HTTPException(500, f"CMYK conversion failed: {e}")
         # Update project to use the fixed file
         try:
             os.remove(file_path)
@@ -1027,37 +1040,42 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     if TIERS.get(tier, {}).get("white_label") and billing_user.get("white_label_brand_name"):
         producer_name = billing_user["white_label_brand_name"]
 
-    # Multi-page interior branch: source is a PDF → preserve vector text + fonts, tag PDF/X-1a
-    if is_interior and file_ext == ".pdf":
-        result = build_interior_pdf_x1a(
-            str(file_path), str(export_path),
-            trim_w=trim["w"], trim_h=trim["h"],
-            bleed=plat["bleed"],
-            title=p["name"],
-            author=(user.get("name") or ""),
-            color_profile=color_profile,
-            producer_name=producer_name,
-        )
-    else:
-        # Cover, combined, or image-source interior → rasterized single-page flow
-        # If a valid ISBN is set on the project and this is a cover, generate barcode PNG
-        barcode_png = None
-        if is_cover and p.get("isbn"):
-            try:
-                from barcode_engine import generate_barcode_png_bytes
-                barcode_png = generate_barcode_png_bytes(p["isbn"])
-            except Exception:
-                barcode_png = None
-        result = build_print_ready_pdf(
-            str(file_path), str(export_path),
-            trim_w=trim["w"], trim_h=trim["h"],
-            bleed=plat["bleed"], spine_w=spine_w,
-            is_cover=is_cover, title=p["name"],
-            author=(user.get("name") or ""),
-            barcode_png_bytes=barcode_png,
-            color_profile=color_profile,
-            producer_name=producer_name,
-        )
+    try:
+        # Multi-page interior branch: source is a PDF → preserve vector text + fonts, tag PDF/X-1a
+        if is_interior and file_ext == ".pdf":
+            result = build_interior_pdf_x1a(
+                str(file_path), str(export_path),
+                trim_w=trim["w"], trim_h=trim["h"],
+                bleed=plat["bleed"],
+                title=p["name"],
+                author=(user.get("name") or ""),
+                color_profile=color_profile,
+                producer_name=producer_name,
+            )
+        else:
+            # Cover, combined, or image-source interior → rasterized single-page flow
+            # If a valid ISBN is set on the project and this is a cover, generate barcode PNG
+            barcode_png = None
+            if is_cover and p.get("isbn"):
+                try:
+                    from barcode_engine import generate_barcode_png_bytes
+                    barcode_png = generate_barcode_png_bytes(p["isbn"])
+                except Exception:
+                    barcode_png = None
+            result = build_print_ready_pdf(
+                str(file_path), str(export_path),
+                trim_w=trim["w"], trim_h=trim["h"],
+                bleed=plat["bleed"], spine_w=spine_w,
+                is_cover=is_cover, title=p["name"],
+                author=(user.get("name") or ""),
+                barcode_png_bytes=barcode_png,
+                color_profile=color_profile,
+                producer_name=producer_name,
+            )
+    except Exception as e:
+        await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
+                           context={"project_type": p["project_type"], "file_ext": file_ext, "platform": p["platform"]})
+        raise HTTPException(500, f"Export failed while building the print-ready PDF: {e}")
 
     # Increment usage -- always against the billing account, not necessarily
     # the acting user, so a team's shared pool is debited correctly.
@@ -1792,7 +1810,12 @@ async def upload_publisher_template(project_id: str, file: UploadFile = File(...
         while chunk := await file.read(1024 * 1024):
             f.write(chunk)
 
-    metadata = analyze_file(str(file_path))
+    try:
+        metadata = analyze_file(str(file_path))
+    except Exception as e:
+        await log_failure(db, "template_upload_analyze", e, project_id=project_id, user_id=user["id"],
+                           context={"filename": file.filename, "ext": ext})
+        raise HTTPException(500, f"Couldn't analyze this template file: {e}")
     metadata["original_filename"] = file.filename
     metadata["stored_filename"] = file_id
     metadata["source"] = "publisher_template"
@@ -1821,6 +1844,8 @@ async def upload_publisher_template(project_id: str, file: UploadFile = File(...
         except Exception as e:
             logging.exception("template interpretation failed for %s", file_id)
             detected_spec = {"error": str(e)}
+            await log_failure(db, "template_interpretation", e, project_id=project_id, user_id=user["id"],
+                               context={"filename": file.filename})
 
     await db.projects.update_one(
         {"_id": ObjectId(project_id)},
@@ -1870,14 +1895,19 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
                 raise HTTPException(413, f"File exceeds {max_mb}MB limit")
             f.write(chunk)
 
-    metadata = analyze_file(str(file_path))
-    metadata["original_filename"] = file.filename
-    metadata["stored_filename"] = file_id
-    metadata["slot"] = slot
+    try:
+        metadata = analyze_file(str(file_path))
+        metadata["original_filename"] = file.filename
+        metadata["stored_filename"] = file_id
+        metadata["slot"] = slot
 
-    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
-    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
+        trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+        plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+        compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
+    except Exception as e:
+        await log_failure(db, "slot_upload_analyze", e, project_id=project_id, user_id=user["id"],
+                           context={"filename": file.filename, "ext": ext, "slot": slot})
+        raise HTTPException(500, f"Couldn't analyze this file: {e}. It may be corrupted or an unsupported variant of {ext}.")
 
     slots = p.get("slots") or {}
     # Clean up prior file for this slot
@@ -2481,6 +2511,24 @@ async def beta_submit_feedback(payload: BetaFeedbackIn, user: dict = Depends(get
 
 
 # ---- Admin-only ----
+@api_router.get("/admin/failures")
+async def admin_list_failures(stage: str = None, limit: int = 100, _: dict = Depends(require_admin)):
+    """Read-only view of the failure_log collection (see failure_log.py) --
+    every processing crash (upload analysis, autofix, export, template
+    detection) with its stage, error, traceback and the project/user it
+    happened to, most recent first. Filter by `stage` to isolate one
+    failure point (e.g. ?stage=export_build_pdf) while debugging a
+    specific report from a user."""
+    limit = max(1, min(500, limit))
+    query = {"stage": stage} if stage else {}
+    cursor = db.failure_log.find(query).sort("timestamp", -1).limit(limit)
+    items = []
+    async for f in cursor:
+        f["id"] = str(f.pop("_id"))
+        items.append(f)
+    return {"failures": items, "count": len(items)}
+
+
 @api_router.get("/admin/beta/passes")
 async def admin_list_passes(_: dict = Depends(require_admin)):
     cursor = db.beta_passes.find().sort("created_at", -1)
