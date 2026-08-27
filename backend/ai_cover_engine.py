@@ -1,30 +1,41 @@
-"""AI cover art generation via Google's Gemini API (image-generation models).
+"""AI cover art generation and image enhancement via OpenAI's Image API.
 
-Requires GOOGLE_API_KEY in backend/.env. Uses the REST generateContent
-endpoint directly (no SDK dependency, same pattern as the direct-HTTP
-Anthropic call in server.py's /ai/blurb) so there's one fewer pinned SDK
-version to track.
+Requires OPENAI_API_KEY in backend/.env. Uses OpenAI's REST endpoints
+directly (no SDK dependency, same pattern as the direct-HTTP Anthropic
+call in server.py's /ai/blurb) so there's one fewer pinned SDK version to
+track.
 
-The prior model (imagen-4.0-generate-001, called via :predict) was
-deprecated and shut down by Google on 2026-08-17 -- confirmed dead in
-production via a live test call (404 model not found) on 2026-08-26.
-Google's documented replacement is gemini-2.5-flash-image via
-:generateContent, a different request/response shape entirely (contents/
-parts instead of instances/parameters, inlineData instead of
-bytesBase64Encoded) -- this file was rewritten for that shape, not just
-had its model name swapped.
+Switched from Google's Gemini/Imagen API on 2026-08-26 -- that path hit
+two separate blockers in production: the Imagen model had been deprecated
+and shut down by Google, and even after fixing the model name, image
+generation requires a Google Cloud project with billing enabled (the free
+tier's quota is 0 requests, not a small allowance), which ran into a
+card-decline issue at signup. OpenAI's billing is a plain card checkout
+with no cloud-project setup step.
 
-Separately: image generation requires a Google Cloud project with billing
-enabled -- the free tier's quota for these models is 0 requests, not a
-small allowance. A 429 RESOURCE_EXHAUSTED error whose message says
-"limit: 0" means billing isn't on, not that usage was exceeded.
+One thing to verify once a real key is in hand: OpenAI's docs mention GPT
+Image models may require "API Organization Verification" (an identity
+check) in the developer dashboard before they'll actually respond, on top
+of billing being enabled -- if generation calls fail with an
+organization/verification-related error, that's what's being asked for.
 """
 import base64
 import os
 from typing import Optional
 
-GOOGLE_IMAGE_MODEL = os.environ.get("GOOGLE_IMAGE_MODEL", "gemini-2.5-flash-image")
-GOOGLE_GENAI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
+OPENAI_API_BASE = "https://api.openai.com/v1"
+
+# OpenAI's images endpoints take a fixed set of sizes, not an arbitrary
+# aspect ratio string -- map SparkPrep's cover aspect ratios to the closest
+# supported size (all covers here are portrait, so this only needs to
+# distinguish "roughly square" from "clearly portrait").
+_SIZE_BY_ASPECT = {
+    "1:1": "1024x1024",
+    "3:4": "1024x1536",
+    "2:3": "1024x1536",
+}
+DEFAULT_SIZE = "1024x1536"
 
 
 class AICoverError(Exception):
@@ -54,93 +65,86 @@ def build_cover_prompt(user_prompt: str, title: Optional[str], genre: Optional[s
     return " ".join(parts)
 
 
-def _extract_image_bytes(data: dict) -> bytes:
-    """Shared response parsing for generateContent calls -- both cover
-    generation and image-enhancement use this same response shape (a
-    candidate's content.parts, one of which carries inlineData)."""
-    candidates = data.get("candidates") or []
-    if not candidates:
-        block_reason = (data.get("promptFeedback") or {}).get("blockReason")
-        if block_reason:
-            raise AICoverError(f"Google's image model declined this request ({block_reason}). Try a different description or image.")
-        raise AICoverError("Image generation returned no results. Try a different description.")
-
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    for part in parts:
-        inline = part.get("inlineData")
-        if inline and inline.get("data"):
-            try:
-                return base64.b64decode(inline["data"])
-            except Exception as e:
-                raise AICoverError(f"Couldn't decode the generated image: {e}")
-
-    raise AICoverError("Image generation response didn't include an image.")
+def _handle_error_response(resp) -> None:
+    if resp.status_code == 401:
+        raise AICoverError("OpenAI rejected this API key. Double-check OPENAI_API_KEY is set correctly.", 503)
+    if resp.status_code == 429:
+        raise AICoverError(
+            "OpenAI rate-limited or quota-exhausted this request. If this is a fresh account, make sure "
+            "billing/credit is actually added, not just an API key created.", 503,
+        )
+    if resp.status_code == 403:
+        raise AICoverError(
+            "OpenAI blocked this request (403) -- GPT Image models can require completing 'API Organization "
+            "Verification' in the OpenAI developer dashboard before they'll respond, separate from billing.", 503,
+        )
+    if resp.status_code != 200:
+        raise AICoverError(f"OpenAI image request failed ({resp.status_code}): {resp.text[:300]}")
 
 
 async def generate_cover_image(prompt: str, api_key: str, aspect_ratio: str = "3:4") -> bytes:
-    """Calls Gemini's generateContent endpoint and returns raw image bytes
-    for the generated image. Raises AICoverError with a user-facing message
-    on any failure (missing key handled by the caller before this is ever
-    invoked). aspect_ratio isn't a request parameter on this endpoint the
-    way it was on the old :predict API -- folded into the prompt text
-    instead, since that's how this model shape controls composition."""
+    """Calls OpenAI's image generation endpoint and returns raw PNG bytes.
+    Raises AICoverError with a user-facing message on any failure (missing
+    key handled by the caller before this is ever invoked)."""
     if not api_key:
-        raise AICoverError("AI Cover Generation isn't configured yet — add GOOGLE_API_KEY to backend/.env", 503)
+        raise AICoverError("AI Cover Generation isn't configured yet — add OPENAI_API_KEY to backend/.env", 503)
 
     import httpx
-    url = f"{GOOGLE_GENAI_BASE}/models/{GOOGLE_IMAGE_MODEL}:generateContent?key={api_key}"
-    full_prompt = f"{prompt} Image aspect ratio: {aspect_ratio}."
-    payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+    url = f"{OPENAI_API_BASE}/images/generations"
+    payload = {
+        "model": OPENAI_IMAGE_MODEL,
+        "prompt": prompt,
+        "size": _SIZE_BY_ASPECT.get(aspect_ratio, DEFAULT_SIZE),
+        "n": 1,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=payload)
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
     except Exception as e:
-        raise AICoverError(f"Couldn't reach Google's image generation API: {e}")
+        raise AICoverError(f"Couldn't reach OpenAI's image generation API: {e}")
 
-    if resp.status_code == 429:
-        raise AICoverError(
-            "Google's image generation quota is exhausted. If this is a fresh setup, this usually means "
-            "billing isn't enabled yet on the Google Cloud project for this API key -- the free tier's quota "
-            "for image models is 0, not a small trial allowance.", 503,
-        )
-    if resp.status_code != 200:
-        raise AICoverError(f"Image generation failed ({resp.status_code}): {resp.text[:300]}")
+    _handle_error_response(resp)
 
-    return _extract_image_bytes(resp.json())
+    data = resp.json()
+    items = data.get("data") or []
+    if not items or not items[0].get("b64_json"):
+        raise AICoverError("Image generation returned no results. Try a different description.")
+    try:
+        return base64.b64decode(items[0]["b64_json"])
+    except Exception as e:
+        raise AICoverError(f"Couldn't decode the generated image: {e}")
 
 
 async def enhance_image(image_bytes: bytes, mime_type: str, api_key: str, instruction: str) -> bytes:
-    """Feeds an existing image back into the same multimodal model along
+    """Feeds an existing image into OpenAI's image *edits* endpoint along
     with an editing instruction and returns the resulting image bytes --
     used for the "AI Upscale" fix option (SparkPrep's approach: rather than
     a naive pixel-stretch, ask the model to enhance detail/resolution while
-    preserving the original composition exactly)."""
+    preserving the original composition exactly). Unlike generations, edits
+    is multipart/form-data since it takes a real file upload, not JSON."""
     if not api_key:
-        raise AICoverError("AI enhancement isn't configured yet — add GOOGLE_API_KEY to backend/.env", 503)
+        raise AICoverError("AI enhancement isn't configured yet — add OPENAI_API_KEY to backend/.env", 503)
 
     import httpx
-    url = f"{GOOGLE_GENAI_BASE}/models/{GOOGLE_IMAGE_MODEL}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": instruction},
-                {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(image_bytes).decode("ascii")}},
-            ],
-        }],
-    }
+    url = f"{OPENAI_API_BASE}/images/edits"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    ext = "png" if "png" in mime_type else "jpg"
+    files = {"image": (f"source.{ext}", image_bytes, mime_type)}
+    data = {"model": OPENAI_IMAGE_MODEL, "prompt": instruction, "n": "1"}
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=payload)
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(url, headers=headers, data=data, files=files)
     except Exception as e:
-        raise AICoverError(f"Couldn't reach Google's image API: {e}")
+        raise AICoverError(f"Couldn't reach OpenAI's image API: {e}")
 
-    if resp.status_code == 429:
-        raise AICoverError(
-            "Google's image quota is exhausted. If this is a fresh setup, this usually means billing isn't "
-            "enabled yet on the Google Cloud project for this API key -- the free tier's quota for image "
-            "models is 0, not a small trial allowance.", 503,
-        )
-    if resp.status_code != 200:
-        raise AICoverError(f"Image enhancement failed ({resp.status_code}): {resp.text[:300]}")
+    _handle_error_response(resp)
 
-    return _extract_image_bytes(resp.json())
+    result = resp.json()
+    items = result.get("data") or []
+    if not items or not items[0].get("b64_json"):
+        raise AICoverError("Image enhancement returned no results.")
+    try:
+        return base64.b64decode(items[0]["b64_json"])
+    except Exception as e:
+        raise AICoverError(f"Couldn't decode the enhanced image: {e}")

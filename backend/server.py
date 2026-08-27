@@ -46,7 +46,7 @@ from beta_engine import (
     generate_pass_code, new_pass_doc, new_feedback_doc, DEFAULT_CHECKLIST_FEATURES,
 )
 from series_engine import check_series_consistency
-from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
+from ai_cover_engine import build_cover_prompt, generate_cover_image, enhance_image, AICoverError
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -1798,7 +1798,7 @@ async def manuscript_preview(file_id: str, request: Request):
 import json as _json
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")  # AI Cover Generation (Imagen via Gemini API)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # AI Cover Generation + AI Upscale (OpenAI Image API)
 ANTHROPIC_BLURB_MODEL = os.environ.get("ANTHROPIC_BLURB_MODEL", "claude-sonnet-4-5-20250929")
 
 
@@ -2055,7 +2055,7 @@ async def _replace_slot(project_id: str, p: dict, slot: str, metadata: dict, com
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
 
 
-# ---- AI Cover Generation (Author plan+, requires GOOGLE_API_KEY) ----
+# ---- AI Cover Generation (Author plan+, requires OPENAI_API_KEY) ----
 class AICoverIn(BaseModel):
     prompt: str
     genre: Optional[str] = None
@@ -2075,12 +2075,12 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
     billing_user = await get_billing_user(user)
     if billing_user.get("tier", "free") == "free":
         raise HTTPException(402, "AI Cover Generation requires the Author plan or higher.")
-    if not GOOGLE_API_KEY:
-        raise HTTPException(503, "AI Cover Generation isn't configured yet — add GOOGLE_API_KEY to backend/.env")
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, "AI Cover Generation isn't configured yet — add OPENAI_API_KEY to backend/.env")
 
     prompt = build_cover_prompt(payload.prompt, p.get("name"), payload.genre, payload.slot == "full_wrap")
     try:
-        image_bytes = await generate_cover_image(prompt, GOOGLE_API_KEY)
+        image_bytes = await generate_cover_image(prompt, OPENAI_API_KEY)
     except AICoverError as e:
         raise HTTPException(e.status_code, str(e))
 
@@ -2092,6 +2092,64 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
     )
     await _replace_slot(project_id, p, payload.slot, metadata, compliance)
     return {"slot": payload.slot, "file_metadata": metadata, "compliance": compliance}
+
+
+ENHANCE_INSTRUCTION = (
+    "Enhance this exact image: significantly increase resolution, sharpness, and fine detail as if it had "
+    "originally been captured at much higher resolution. Preserve the composition, colors, subject, framing, "
+    "and every visible detail exactly as they are -- do not add, remove, move, or reinterpret anything in the "
+    "image. This is a quality restoration, not a creative reinterpretation."
+)
+
+
+@api_router.post("/projects/{project_id}/ai-enhance/{slot}")
+async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_current_user)):
+    """'AI Upscale' fix option for a low-DPI compliance failure: sends the
+    existing slot image to OpenAI's image-edit endpoint with an instruction
+    to enhance detail/resolution while preserving composition exactly,
+    rather than the DPI metadata tag convert_to_cmyk() was writing without
+    ever actually resampling the pixels. Still an approximation, not a
+    guarantee of print-perfect results -- see the compliance re-check the
+    frontend runs immediately after this to confirm whether it actually
+    cleared the DPI failure."""
+    if slot not in ALLOWED_SLOTS:
+        raise HTTPException(400, f"Unknown slot: {slot}")
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    slot_data = (p.get("slots") or {}).get(slot)
+    if not slot_data or not slot_data.get("stored_filename"):
+        raise HTTPException(404, f"No uploaded file in slot '{slot}'")
+
+    billing_user = await get_billing_user(user)
+    if billing_user.get("tier", "free") == "free":
+        raise HTTPException(402, "AI Upscale requires the Author plan or higher.")
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, "AI Upscale isn't configured yet — add OPENAI_API_KEY to backend/.env")
+
+    source_path = UPLOAD_DIR / slot_data["stored_filename"]
+    if not source_path.exists():
+        raise HTTPException(404, "Source file is missing on the server")
+    ext = source_path.suffix.lower()
+    mime_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext)
+    if not mime_type:
+        raise HTTPException(400, f"AI Upscale supports PNG/JPEG/WEBP source images, not {ext} files.")
+
+    try:
+        with open(source_path, "rb") as f:
+            image_bytes = await enhance_image(f.read(), mime_type, OPENAI_API_KEY, ENHANCE_INSTRUCTION)
+    except AICoverError as e:
+        await log_failure(db, "ai_enhance", e, project_id=project_id, user_id=user["id"], context={"slot": slot})
+        raise HTTPException(e.status_code, str(e))
+
+    file_id = f"{project_id}_{slot}_enhanced_{uuid.uuid4().hex[:6]}.png"
+    metadata, compliance = _save_generated_slot_file(
+        p, project_id, slot, file_id, image_bytes,
+        original_filename=slot_data.get("original_filename") or "enhanced.png",
+        extra_meta={"ai_enhanced": True},
+    )
+    await _replace_slot(project_id, p, slot, metadata, compliance)
+    return {"slot": slot, "file_metadata": metadata, "compliance": compliance}
 
 
 # ---- Cover Design Template library (typographic starter covers, no AI/art assets needed) ----
