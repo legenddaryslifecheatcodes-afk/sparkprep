@@ -6,6 +6,7 @@ load_dotenv(ROOT_DIR / ".env")
 import os
 import io
 import uuid
+import asyncio
 import logging
 import shutil
 import secrets
@@ -46,7 +47,8 @@ from beta_engine import (
     generate_pass_code, new_pass_doc, new_feedback_doc, DEFAULT_CHECKLIST_FEATURES,
 )
 from series_engine import check_series_consistency
-from ai_cover_engine import build_cover_prompt, generate_cover_image, enhance_image, AICoverError
+from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
+from image_upscale_engine import upscale_to_size
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -2094,24 +2096,36 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
     return {"slot": payload.slot, "file_metadata": metadata, "compliance": compliance}
 
 
-ENHANCE_INSTRUCTION = (
-    "Enhance this exact image: significantly increase resolution, sharpness, and fine detail as if it had "
-    "originally been captured at much higher resolution. Preserve the composition, colors, subject, framing, "
-    "and every visible detail exactly as they are -- do not add, remove, move, or reinterpret anything in the "
-    "image. This is a quality restoration, not a creative reinterpretation."
-)
+def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
+    """Target pixel dimensions for a slot at 300 DPI, trim + bleed included."""
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    bleed = plat["bleed"]
+
+    if slot == "full_wrap":
+        paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
+        spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"])
+        dims = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, p.get("binding", "paperback"))
+        return round(dims["total_width"] * 300), round(dims["total_height"] * 300)
+
+    if slot == "spine":
+        paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
+        spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"])
+        return round(spine_w * 300), round((trim["h"] + bleed * 2) * 300)
+
+    return round((trim["w"] + bleed * 2) * 300), round((trim["h"] + bleed * 2) * 300)
 
 
 @api_router.post("/projects/{project_id}/ai-enhance/{slot}")
 async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_current_user)):
-    """'AI Upscale' fix option for a low-DPI compliance failure: sends the
-    existing slot image to OpenAI's image-edit endpoint with an instruction
-    to enhance detail/resolution while preserving composition exactly,
-    rather than the DPI metadata tag convert_to_cmyk() was writing without
-    ever actually resampling the pixels. Still an approximation, not a
-    guarantee of print-perfect results -- see the compliance re-check the
-    frontend runs immediately after this to confirm whether it actually
-    cleared the DPI failure."""
+    """'AI Upscale' fix option for a low-DPI compliance failure: runs the
+    existing slot image through Real-ESRGAN (self-hosted, CPU, no external
+    API) to add genuine pixel detail and resize it to the exact size needed
+    to hit 300 DPI at this project's trim + bleed -- unlike the old
+    OpenAI-based approach, which re-painted the image generatively and
+    couldn't reliably reach the needed resolution. See the compliance
+    re-check the frontend runs immediately after this to confirm it
+    actually cleared the DPI failure."""
     if slot not in ALLOWED_SLOTS:
         raise HTTPException(400, f"Unknown slot: {slot}")
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
@@ -2124,23 +2138,24 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     billing_user = await get_billing_user(user)
     if billing_user.get("tier", "free") == "free":
         raise HTTPException(402, "AI Upscale requires the Author plan or higher.")
-    if not OPENAI_API_KEY:
-        raise HTTPException(503, "AI Upscale isn't configured yet — add OPENAI_API_KEY to backend/.env")
 
     source_path = UPLOAD_DIR / slot_data["stored_filename"]
     if not source_path.exists():
         raise HTTPException(404, "Source file is missing on the server")
     ext = source_path.suffix.lower()
-    mime_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext)
-    if not mime_type:
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
         raise HTTPException(400, f"AI Upscale supports PNG/JPEG/WEBP source images, not {ext} files.")
 
+    target_w_px, target_h_px = _target_pixels_for_slot(p, slot)
     try:
         with open(source_path, "rb") as f:
-            image_bytes = await enhance_image(f.read(), mime_type, OPENAI_API_KEY, ENHANCE_INSTRUCTION)
-    except AICoverError as e:
+            source_bytes = f.read()
+        # CPU-bound (no GPU) -- runs in a thread so it doesn't block the
+        # event loop for every other request while one image upscales.
+        image_bytes = await asyncio.to_thread(upscale_to_size, source_bytes, target_w_px, target_h_px)
+    except Exception as e:
         await log_failure(db, "ai_enhance", e, project_id=project_id, user_id=user["id"], context={"slot": slot})
-        raise HTTPException(e.status_code, str(e))
+        raise HTTPException(502, f"AI Upscale failed: {e}")
 
     file_id = f"{project_id}_{slot}_enhanced_{uuid.uuid4().hex[:6]}.png"
     metadata, compliance = _save_generated_slot_file(
