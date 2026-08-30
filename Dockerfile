@@ -11,7 +11,6 @@ RUN apt-get update \
         tesseract-ocr \
         libgl1 \
         libglib2.0-0 \
-        libvulkan1 \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

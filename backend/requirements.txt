@@ -63,7 +63,8 @@ pathspec==1.1.1
 pikepdf==10.10.0
 pillow==12.3.0
 pymupdf>=1.26,<2
-realesrgan-ncnn-py==2.0.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
 pytesseract>=0.3.13,<1
 # NOTE: Ghostscript (used by ghostscript_engine.py) is NOT a pip package --
 # it's a separate program that must be installed on whatever machine/
