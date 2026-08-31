@@ -1388,7 +1388,7 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
-            payment_method_types=["card"],
+            payment_method_types=["card", "cashapp"],
             line_items=[{
                 "price_data": {
                     "currency": "usd",
@@ -1500,7 +1500,7 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
-            payment_method_types=["card"],
+            payment_method_types=["card", "cashapp"],
             line_items=[{
                 "price_data": {
                     "currency": "usd",
@@ -2459,7 +2459,7 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
-            payment_method_types=["card"],
+            payment_method_types=["card", "cashapp"],
             line_items=[{
                 "price_data": {
                     "currency": "usd",
