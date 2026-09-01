@@ -1073,6 +1073,27 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     if not title or title.lower() == "untitled book":
         raise HTTPException(400, "Please set a title for this book before exporting.")
 
+    # Block export while any slot still has an unresolved compliance
+    # failure -- a "successful" export of a file that fails real distributor
+    # specs just pushes the same rejection downstream instead of catching it
+    # here, which was happening because nothing in this function ever
+    # checked compliance status before generating the PDF.
+    slots = p.get("slots") or {}
+    all_compliance = []
+    if slots:
+        for slot_data in slots.values():
+            all_compliance.extend(slot_data.get("compliance") or [])
+    else:
+        all_compliance = p.get("compliance") or []
+
+    failing = [c for c in all_compliance if c.get("status") == "fail"]
+    if failing:
+        labels = ", ".join(c.get("label") or c.get("id") or "unknown issue" for c in failing)
+        raise HTTPException(
+            400,
+            f"Can't export yet -- unresolved compliance failures: {labels}. Fix these first, then export again.",
+        )
+
     billing_user = await get_billing_user(user)
 
     # Check usage limits (bypassed entirely for active beta testers)
