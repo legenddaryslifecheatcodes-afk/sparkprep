@@ -16,6 +16,7 @@ path (gpuid=-1) crashes with an ncnn allocator error in practice, and the
 newer torchvision releases. Plain PyTorch's CPU path is the most
 mature/widely-used option available.
 """
+import gc
 import io
 import urllib.request
 from pathlib import Path
@@ -26,11 +27,17 @@ from PIL import Image
 
 from rrdbnet_arch import RRDBNet
 
+# This runs on a 1GB-memory container (no GPU) alongside the rest of the API
+# process -- a prior version with TILE_SIZE=256 and default thread count got
+# OOM-killed by the host on a real request. Single-threaded + smaller tiles
+# trades some speed for staying well under the memory ceiling.
+torch.set_num_threads(1)
+
 WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "RealESRGAN_x4plus.pth"
 WEIGHTS_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 
-TILE_SIZE = 256
-TILE_OVERLAP = 16
+TILE_SIZE = 128
+TILE_OVERLAP = 8
 SCALE = 4
 
 _model = None
@@ -75,12 +82,16 @@ def _run_4x(img: Image.Image) -> Image.Image:
 
     out_img = Image.new("RGB", (w * SCALE, h * SCALE))
     step = TILE_SIZE - TILE_OVERLAP
+    tile_count = 0
     for y0 in range(0, h, step):
         for x0 in range(0, w, step):
             x1, y1 = min(x0 + TILE_SIZE, w), min(y0 + TILE_SIZE, h)
             tile = img.crop((x0, y0, x1, y1))
             with torch.no_grad():
-                out_tile = _to_image(model(_to_tensor(tile)))
+                tensor_in = _to_tensor(tile)
+                tensor_out = model(tensor_in)
+                out_tile = _to_image(tensor_out)
+            del tensor_in, tensor_out
 
             # Crop off the overlap margin (except at the image edges) before
             # pasting, so tiles line up without visible seams.
@@ -88,7 +99,13 @@ def _run_4x(img: Image.Image) -> Image.Image:
             top_trim = TILE_OVERLAP * SCALE if y0 > 0 else 0
             out_tile = out_tile.crop((left_trim, top_trim, out_tile.width, out_tile.height))
             out_img.paste(out_tile, (x0 * SCALE + left_trim, y0 * SCALE + top_trim))
+            del tile, out_tile
 
+            tile_count += 1
+            if tile_count % 8 == 0:
+                gc.collect()
+
+    gc.collect()
     return out_img
 
 
