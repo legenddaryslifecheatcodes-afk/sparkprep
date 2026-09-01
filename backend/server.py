@@ -186,8 +186,14 @@ else:
         db = MemoryDatabase()
         logger.warning("Database client initialization failed: %s; using an in-memory fallback", exc)
 
-UPLOAD_DIR = ROOT_DIR / "uploads"
-EXPORT_DIR = ROOT_DIR / "exports"
+
+# DATA_DIR points at a mounted persistent volume in production (Railway's
+# container filesystem is wiped on every deploy/restart otherwise, which is
+# why previously uploaded files kept disappearing). Falls back to the repo
+# folder for local dev, where that's not an issue.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR)
+UPLOAD_DIR = DATA_DIR / "uploads"
+EXPORT_DIR = DATA_DIR / "exports"
 UPLOAD_DIR.mkdir(exist_ok=True)
 EXPORT_DIR.mkdir(exist_ok=True)
 
