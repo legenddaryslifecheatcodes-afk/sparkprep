@@ -442,3 +442,128 @@ def run_pdf_structure_audit(pdf_path: str, platform_name: str = "your distributo
             fix_steps=["Try re-exporting the PDF from the original source file."],
         ))
     return findings
+
+
+# Distributors reject a large share of interior files for this exact reason
+# ("content extends outside the safety area" / "content is not centered"),
+# but nothing above -- or in file_processor.py's DPI/color/transparency
+# checks -- ever looks at where the actual text sits on the page. Those
+# checks all validate the *file*; this validates the *layout*, by opening
+# it with PyMuPDF and measuring real text-block bounding boxes against the
+# distributor's required margins, the same way a distributor's own
+# automated preflight does.
+SAFETY_MARGIN_IN = 0.5  # universal floor most distributors (incl. IngramSpark) require from any trim edge
+_SIZE_TOLERANCE_IN = 0.06   # ~1/16" -- normal rounding slack from a PDF exporter
+_MARGIN_TOLERANCE_IN = 0.02
+
+
+def check_interior_safety_margins(
+    pdf_path: str, platform_name: str, trim_w_in: float, trim_h_in: float, max_pages: Optional[int] = None
+) -> List[dict]:
+    """Checks that interior page size matches the ordered trim, and that no
+    text block comes closer than SAFETY_MARGIN_IN to any trim edge.
+
+    Page-size is checked first and separately from margins: if the PDF's
+    actual page dimensions don't match the trim size at all (the single most
+    common cause of a "not centered" rejection -- e.g. a manuscript left at
+    US Letter instead of the ordered 6"x9" trim), margin distances measured
+    against the wrong page are meaningless, so that page is skipped rather
+    than double-reported as also having bad margins.
+    """
+    import fitz  # PyMuPDF -- imported here since only this interior-specific check needs it
+
+    findings = []
+    bad_size_pages = []
+    tight_margin_pages = []
+    worst_margin_in = None
+    checked_pages = 0
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        # If the PDF can't even be opened, run_pdf_structure_audit's own
+        # pdf_unreadable finding already covers reporting that -- nothing
+        # further to add here.
+        return []
+
+    try:
+        pages = doc if max_pages is None else doc[:max_pages]
+        for i, page in enumerate(pages):
+            checked_pages += 1
+            page_w_in = page.rect.width / 72.0
+            page_h_in = page.rect.height / 72.0
+
+            if abs(page_w_in - trim_w_in) > _SIZE_TOLERANCE_IN or abs(page_h_in - trim_h_in) > _SIZE_TOLERANCE_IN:
+                bad_size_pages.append({"page": i + 1, "found_in": [round(page_w_in, 2), round(page_h_in, 2)]})
+                continue
+
+            blocks = [b for b in page.get_text("blocks") if str(b[4]).strip()]
+            if not blocks:
+                continue
+
+            x0 = min(b[0] for b in blocks)
+            y0 = min(b[1] for b in blocks)
+            x1 = max(b[2] for b in blocks)
+            y1 = max(b[3] for b in blocks)
+
+            left_in = x0 / 72.0
+            right_in = page_w_in - (x1 / 72.0)
+            top_in = y0 / 72.0
+            bottom_in = page_h_in - (y1 / 72.0)
+            page_min_margin = min(left_in, right_in, top_in, bottom_in)
+
+            if page_min_margin < SAFETY_MARGIN_IN - _MARGIN_TOLERANCE_IN:
+                tight_margin_pages.append({"page": i + 1, "margin_in": round(page_min_margin, 2)})
+                if worst_margin_in is None or page_min_margin < worst_margin_in:
+                    worst_margin_in = page_min_margin
+    finally:
+        doc.close()
+
+    if bad_size_pages:
+        sample = bad_size_pages[0]
+        findings.append(_finding(
+            id="interior_page_size_mismatch",
+            severity="fail",
+            title=f"{len(bad_size_pages)} of {checked_pages} page(s) checked are the wrong size for your {trim_w_in}\"×{trim_h_in}\" trim",
+            why_it_fails=(
+                f"Page {sample['page']} actually measures {sample['found_in'][0]}\"×{sample['found_in'][1]}\", not "
+                f"{trim_w_in}\"×{trim_h_in}\". When a distributor scales or crops a wrong-size page to fit the trim "
+                f"you ordered, the text shifts off-center and can land outside the required safety margin -- this "
+                f"alone commonly produces both an 'extends outside safety area' AND a 'not centered' rejection at once."
+            ),
+            publisher_rule=f"{platform_name} — interior pages must match the ordered trim size exactly",
+            pinpoint={"pages": [b["page"] for b in bad_size_pages[:10]], "expected_in": [trim_w_in, trim_h_in]},
+            fix_steps=[
+                f"Set your document's page size to exactly {trim_w_in}\" × {trim_h_in}\" in whatever tool exported "
+                "this PDF (Word: Layout → Size → More Paper Sizes; Google Docs: File → Page setup; InDesign/Vellum: "
+                "document setup).",
+                "Re-export and re-upload -- this is the actual page geometry, so it can't be auto-fixed by resampling.",
+            ],
+            fix_tools=["Microsoft Word", "Google Docs", "Adobe InDesign", "Vellum"],
+            one_click_fix=False,
+        ))
+
+    if tight_margin_pages and not bad_size_pages:
+        # Only reported when page size is confirmed correct -- otherwise the
+        # margin numbers above were measured against the wrong page and
+        # would just be a confusing, redundant echo of the size finding.
+        findings.append(_finding(
+            id="interior_safety_margin",
+            severity="fail",
+            title=f"Text sits too close to the edge on {len(tight_margin_pages)} of {checked_pages} page(s) checked",
+            why_it_fails=(
+                f"The closest any text gets to a trim edge is {round(worst_margin_in, 2)}\", on page "
+                f"{tight_margin_pages[0]['page']}. {platform_name} requires at least {SAFETY_MARGIN_IN}\" of "
+                "clearance on every side so nothing gets clipped by normal cutting variance during binding."
+            ),
+            publisher_rule=f"{platform_name} — all text/borders must be at least {SAFETY_MARGIN_IN}\" from the trim edge",
+            pinpoint={"pages": [tp["page"] for tp in tight_margin_pages[:10]], "required_in": SAFETY_MARGIN_IN},
+            fix_steps=[
+                f"Increase your document's margins to at least {SAFETY_MARGIN_IN}\" on every side (top/bottom/left/right).",
+                "Re-export and re-upload -- like page size, this needs the source file's layout fixed, not a one-click resample.",
+            ],
+            fix_tools=["Microsoft Word", "Google Docs", "Adobe InDesign", "Vellum"],
+            one_click_fix=False,
+        ))
+
+    return findings

@@ -36,7 +36,7 @@ from file_processor import (
 )
 from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
-from pdfx_validator import run_pdf_structure_audit
+from pdfx_validator import run_pdf_structure_audit, check_interior_safety_margins
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
 from report_export import generate_audit_report_pdf, generate_audit_brief_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
@@ -212,6 +212,34 @@ logger = logging.getLogger("sparkprep")
 # ADVANCED_INTERIOR_MAX_PAGES, defined below near its checkout endpoint) is
 # the only thing allowed to scan beyond page 1 -- these must never be mixed.
 BASIC_CHECK_MAX_PAGES = 1
+
+
+def _cover_file_meta(p: dict) -> Optional[dict]:
+    """Resolve a project's cover file regardless of whether it was uploaded
+    through the slot-based endpoint (slots.full_wrap/front_cover, the only
+    path the current editor UI uses) or the legacy single-file field (older
+    projects, or anything that predates slots)."""
+    slots = p.get("slots") or {}
+    if slots.get("full_wrap"):
+        return slots["full_wrap"]
+    if slots.get("front_cover"):
+        return slots["front_cover"]
+    if p.get("uploaded_file"):
+        return {"stored_filename": p["uploaded_file"], **(p.get("file_metadata") or {})}
+    return None
+
+
+def _interior_file_meta(p: dict) -> Optional[dict]:
+    """Resolve a project's interior file the same way -- several endpoints
+    used to check only the legacy uploaded_file field, which a slot upload
+    never sets, so they 404'd ("no file uploaded") for every interior/
+    combined project uploaded through the real UI even after a real upload."""
+    slots = p.get("slots") or {}
+    if slots.get("interior"):
+        return slots["interior"]
+    if p.get("uploaded_file"):
+        return {"stored_filename": p["uploaded_file"], **(p.get("file_metadata") or {})}
+    return None
 
 # Flat per-book export cap, independent of (layered on top of) the
 # tier-based monthly account limits below -- prevents a single book from
@@ -980,7 +1008,10 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
+    compliance = run_compliance_checks(
+        metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
+        file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+    )
     # Branches above that didn't actually replace the file (no fix needed, or
     # Ghostscript unavailable) don't set stored_filename on the fresh
     # metadata -- fall back to the file we started with so it doesn't go
@@ -1040,7 +1071,12 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
         if not interior_meta:
             sections["interior"] = {"uploaded": False, "compliance": []}
         else:
-            sections["interior"] = {"uploaded": True, "compliance": run_compliance_checks(interior_meta, trim["w"], trim["h"], plat["bleed"], p["platform"])}
+            interior_path = UPLOAD_DIR / interior_meta["stored_filename"] if interior_meta.get("stored_filename") else None
+            sections["interior"] = {"uploaded": True, "compliance": run_compliance_checks(
+                interior_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
+                file_path=str(interior_path) if interior_path else None, slot="interior",
+                platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+            )}
 
     all_checks = [c for s in sections.values() for c in s["compliance"]]
     any_missing = any(not s["uploaded"] for s in sections.values())
@@ -1070,8 +1106,23 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     counters, white-label branding) resolves through get_billing_user() so
     team members correctly draw against their org owner's shared pool."""
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
-    if not p or not p.get("uploaded_file"):
-        raise HTTPException(404, "No uploaded file to export")
+    if not p:
+        raise HTTPException(404, "Project not found")
+
+    # This used to check only the legacy p["uploaded_file"] field, which is
+    # NEVER set by a slot upload (nothing mirrors slots.interior into it,
+    # unlike slots.full_wrap) -- so exporting any interior-only or combined
+    # project always 404'd here regardless of what was actually uploaded.
+    project_type = p.get("project_type", "cover")
+    needs_cover = project_type in ("cover", "combined")
+    needs_interior = project_type in ("interior", "combined")
+
+    cover_data = _cover_file_meta(p) if needs_cover else None
+    if needs_cover and not cover_data:
+        raise HTTPException(404, "No cover file uploaded to export")
+    interior_data = _interior_file_meta(p) if needs_interior else None
+    if needs_interior and not interior_data:
+        raise HTTPException(404, "No interior file uploaded to export")
 
     # Mandatory book title -- required before any export so exports are
     # traceable to a real book, not left on a never-renamed placeholder.
@@ -1133,18 +1184,11 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
                 f"Monthly book allowance reached ({books_used}/{books_limit} books). Upgrade or wait until next cycle.",
             )
 
-    file_path = UPLOAD_DIR / p["uploaded_file"]
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"]) if p["project_type"] in ("cover", "combined") else 0
-
-    export_name = f"{project_id}_export_{uuid.uuid4().hex[:6]}.pdf"
-    export_path = EXPORT_DIR / export_name
-
-    is_cover = p["project_type"] in ("cover", "combined")
-    is_interior = p["project_type"] == "interior"
-    file_ext = Path(file_path).suffix.lower()
+    spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"]) if needs_cover else 0
+    export_id = uuid.uuid4().hex[:6]
 
     color_profile = (p.get("adjustments") or {}).get("color_profile") or DEFAULT_COLOR_PROFILE
     # White-label: only takes effect if the *billing* account's tier actually
@@ -1154,42 +1198,90 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     if TIERS.get(tier, {}).get("white_label") and billing_user.get("white_label_brand_name"):
         producer_name = billing_user["white_label_brand_name"]
 
-    try:
-        # Multi-page interior branch: source is a PDF → preserve vector text + fonts, tag PDF/X-1a
-        if is_interior and file_ext == ".pdf":
-            result = build_interior_pdf_x1a(
-                str(file_path), str(export_path),
-                trim_w=trim["w"], trim_h=trim["h"],
-                bleed=plat["bleed"],
-                title=p["name"],
-                author=(user.get("name") or ""),
-                color_profile=color_profile,
-                producer_name=producer_name,
-            )
-        else:
-            # Cover, combined, or image-source interior → rasterized single-page flow
-            # If a valid ISBN is set on the project and this is a cover, generate barcode PNG
-            barcode_png = None
-            if is_cover and p.get("isbn"):
-                try:
-                    from barcode_engine import generate_barcode_png_bytes
-                    barcode_png = generate_barcode_png_bytes(p["isbn"])
-                except Exception:
-                    barcode_png = None
-            result = build_print_ready_pdf(
-                str(file_path), str(export_path),
+    cover_result = None
+    interior_result = None
+
+    if needs_cover:
+        cover_path = UPLOAD_DIR / cover_data["stored_filename"]
+        cover_export_path = EXPORT_DIR / f"{project_id}_cover_{export_id}.pdf"
+        # If a valid ISBN is set on the project, generate the barcode PNG for the back cover
+        barcode_png = None
+        if p.get("isbn"):
+            try:
+                barcode_png = generate_barcode_png_bytes(p["isbn"])
+            except Exception:
+                barcode_png = None
+        try:
+            cover_result = build_print_ready_pdf(
+                str(cover_path), str(cover_export_path),
                 trim_w=trim["w"], trim_h=trim["h"],
                 bleed=plat["bleed"], spine_w=spine_w,
-                is_cover=is_cover, title=p["name"],
+                is_cover=True, title=p["name"],
                 author=(user.get("name") or ""),
                 barcode_png_bytes=barcode_png,
                 color_profile=color_profile,
                 producer_name=producer_name,
             )
-    except Exception as e:
-        await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
-                           context={"project_type": p["project_type"], "file_ext": file_ext, "platform": p["platform"]})
-        raise HTTPException(500, f"Export failed while building the print-ready PDF: {e}")
+        except Exception as e:
+            await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
+                               context={"project_type": project_type, "part": "cover", "platform": p["platform"]})
+            raise HTTPException(500, f"Export failed while building the cover PDF: {e}")
+
+    if needs_interior:
+        interior_path = UPLOAD_DIR / interior_data["stored_filename"]
+        interior_ext = Path(interior_path).suffix.lower()
+        interior_export_path = EXPORT_DIR / f"{project_id}_interior_{export_id}.pdf"
+        try:
+            if interior_ext == ".pdf":
+                # Multi-page interior branch: source is a PDF → preserve vector text + fonts, tag PDF/X-1a
+                interior_result = build_interior_pdf_x1a(
+                    str(interior_path), str(interior_export_path),
+                    trim_w=trim["w"], trim_h=trim["h"],
+                    bleed=plat["bleed"],
+                    title=p["name"],
+                    author=(user.get("name") or ""),
+                    color_profile=color_profile,
+                    producer_name=producer_name,
+                )
+            else:
+                # Image-source interior (e.g. a single scanned page) → rasterized single-page flow
+                interior_result = build_print_ready_pdf(
+                    str(interior_path), str(interior_export_path),
+                    trim_w=trim["w"], trim_h=trim["h"],
+                    bleed=plat["bleed"], spine_w=0,
+                    is_cover=False, title=p["name"],
+                    author=(user.get("name") or ""),
+                    color_profile=color_profile,
+                    producer_name=producer_name,
+                )
+        except Exception as e:
+            await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
+                               context={"project_type": project_type, "part": "interior", "platform": p["platform"], "file_ext": interior_ext})
+            raise HTTPException(500, f"Export failed while building the interior PDF: {e}")
+
+    # Distributors require the cover and interior as separate file uploads,
+    # never merged into one PDF -- so a combined project's two outputs are
+    # zipped together into a single download instead of only ever building
+    # the cover and silently dropping the interior, which is what this
+    # function did for every "combined" project before (is_interior only
+    # matched project_type == "interior" exactly, so combined always fell
+    # into the cover-only branch and only ever produced one file).
+    if cover_result is not None and interior_result is not None:
+        import zipfile
+        export_name = f"{project_id}_export_{export_id}.zip"
+        export_path = EXPORT_DIR / export_name
+        with zipfile.ZipFile(export_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(EXPORT_DIR / f"{project_id}_cover_{export_id}.pdf", arcname=f"{title}_cover.pdf")
+            zf.write(EXPORT_DIR / f"{project_id}_interior_{export_id}.pdf", arcname=f"{title}_interior.pdf")
+        result = {"bundled": True, "cover": cover_result, "interior": interior_result}
+    elif cover_result is not None:
+        export_name = f"{project_id}_cover_{export_id}.pdf"
+        export_path = EXPORT_DIR / export_name
+        result = cover_result
+    else:
+        export_name = f"{project_id}_interior_{export_id}.pdf"
+        export_path = EXPORT_DIR / export_name
+        result = interior_result
 
     # Increment usage -- always against the billing account, not necessarily
     # the acting user, so a team's shared pool is debited correctly.
@@ -1257,7 +1349,10 @@ async def download_export(project_id: str, export_name: str, request: Request):
     fp = EXPORT_DIR / export_name
     if not fp.exists():
         raise HTTPException(404, "Export not found")
-    return FileResponse(str(fp), media_type="application/pdf", filename=f"sparkprep_{export_name}")
+    # A combined (cover + interior) project's export is a .zip bundling both
+    # PDFs -- everything else is still a single .pdf, same as before.
+    media_type = "application/zip" if fp.suffix.lower() == ".zip" else "application/pdf"
+    return FileResponse(str(fp), media_type=media_type, filename=f"sparkprep_{export_name}")
 
 
 # ---- Batch audit + batch export (Publisher/Studio -- see TIERS[*]["batch_enabled"]) ----
@@ -1291,16 +1386,36 @@ async def batch_audit(payload: BatchIn, user: dict = Depends(get_current_user)):
         if not p:
             results.append({"project_id": pid, "ok": False, "error": "Project not found"})
             continue
-        if not p.get("uploaded_file"):
-            results.append({"project_id": pid, "ok": False, "error": "No uploaded file"})
-            continue
-        file_path = UPLOAD_DIR / p["uploaded_file"]
+        # Checks whichever of cover/interior this project type actually has,
+        # via slots first and the legacy uploaded_file field as a fallback --
+        # this used to only ever look at uploaded_file, which a slot upload
+        # never sets, so every interior-only or combined project batch-audited
+        # always came back "No uploaded file" regardless of what was uploaded.
+        project_type = p.get("project_type", "cover")
         trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
         plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-        compliance = run_compliance_checks(p.get("file_metadata") or {}, trim["w"], trim["h"], plat["bleed"], p["platform"])
+        compliance = []
         structure = []
-        if p.get("file_metadata", {}).get("is_pdf") and file_path.exists():
-            structure = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
+        if project_type in ("cover", "combined"):
+            cover_meta = _cover_file_meta(p)
+            if cover_meta:
+                compliance += run_compliance_checks(cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"])
+                cover_path = UPLOAD_DIR / cover_meta["stored_filename"]
+                if cover_meta.get("is_pdf") and cover_path.exists():
+                    structure += run_pdf_structure_audit(str(cover_path), plat.get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
+        if project_type in ("interior", "combined"):
+            interior_meta = _interior_file_meta(p)
+            if interior_meta:
+                interior_path = UPLOAD_DIR / interior_meta["stored_filename"]
+                compliance += run_compliance_checks(
+                    interior_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
+                    file_path=str(interior_path), slot="interior", platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+                )
+                if interior_meta.get("is_pdf") and interior_path.exists():
+                    structure += run_pdf_structure_audit(str(interior_path), plat.get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
+        if not compliance and not structure:
+            results.append({"project_id": pid, "ok": False, "error": "No uploaded file"})
+            continue
         fails = sum(1 for c in compliance if c.get("status") == "fail") + sum(1 for f in structure if f.get("severity") == "fail")
         warnings = sum(1 for c in compliance if c.get("status") == "warning") + sum(1 for f in structure if f.get("severity") == "warning")
         results.append({
@@ -1399,9 +1514,16 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
-    if p.get("project_type") != "interior":
-        raise HTTPException(400, "Advanced Interior Check only applies to interior projects")
-    if not p.get("uploaded_file"):
+    # "combined" is allowed too -- the editor already shows this upsell card
+    # on combined projects (it has an interior section same as interior-only),
+    # but this endpoint used to hard-reject them with a 400 the moment
+    # someone actually clicked buy.
+    if p.get("project_type") not in ("interior", "combined"):
+        raise HTTPException(400, "Advanced Interior Check only applies to projects with an interior")
+    # Used to check only the legacy uploaded_file field, which a slot upload
+    # never sets -- this 404'd for every interior file uploaded through the
+    # real editor UI (slots.interior), even though one was clearly there.
+    if not _interior_file_meta(p):
         raise HTTPException(404, "No interior file uploaded yet")
     if (p.get("page_count") or 0) > ADVANCED_INTERIOR_MAX_PAGES:
         raise HTTPException(400, f"Advanced Interior Check supports up to {ADVANCED_INTERIOR_MAX_PAGES} pages")
@@ -1470,13 +1592,16 @@ async def interior_check_status(project_id: str, user: dict = Depends(get_curren
         return {"paid": False}
 
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
-    if not p or not p.get("uploaded_file"):
+    interior_meta = _interior_file_meta(p) if p else None
+    if not p or not interior_meta:
         raise HTTPException(404, "Interior file not found")
-    file_path = UPLOAD_DIR / p["uploaded_file"]
+    file_path = UPLOAD_DIR / interior_meta["stored_filename"]
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
     findings = []
-    if p.get("file_metadata", {}).get("is_pdf"):
+    if interior_meta.get("is_pdf"):
         findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
     return {"paid": True, "findings": findings, "check_type": "advanced"}
 
 
@@ -1497,17 +1622,20 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
         return {"paid": False}
 
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
-    if not p or not p.get("uploaded_file"):
+    interior_meta = _interior_file_meta(p) if p else None
+    if not p or not interior_meta:
         raise HTTPException(404, "Interior file not found")
-    file_path = UPLOAD_DIR / p["uploaded_file"]
+    file_path = UPLOAD_DIR / interior_meta["stored_filename"]
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
     findings = []
-    if p.get("file_metadata", {}).get("is_pdf"):
+    if interior_meta.get("is_pdf"):
         # The only call site allowed to scan beyond page 1 -- explicitly
         # capped at ADVANCED_INTERIOR_MAX_PAGES regardless of the file's
         # actual page count, enforcing the 300-page limit defense-in-depth
         # (on top of the page_count check already done at checkout time).
         findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
     return {"paid": True, "findings": findings, "check_type": "advanced"}
 
 
@@ -2017,7 +2145,10 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
 
         trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
         plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-        compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
+        compliance = run_compliance_checks(
+            metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
+            file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+        )
     except Exception as e:
         await log_failure(db, "slot_upload_analyze", e, project_id=project_id, user_id=user["id"],
                            context={"filename": file.filename, "ext": ext, "slot": slot})

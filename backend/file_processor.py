@@ -374,9 +374,15 @@ def build_print_ready_pdf(
 
 
 def run_compliance_checks(
-    file_metadata: dict, target_w: float, target_h: float, bleed: float, platform: str = "kdp"
+    file_metadata: dict, target_w: float, target_h: float, bleed: float, platform: str = "kdp",
+    file_path: str = None, slot: str = None, platform_name: str = None, max_pages: int = None,
 ) -> list:
-    """Return a list of compliance issues with severity and auto-fix availability."""
+    """Return a list of compliance issues with severity and auto-fix availability.
+
+    file_path/slot/platform_name/max_pages are optional and only used for the
+    interior safety-margin/centering check below -- every existing caller that
+    doesn't pass them (cover slots, legacy uploads) behaves exactly as before.
+    """
     checks = []
 
     # DPI check
@@ -472,5 +478,25 @@ def run_compliance_checks(
         "auto_fix": True,
         "fix_action": "export_pdfx1a",
     })
+
+    # Interior text safety margin + page-size check -- nothing above (DPI,
+    # color space, transparency, bleed, PDF/X-1a) ever looks at where the
+    # actual text sits on the page, which is exactly what a distributor's
+    # "content extends outside the safety area" / "not centered" rejection
+    # is about. Only runs for the interior slot of a real PDF, since it's
+    # meaningless for a raster cover image.
+    if slot == "interior" and file_metadata.get("is_pdf") and file_path:
+        from pdfx_validator import check_interior_safety_margins
+        margin_findings = check_interior_safety_margins(
+            file_path, platform_name or platform, target_w, target_h, max_pages=max_pages,
+        )
+        for f in margin_findings:
+            checks.append({
+                "id": f["id"],
+                "label": f["title"],
+                "status": f["severity"],
+                "message": f["why_it_fails"],
+                "auto_fix": False,
+            })
 
     return checks
