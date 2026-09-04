@@ -455,6 +455,10 @@ def run_pdf_structure_audit(pdf_path: str, platform_name: str = "your distributo
 SAFETY_MARGIN_IN = 0.5  # universal floor most distributors (incl. IngramSpark) require from any trim edge
 _SIZE_TOLERANCE_IN = 0.06   # ~1/16" -- normal rounding slack from a PDF exporter
 _MARGIN_TOLERANCE_IN = 0.02
+# Below this length, a text block is treated as furniture (page number,
+# running head) rather than body content -- see the comment at its one use
+# site below for why that distinction matters.
+MIN_BODY_BLOCK_CHARS = 20
 
 
 def check_interior_safety_margins(
@@ -476,6 +480,7 @@ def check_interior_safety_margins(
     bad_size_pages = []
     tight_margin_pages = []
     worst_margin_in = None
+    worst_margin_page = None
     checked_pages = 0
 
     try:
@@ -497,14 +502,24 @@ def check_interior_safety_margins(
                 bad_size_pages.append({"page": i + 1, "found_in": [round(page_w_in, 2), round(page_h_in, 2)]})
                 continue
 
+            # Page numbers and running heads are deliberately placed inside
+            # the margin, not the body-text safe area -- every real print
+            # template (including this app's own "Compose Interior" output)
+            # puts the folio at half the bottom margin and a running head at
+            # half the top margin. Measuring the safety margin against ALL
+            # text indiscriminately flagged that completely standard, correct
+            # layout as a violation. A short line (folio/running head length)
+            # is excluded from the body-content measurement; genuine body
+            # paragraphs are essentially never this short.
             blocks = [b for b in page.get_text("blocks") if str(b[4]).strip()]
-            if not blocks:
+            body_blocks = [b for b in blocks if len(str(b[4]).strip()) >= MIN_BODY_BLOCK_CHARS]
+            if not body_blocks:
                 continue
 
-            x0 = min(b[0] for b in blocks)
-            y0 = min(b[1] for b in blocks)
-            x1 = max(b[2] for b in blocks)
-            y1 = max(b[3] for b in blocks)
+            x0 = min(b[0] for b in body_blocks)
+            y0 = min(b[1] for b in body_blocks)
+            x1 = max(b[2] for b in body_blocks)
+            y1 = max(b[3] for b in body_blocks)
 
             left_in = x0 / 72.0
             right_in = page_w_in - (x1 / 72.0)
@@ -516,6 +531,7 @@ def check_interior_safety_margins(
                 tight_margin_pages.append({"page": i + 1, "margin_in": round(page_min_margin, 2)})
                 if worst_margin_in is None or page_min_margin < worst_margin_in:
                     worst_margin_in = page_min_margin
+                    worst_margin_page = i + 1
     finally:
         doc.close()
 
@@ -553,7 +569,7 @@ def check_interior_safety_margins(
             title=f"Text sits too close to the edge on {len(tight_margin_pages)} of {checked_pages} page(s) checked",
             why_it_fails=(
                 f"The closest any text gets to a trim edge is {round(worst_margin_in, 2)}\", on page "
-                f"{tight_margin_pages[0]['page']}. {platform_name} requires at least {SAFETY_MARGIN_IN}\" of "
+                f"{worst_margin_page}. {platform_name} requires at least {SAFETY_MARGIN_IN}\" of "
                 "clearance on every side so nothing gets clipped by normal cutting variance during binding."
             ),
             publisher_rule=f"{platform_name} — all text/borders must be at least {SAFETY_MARGIN_IN}\" from the trim edge",

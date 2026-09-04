@@ -2121,9 +2121,24 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
         max_mb = 1024
 
     ext = Path(file.filename).suffix.lower()
+    # A book-only project's interior slot also accepts a Word doc or plain-
+    # text manuscript, not just a PDF -- most authors don't have a print-
+    # ready PDF sitting around, they have a Word file. It gets converted
+    # below rather than stored as-is.
+    convertible_manuscript_exts = {".docx", ".txt"}
     allowed = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+    if slot == "interior":
+        allowed = allowed | convertible_manuscript_exts
     if ext not in allowed:
         raise HTTPException(400, f"Unsupported file type: {ext}")
+
+    # Converting a Word/text manuscript into a print-ready interior PDF is a
+    # production deliverable, same as the standalone "Compose Interior" tool
+    # -- this must carry the same tier gate as /manuscript/compose rather
+    # than becoming a free backdoor around that paywall.
+    if slot == "interior" and ext in convertible_manuscript_exts:
+        if tier == "free" and not (user.get("beta_active") or billing_user.get("beta_active")):
+            raise HTTPException(402, "Converting a Word/text manuscript into a print-ready interior isn't included in the Free plan. Upgrade to Author or higher, or upload a PDF directly.")
 
     file_id = f"{project_id}_{slot}_{uuid.uuid4().hex[:6]}{ext}"
     file_path = UPLOAD_DIR / file_id
@@ -2137,11 +2152,45 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
                 raise HTTPException(413, f"File exceeds {max_mb}MB limit")
             f.write(chunk)
 
+    compose_warnings = []
+    if slot == "interior" and ext in convertible_manuscript_exts:
+        # Re-typeset the actual text content through the same composer
+        # engine "Compose Interior" already uses (correct margins, trim
+        # size, PDF/X-1a output) instead of storing a file that would just
+        # fail every layout check as uploaded -- most self-published
+        # authors' Word formatting isn't print-ready (wrong margins,
+        # screen-sized fonts, no real page breaks).
+        try:
+            if ext == ".docx":
+                extracted = extract_manuscript_text(str(file_path))
+                compose_warnings = extracted["warnings"]
+                source_text = extracted["source_text"]
+            else:
+                source_text = file_path.read_text(encoding="utf-8", errors="replace")
+            trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+            composed_id = f"{project_id}_interior_composed_{uuid.uuid4().hex[:6]}.pdf"
+            composed_path = UPLOAD_DIR / composed_id
+            compose_manuscript_pdf(
+                str(composed_path), "fiction_novel", p.get("name") or "Untitled Book", "",
+                source_text, trim["w"], trim["h"], p["platform"],
+            )
+        except Exception as e:
+            await log_failure(db, "slot_upload_compose", e, project_id=project_id, user_id=user["id"],
+                               context={"filename": file.filename, "ext": ext, "slot": slot})
+            raise HTTPException(400, f"Couldn't convert this file into a print-ready interior: {e}")
+        finally:
+            try: os.remove(file_path)  # the raw docx/txt was only a staging step
+            except OSError: pass
+        file_id = composed_id
+        file_path = composed_path
+
     try:
         metadata = analyze_file(str(file_path))
         metadata["original_filename"] = file.filename
         metadata["stored_filename"] = file_id
         metadata["slot"] = slot
+        if compose_warnings:
+            metadata["compose_warnings"] = compose_warnings
 
         trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
         plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
