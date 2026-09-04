@@ -241,6 +241,33 @@ def _interior_file_meta(p: dict) -> Optional[dict]:
         return {"stored_filename": p["uploaded_file"], **(p.get("file_metadata") or {})}
     return None
 
+
+# Both build_interior_pdf_x1a() and build_print_ready_pdf() unconditionally
+# (re)stamp GTS_PDFXVersion/OutputIntents/XMP at export time, regardless of
+# whether the file already has them -- so a "fail" on these two checks
+# doesn't mean SparkPrep's own export will produce a non-compliant file,
+# only that the file doesn't have it *yet*, as uploaded.
+EXPORT_TIME_FIXED_IDS = {"pdfx1a_not_declared", "pdfx1a_missing_output_intent"}
+
+
+def _annotate_export_time_fixes(findings: list) -> list:
+    """Shown as a plain 'fail' with no context, these two checks read as a
+    real blocker -- exactly the confusion a real user hit, pointing at this
+    exact finding right after being told their file was export-ready. This
+    is applied only where the audit is shown specifically to someone about
+    to export through SparkPrep (the Advanced Interior Check); a general
+    PDF audit for a file someone intends to fix and use elsewhere is right
+    to call this a real, unresolved fail, so the underlying check itself
+    is left alone."""
+    for f in findings:
+        if f.get("id") in EXPORT_TIME_FIXED_IDS:
+            f["why_it_fails"] = (
+                (f.get("why_it_fails") or "").rstrip()
+                + " Note: SparkPrep's own Export button fixes this automatically, every time, regardless of the "
+                "file's current state -- this only matters if you use this file somewhere other than SparkPrep's export."
+            )
+    return findings
+
 # Flat per-book export cap, independent of (layered on top of) the
 # tier-based monthly account limits below -- prevents a single book from
 # burning an entire month's export allowance on repeated re-exports of
@@ -1627,6 +1654,7 @@ async def interior_check_status(project_id: str, user: dict = Depends(get_curren
     if interior_meta.get("is_pdf"):
         findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
         findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        findings = _annotate_export_time_fixes(findings)
     # Real proof of scope, not just a marketing claim -- the actual page
     # count of this file (recorded by analyze_file() at upload time) and
     # how many of those were actually examined, so "full check" means
@@ -1670,6 +1698,7 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
         # (on top of the page_count check already done at checkout time).
         findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
         findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        findings = _annotate_export_time_fixes(findings)
     return {
         "paid": True, "findings": findings, "check_type": "advanced",
         "total_pages": total_pages,
