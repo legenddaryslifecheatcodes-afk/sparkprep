@@ -1623,10 +1623,19 @@ async def interior_check_status(project_id: str, user: dict = Depends(get_curren
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
     findings = []
+    total_pages = interior_meta.get("pdf_pages") or 0
     if interior_meta.get("is_pdf"):
         findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
         findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
-    return {"paid": True, "findings": findings, "check_type": "advanced"}
+    # Real proof of scope, not just a marketing claim -- the actual page
+    # count of this file (recorded by analyze_file() at upload time) and
+    # how many of those were actually examined, so "full check" means
+    # something the person looking at it can verify against their own book.
+    return {
+        "paid": True, "findings": findings, "check_type": "advanced",
+        "total_pages": total_pages,
+        "pages_checked": min(total_pages, ADVANCED_INTERIOR_MAX_PAGES),
+    }
 
 
 @api_router.get("/projects/{project_id}/interior-check/verify")
@@ -1653,6 +1662,7 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
     findings = []
+    total_pages = interior_meta.get("pdf_pages") or 0
     if interior_meta.get("is_pdf"):
         # The only call site allowed to scan beyond page 1 -- explicitly
         # capped at ADVANCED_INTERIOR_MAX_PAGES regardless of the file's
@@ -1660,7 +1670,11 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
         # (on top of the page_count check already done at checkout time).
         findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
         findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
-    return {"paid": True, "findings": findings, "check_type": "advanced"}
+    return {
+        "paid": True, "findings": findings, "check_type": "advanced",
+        "total_pages": total_pages,
+        "pages_checked": min(total_pages, ADVANCED_INTERIOR_MAX_PAGES),
+    }
 
 
 # ---- Promo codes (free giveaway access, no Stripe involved -- these never
