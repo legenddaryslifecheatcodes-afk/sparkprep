@@ -2529,6 +2529,24 @@ async def slot_preview(project_id: str, slot: str, request: Request):
     fp = UPLOAD_DIR / slot_data["stored_filename"]
     if not fp.exists():
         raise HTTPException(404, "File missing")
+    # A browser <img> tag can't render a PDF at all -- it just shows a
+    # broken image, indistinguishable from "no file" to whoever's looking
+    # at it. This was serving the interior slot's PDF (or a PDF-format
+    # cover) directly and unconditionally, so its preview never actually
+    # rendered; rasterize page 1 to a real PNG instead, same as any other
+    # image-based slot already displays.
+    if fp.suffix.lower() == ".pdf":
+        try:
+            import fitz
+            from fastapi.responses import Response
+            with fitz.open(str(fp)) as doc:
+                pix = doc[0].get_pixmap(dpi=150)
+                png_bytes = pix.tobytes("png")
+            return Response(content=png_bytes, media_type="image/png")
+        except Exception as e:
+            await log_failure(db, "slot_preview_rasterize", e, project_id=project_id, user_id=user_id,
+                               context={"slot": slot, "filename": slot_data["stored_filename"]})
+            raise HTTPException(500, f"Couldn't render a preview of this PDF: {e}")
     return FileResponse(str(fp))
 
 
