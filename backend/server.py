@@ -1153,12 +1153,16 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
 
     billing_user = await get_billing_user(user)
 
-    # Check usage limits (bypassed entirely for active beta testers)
+    # Check usage limits (bypassed entirely for active beta testers, or for
+    # this specific project if a "full_access"/"interior_only_access" promo
+    # code was redeemed on it -- those are per-project, not account-wide,
+    # unlike the beta flag).
     tier = billing_user.get("tier", "free")
     tier_info = TIERS.get(tier, TIERS["free"])
     export_limit = tier_info["monthly_exports"]
     used = billing_user.get("exports_this_month", 0)
-    beta_bypass = bool(user.get("beta_active") or billing_user.get("beta_active"))
+    promo_bypass = p.get("promo_access") in ("full_access", "interior_only_access")
+    beta_bypass = bool(user.get("beta_active") or billing_user.get("beta_active") or promo_bypass)
     if not beta_bypass and used >= export_limit:
         raise HTTPException(402, f"Monthly export limit reached ({used}/{export_limit}). Upgrade to continue.")
 
@@ -1637,6 +1641,70 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
         findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
         findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
     return {"paid": True, "findings": findings, "check_type": "advanced"}
+
+
+# ---- Promo codes (free giveaway access, no Stripe involved -- these never
+# charge anything, so there's nothing for a payment processor to do) ----
+# "full_access" and "interior_only_access" mark a specific project so every
+# paid-tier gate that's actually scoped to a project (export limits, the
+# Word/text-to-interior conversion, AI Cover, AI Upscale) treats it as
+# unlocked, regardless of the account's real plan. AI Blurb isn't included
+# in that list because it has no project_id at all in its request -- there's
+# nothing to attach a per-project unlock to without a larger change to that
+# endpoint. "advanced_interior_check" instead just writes a paid=True
+# interior_checks record directly, so the existing status/verify endpoints
+# pick it up with no further changes -- identical to a real Stripe purchase
+# from their point of view.
+PROMO_CODE_TYPES = {"full_access", "interior_only_access", "advanced_interior_check"}
+
+
+class RedeemPromoIn(BaseModel):
+    code: str
+
+
+@api_router.post("/projects/{project_id}/redeem-promo")
+async def redeem_promo_code(project_id: str, payload: RedeemPromoIn, user: dict = Depends(get_current_user)):
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+
+    code = payload.code.strip().upper()
+    promo = await db.promo_codes.find_one({"code": code})
+    if not promo:
+        raise HTTPException(404, "That code isn't valid.")
+    if promo.get("used"):
+        raise HTTPException(400, "That code has already been used.")
+
+    promo_type = promo["type"]
+    if promo_type == "interior_only_access" and p.get("project_type") != "interior":
+        raise HTTPException(400, "This code only works on an interior-only project.")
+    if promo_type == "advanced_interior_check":
+        if p.get("project_type") not in ("interior", "combined"):
+            raise HTTPException(400, "This code only applies to a project with an interior.")
+        if not _interior_file_meta(p):
+            raise HTTPException(404, "Upload your interior file first, then redeem this code.")
+        if (p.get("page_count") or 0) > ADVANCED_INTERIOR_MAX_PAGES:
+            raise HTTPException(400, f"Advanced Interior Check supports up to {ADVANCED_INTERIOR_MAX_PAGES} pages")
+
+    await db.promo_codes.update_one(
+        {"_id": promo["_id"]},
+        {"$set": {
+            "used": True, "used_by_user_id": user["id"], "used_on_project_id": project_id,
+            "used_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+
+    if promo_type == "advanced_interior_check":
+        await db.interior_checks.insert_one({
+            "project_id": project_id, "user_id": user["id"], "session_id": f"promo_{code}",
+            "price_cents": 0, "tier_at_purchase": "promo", "paid": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return {"ok": True, "unlocked": "Advanced Interior Check — refresh to see full results."}
+
+    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"promo_access": promo_type}})
+    label = "Full Access" if promo_type == "full_access" else "Interior-Only Access"
+    return {"ok": True, "unlocked": f"{label} for this book — paid-tier features are now unlocked here."}
 
 
 # ---- Stripe Payments ----
@@ -2137,7 +2205,8 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
     # -- this must carry the same tier gate as /manuscript/compose rather
     # than becoming a free backdoor around that paywall.
     if slot == "interior" and ext in convertible_manuscript_exts:
-        if tier == "free" and not (user.get("beta_active") or billing_user.get("beta_active")):
+        promo_bypass = p.get("promo_access") in ("full_access", "interior_only_access")
+        if tier == "free" and not (user.get("beta_active") or billing_user.get("beta_active") or promo_bypass):
             raise HTTPException(402, "Converting a Word/text manuscript into a print-ready interior isn't included in the Free plan. Upgrade to Author or higher, or upload a PDF directly.")
 
     file_id = f"{project_id}_{slot}_{uuid.uuid4().hex[:6]}{ext}"
@@ -2282,7 +2351,7 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
         raise HTTPException(404, "Project not found")
 
     billing_user = await get_billing_user(user)
-    if billing_user.get("tier", "free") == "free":
+    if billing_user.get("tier", "free") == "free" and p.get("promo_access") != "full_access":
         raise HTTPException(402, "AI Cover Generation requires the Author plan or higher.")
     if not OPENAI_API_KEY:
         raise HTTPException(503, "AI Cover Generation isn't configured yet — add OPENAI_API_KEY to backend/.env")
@@ -2343,7 +2412,7 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
         raise HTTPException(404, f"No uploaded file in slot '{slot}'")
 
     billing_user = await get_billing_user(user)
-    if billing_user.get("tier", "free") == "free":
+    if billing_user.get("tier", "free") == "free" and p.get("promo_access") != "full_access":
         raise HTTPException(402, "AI Upscale requires the Author plan or higher.")
 
     source_path = UPLOAD_DIR / slot_data["stored_filename"]
