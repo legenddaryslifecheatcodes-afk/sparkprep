@@ -975,21 +975,30 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     after_findings = run_pdf_structure_audit(str(fixed_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
                     still_broken_findings = [f for f in after_findings if f["id"] in fixable_ids]
                     still_broken = [f["id"] for f in still_broken_findings]
+                    # pdfx1a_not_declared/pdfx1a_missing_output_intent get stamped
+                    # unconditionally at export time regardless of whether THIS
+                    # pre-export Ghostscript attempt succeeds -- both
+                    # build_interior_pdf_x1a() and build_print_ready_pdf() always
+                    # (re)write GTS_PDFXVersion/OutputIntents/XMP via
+                    # _declare_pdfx1a(), independent of this step. So a leftover
+                    # failure on ONLY those two doesn't actually block export --
+                    # it was being reported as "needs a manual fix" and shown
+                    # right next to "you're ready for Final Review" in the same
+                    # breath, which is exactly as contradictory as it sounds.
+                    # live_transparency_detected/layers_detected are NOT redone at
+                    # export, so those genuinely are still broken if unresolved here.
+                    ALWAYS_FIXED_AT_EXPORT = {"pdfx1a_not_declared", "pdfx1a_missing_output_intent"}
+                    genuinely_unresolved = [f for f in still_broken_findings if f["id"] not in ALWAYS_FIXED_AT_EXPORT]
                     ghostscript_result = {
                         "attempted": True,
-                        "succeeded": not still_broken,
+                        "succeeded": not genuinely_unresolved,
                         "fixed_issues": [f["id"] for f in structure_findings if f["id"] in fixable_ids],
                         "still_present": still_broken,
-                        # This used to be left unset whenever Ghostscript ran but only
-                        # partially fixed things, so the "needs a manual fix" banner
-                        # had nothing to show but its own generic fallback text --
-                        # the backend knew exactly which check was still broken and
-                        # why, it just never got passed through to the response.
                         "reason": (
                             "Ghostscript fixed some issues automatically, but couldn't resolve: "
-                            + "; ".join(f["title"] for f in still_broken_findings)
+                            + "; ".join(f["title"] for f in genuinely_unresolved)
                             + ". This needs the source file re-exported from the original design tool with the correct settings -- see the fix steps on that check below."
-                        ) if still_broken_findings else None,
+                        ) if genuinely_unresolved else None,
                     }
                 except RuntimeError as e:
                     ghostscript_result = {"attempted": True, "succeeded": False, "reason": str(e)}
