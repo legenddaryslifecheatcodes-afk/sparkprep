@@ -973,12 +973,23 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     # Re-run the structural audit against the fixed file so the
                     # response reflects what's actually true now, not a promise.
                     after_findings = run_pdf_structure_audit(str(fixed_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
-                    still_broken = [f["id"] for f in after_findings if f["id"] in fixable_ids]
+                    still_broken_findings = [f for f in after_findings if f["id"] in fixable_ids]
+                    still_broken = [f["id"] for f in still_broken_findings]
                     ghostscript_result = {
                         "attempted": True,
                         "succeeded": not still_broken,
                         "fixed_issues": [f["id"] for f in structure_findings if f["id"] in fixable_ids],
                         "still_present": still_broken,
+                        # This used to be left unset whenever Ghostscript ran but only
+                        # partially fixed things, so the "needs a manual fix" banner
+                        # had nothing to show but its own generic fallback text --
+                        # the backend knew exactly which check was still broken and
+                        # why, it just never got passed through to the response.
+                        "reason": (
+                            "Ghostscript fixed some issues automatically, but couldn't resolve: "
+                            + "; ".join(f["title"] for f in still_broken_findings)
+                            + ". This needs the source file re-exported from the original design tool with the correct settings -- see the fix steps on that check below."
+                        ) if still_broken_findings else None,
                     }
                 except RuntimeError as e:
                     ghostscript_result = {"attempted": True, "succeeded": False, "reason": str(e)}
