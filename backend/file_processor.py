@@ -9,7 +9,7 @@ from reportlab.lib.units import inch
 from pypdf import PdfReader
 import pikepdf
 
-from print_specs import COLOR_PROFILES, DEFAULT_COLOR_PROFILE
+from print_specs import COLOR_PROFILES, DEFAULT_COLOR_PROFILE, calculate_full_cover_dimensions
 
 # Enable large images
 Image.MAX_IMAGE_PIXELS = None
@@ -277,13 +277,27 @@ def build_print_ready_pdf(
     barcode_png_bytes: bytes = None,
     color_profile: str = DEFAULT_COLOR_PROFILE,
     producer_name: str = "SparkPrep",
+    binding: str = "paperback",
+    platform: str = "ingramspark",
 ) -> dict:
     """Build a real PDF/X-1a:2001 print-ready PDF from a source image.
     If is_cover and barcode_png_bytes provided, composite the barcode into the
-    reserved back-cover barcode zone (bottom-left area, 2" x 1.2")."""
+    reserved back-cover barcode zone (bottom-left area, 2" x 1.2").
+
+    Cover canvas size is binding-aware (see calculate_full_cover_dimensions):
+    a hardcover_case or hardcover_jacket cover is NOT shaped like a plain
+    paperback wrap -- it used to always use the plain-wrap formula here
+    regardless of binding, which for a jacket silently stretched a real
+    5-panel designer file (back flap / back / spine / front / front flap)
+    into a canvas ~7" too narrow, squeezing the whole image horizontally.
+    The uploaded image is expected to already be laid out for the real
+    binding shape (this function sizes the PDF page to match and places it,
+    it does not generate flap artwork)."""
+    cover_dims = None
     if is_cover and spine_w > 0:
-        total_w = (trim_w * 2) + spine_w + (bleed * 2)
-        total_h = trim_h + (bleed * 2)
+        cover_dims = calculate_full_cover_dimensions(trim_w, trim_h, spine_w, bleed, binding, platform)
+        total_w = cover_dims["total_width"]
+        total_h = cover_dims["total_height"]
     else:
         total_w = trim_w + (bleed * 2)
         total_h = trim_h + (bleed * 2)
@@ -332,7 +346,11 @@ def build_print_ready_pdf(
         try:
             import pikepdf, io
             # Barcode zone on back cover — 0.5" from spine, 0.5" from bottom, 2" x 1.2"
-            zone_x_in = bleed + 0.5  # back cover starts at bleed
+            # back_x is where the back cover panel actually starts, which for
+            # a jacket is past the bleed, wrap-fold AND back flap -- not just
+            # past the bleed like a plain wrap.
+            back_x = cover_dims["back_x"] if cover_dims else bleed
+            zone_x_in = back_x + 0.5
             zone_y_in = bleed + 0.5
             zone_w_in = 2.0
             zone_h_in = 1.2

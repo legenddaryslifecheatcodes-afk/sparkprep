@@ -28,7 +28,8 @@ from bson import ObjectId
 
 from print_specs import (
     TRIM_SIZES, PAPER_TYPES, BINDING_TYPES, PLATFORMS, COLOR_PROFILES, DEFAULT_COLOR_PROFILE,
-    calculate_spine_width, calculate_full_cover_dimensions,
+    calculate_spine_width, calculate_spine_width_for_platform, calculate_full_cover_dimensions,
+    resolve_binding_spec, PLATFORM_UNSUPPORTED_BINDINGS,
 )
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
@@ -512,6 +513,20 @@ class ProjectUpdate(BaseModel):
     page_count: Optional[int] = None
     project_type: Optional[str] = None
     series_name: Optional[str] = None
+    # Hardcover (case laminate or dust jacket) spine width isn't a public
+    # formula -- IngramSpark computes it from their own internal stepped
+    # table keyed to exact page count + paper weight, not a page/PPI ratio,
+    # so SparkPrep's formula-based estimate can be meaningfully wrong for
+    # any hardcover binding. This lets the user paste the exact number from
+    # IngramSpark's own Spine and Weight Calculator and have SparkPrep build
+    # the real cover around that instead of guessing. None/omitted falls
+    # back to the formula estimate (correct for paperback, an estimate only
+    # for hardcover). Set to 0 or null explicitly to clear it.
+    spine_width_override: Optional[float] = None
+    # When the uploaded/designed cover art already has its own barcode built
+    # in (common for a professionally designed jacket), skip SparkPrep's
+    # auto-overlay at export instead of stamping a second barcode on top.
+    cover_has_barcode: Optional[bool] = None
 
 class CheckoutIn(BaseModel):
     tier: str  # pro | studio
@@ -734,15 +749,24 @@ async def spine_calc(payload: dict):
     page_count = int(payload.get("page_count", 0))
     paper = payload.get("paper_type", "white_50lb")
     paper_info = PAPER_TYPES.get(paper, PAPER_TYPES["white_50lb"])
-    spine_w = calculate_spine_width(page_count, paper_info["ppi"])
     trim_key = payload.get("trim_size", "6x9")
     trim = TRIM_SIZES.get(trim_key, TRIM_SIZES["6x9"])
     binding = payload.get("binding", "paperback")
     plat = payload.get("platform", "kdp")
-    bleed = PLATFORMS.get(plat, PLATFORMS["kdp"])["bleed"]
-    full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding)
+    binding_unsupported = binding in PLATFORM_UNSUPPORTED_BINDINGS.get(plat, set())
+    # Cover bleed is a property of the (platform, binding) pair -- case
+    # laminate/jacket bleed varies by distributor, not just by binding.
+    bleed = resolve_binding_spec(binding, plat)["bleed"]
+    spine_w, spine_is_estimate = calculate_spine_width_for_platform(page_count, paper_info["ppi"], plat, binding)
+    spine_is_estimate = not spine_is_estimate
+    if payload.get("spine_width_override"):
+        spine_w = float(payload["spine_width_override"])
+        spine_is_estimate = False
+    full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, plat)
     return {
         "spine_width": spine_w,
+        "spine_is_estimate": spine_is_estimate,
+        "binding_unsupported_on_platform": binding_unsupported,
         "full_cover": full,
         "trim": trim,
         "paper_ppi": paper_info["ppi"],
@@ -1080,6 +1104,19 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             "file_metadata": metadata, "compliance": compliance,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        # This legacy (no-slot) path is really just fixing the full_wrap
+        # cover under its old name -- if the project also has a slots.full_wrap
+        # entry (any slot-based upload, e.g. a cover-template render, sets
+        # both), it must be kept in sync too. Without this, autofix deletes
+        # the old file and updates only uploaded_file/file_metadata, leaving
+        # slots.full_wrap pointing at a file that no longer exists -- so the
+        # very next slot-based call (AI Upscale, AI Cover, re-autofix by
+        # slot) 404s on "No uploaded file in slot 'full_wrap'" even though
+        # the user just successfully fixed that exact cover.
+        existing_slots = p.get("slots") or {}
+        if existing_slots.get("full_wrap"):
+            existing_slots["full_wrap"] = {**metadata, "compliance": compliance}
+            update["slots"] = existing_slots
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
     return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "check_type": "basic"}
 
@@ -1238,7 +1275,17 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"]) if needs_cover else 0
+    platform_key = p.get("platform", "kdp")
+    binding = p.get("binding", "paperback")
+    # Cover bleed and hardcover spine are both properties of the (platform,
+    # binding) pair -- e.g. IngramSpark/KDP case-laminate wrap bleed vs
+    # Lulu's flat 0.125" for every binding -- not just the binding alone.
+    # Interior bleed stays platform-level since that genuinely doesn't vary
+    # by binding.
+    cover_bleed = resolve_binding_spec(binding, platform_key)["bleed"]
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0] if needs_cover else 0
+    if needs_cover and p.get("spine_width_override"):
+        spine_w = float(p["spine_width_override"])
     export_id = uuid.uuid4().hex[:6]
 
     color_profile = (p.get("adjustments") or {}).get("color_profile") or DEFAULT_COLOR_PROFILE
@@ -1255,9 +1302,11 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     if needs_cover:
         cover_path = UPLOAD_DIR / cover_data["stored_filename"]
         cover_export_path = EXPORT_DIR / f"{project_id}_cover_{export_id}.pdf"
-        # If a valid ISBN is set on the project, generate the barcode PNG for the back cover
+        # If a valid ISBN is set on the project, generate the barcode PNG for the back cover --
+        # unless the uploaded cover art already has its own barcode built in, in which case
+        # overlaying another one would stamp a second barcode on top of it.
         barcode_png = None
-        if p.get("isbn"):
+        if p.get("isbn") and not p.get("cover_has_barcode"):
             try:
                 barcode_png = generate_barcode_png_bytes(p["isbn"])
             except Exception:
@@ -1266,12 +1315,14 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
             cover_result = build_print_ready_pdf(
                 str(cover_path), str(cover_export_path),
                 trim_w=trim["w"], trim_h=trim["h"],
-                bleed=plat["bleed"], spine_w=spine_w,
+                bleed=cover_bleed, spine_w=spine_w,
                 is_cover=True, title=p["name"],
                 author=(user.get("name") or ""),
                 barcode_png_bytes=barcode_png,
                 color_profile=color_profile,
                 producer_name=producer_name,
+                binding=binding,
+                platform=platform_key,
             )
         except Exception as e:
             await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
@@ -2438,18 +2489,25 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
 def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
     """Target pixel dimensions for a slot at 300 DPI, trim + bleed included."""
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
-    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    bleed = plat["bleed"]
+    binding = p.get("binding", "paperback")
+    platform_key = p.get("platform", "kdp")
+    # Cover bleed is a property of the (platform, binding) pair -- see the
+    # export path's cover_bleed for the same fix and why it matters.
+    bleed = resolve_binding_spec(binding, platform_key)["bleed"]
 
     if slot == "full_wrap":
         paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
-        spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"])
-        dims = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, p.get("binding", "paperback"))
+        spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+        if p.get("spine_width_override"):
+            spine_w = float(p["spine_width_override"])
+        dims = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, platform_key)
         return round(dims["total_width"] * 300), round(dims["total_height"] * 300)
 
     if slot == "spine":
         paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
-        spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"])
+        spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+        if p.get("spine_width_override"):
+            spine_w = float(p["spine_width_override"])
         return round(spine_w * 300), round((trim["h"] + bleed * 2) * 300)
 
     return round((trim["w"] + bleed * 2) * 300), round((trim["h"] + bleed * 2) * 300)
@@ -2526,15 +2584,20 @@ async def apply_cover_template(project_id: str, payload: CoverTemplateApplyIn, u
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
-    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    spine_w = calculate_spine_width(p.get("page_count", 0), paper["ppi"])
+    binding = p.get("binding", "paperback")
+    platform_key = p.get("platform", "kdp")
+    cover_bleed = resolve_binding_spec(binding, platform_key)["bleed"]
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+    if p.get("spine_width_override"):
+        spine_w = float(p["spine_width_override"])
 
     title = (p.get("name") or "Untitled Book").strip()
     file_id = f"{project_id}_full_wrap_tpl_{uuid.uuid4().hex[:6]}.pdf"
     file_path = UPLOAD_DIR / file_id
     render_cover_template(
         str(file_path), payload.template_key, title=title, author=(user.get("name") or ""),
-        trim_w=trim["w"], trim_h=trim["h"], spine_w=spine_w, bleed=plat["bleed"], binding=p["binding"],
+        trim_w=trim["w"], trim_h=trim["h"], spine_w=spine_w, bleed=cover_bleed, binding=binding,
+        platform=platform_key,
     )
     metadata, compliance = _save_generated_slot_file(
         p, project_id, "full_wrap", file_id, file_path.read_bytes(),

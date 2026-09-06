@@ -115,9 +115,10 @@ def render_cover_template(
     spine_w: float,
     bleed: float,
     binding: str = "paperback",
+    platform: str = "ingramspark",
 ) -> dict:
     tpl = COVER_TEMPLATES.get(template_key, COVER_TEMPLATES["literary_minimal"])
-    full = calculate_full_cover_dimensions(trim_w, trim_h, spine_w, bleed, binding)
+    full = calculate_full_cover_dimensions(trim_w, trim_h, spine_w, bleed, binding, platform)
     total_w_pt = full["total_width"] * inch
     total_h_pt = full["total_height"] * inch
     front_x_pt = full["front_x"] * inch
