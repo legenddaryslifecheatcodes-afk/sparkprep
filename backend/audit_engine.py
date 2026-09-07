@@ -16,8 +16,27 @@ def compute_effective_dpi_report(width_px: int, height_px: int, target_w_in: flo
     return {"dpi_x": round(dpi_x, 1), "dpi_y": round(dpi_y, 1), "effective_dpi": round(eff, 1), "status": status}
 
 
-def deep_audit(file_metadata: dict, trim_w: float, trim_h: float, bleed: float, platform_name: str) -> List[dict]:
+def deep_audit(
+    file_metadata: dict, expected_w: float, expected_h: float, bleed: float, platform_name: str,
+    is_cover: bool = False, shape_note: str = "",
+) -> List[dict]:
     """Return a list of pinpointed failure/risk findings.
+
+    `expected_w`/`expected_h` must already be the FULL expected canvas size
+    including bleed -- for an interior page that's trim + bleed on each side,
+    but for a cover it's the whole front+spine+back(+flaps) wrap, which the
+    caller computes (print_specs.calculate_full_cover_dimensions) since only
+    the caller knows the binding/platform/spine width. This function used to
+    compute `trim + bleed*2` internally for every file regardless of whether
+    it was a cover or interior upload -- correct for interior, but silently
+    wrong for any cover (missing spine width entirely), so real covers were
+    flagged as the wrong size/resolution against a canvas size that isn't
+    what any distributor actually expects for a cover.
+
+    `shape_note` is a caller-supplied phrase describing what expected_w/h
+    represents (e.g. "front + 0.41\" spine + back, plus bleed") so a cover
+    finding's wording doesn't misleadingly talk about "trim + bleed" the way
+    an interior finding correctly does.
 
     Each finding: {
       id, severity (fail|warning|pass), title, why_it_fails, publisher_rule,
@@ -25,21 +44,21 @@ def deep_audit(file_metadata: dict, trim_w: float, trim_h: float, bleed: float, 
     }
     """
     findings = []
+    file_kind = "cover" if is_cover else "interior"
+    size_desc = shape_note or f"trim + {bleed}\" bleed each side"
 
     # Bleed zone integrity
     if file_metadata.get("is_pdf"):
         w_in = (file_metadata.get("width_px") or 0) / 72.0
         h_in = (file_metadata.get("height_px") or 0) / 72.0
-        expected_w = trim_w + bleed * 2
-        expected_h = trim_h + bleed * 2
         if abs(w_in - expected_w) > 0.02 or abs(h_in - expected_h) > 0.02:
             findings.append({
                 "id": "bleed_dimension_mismatch",
                 "severity": "fail",
                 "title": "Bleed dimensions don't match distributor requirement",
                 "why_it_fails": (
-                    f"Your PDF is {w_in:.3f}\" × {h_in:.3f}\" but {platform_name} expects "
-                    f"{expected_w:.3f}\" × {expected_h:.3f}\" (trim {trim_w}\"×{trim_h}\" + {bleed}\" bleed each side). "
+                    f"Your {file_kind} PDF is {w_in:.3f}\" × {h_in:.3f}\" but {platform_name} expects "
+                    f"{expected_w:.3f}\" × {expected_h:.3f}\" ({size_desc}). "
                     f"A mismatch of {abs(w_in - expected_w):.3f}\" wide / {abs(h_in - expected_h):.3f}\" tall "
                     "will cause the file to be rejected during automated preflight."
                 ),
@@ -63,8 +82,6 @@ def deep_audit(file_metadata: dict, trim_w: float, trim_h: float, bleed: float, 
     else:
         w_px = file_metadata.get("width_px") or 0
         h_px = file_metadata.get("height_px") or 0
-        expected_w = trim_w + bleed * 2
-        expected_h = trim_h + bleed * 2
         report = compute_effective_dpi_report(w_px, h_px, expected_w, expected_h)
         if report["status"] == "fail":
             findings.append({

@@ -394,12 +394,23 @@ def build_print_ready_pdf(
 def run_compliance_checks(
     file_metadata: dict, target_w: float, target_h: float, bleed: float, platform: str = "kdp",
     file_path: str = None, slot: str = None, platform_name: str = None, max_pages: int = None,
+    final_w: float = None, final_h: float = None,
 ) -> list:
     """Return a list of compliance issues with severity and auto-fix availability.
 
     file_path/slot/platform_name/max_pages are optional and only used for the
     interior safety-margin/centering check below -- every existing caller that
     doesn't pass them (cover slots, legacy uploads) behaves exactly as before.
+
+    final_w/final_h are optional pre-computed, already bleed-inclusive
+    expected canvas dimensions for the DPI check. Every caller used to leave
+    the DPI check to compute `target_w + bleed*2` itself, which is only
+    correct for a plain trim-sized panel (interior page, front/back cover
+    panel) -- for a full_wrap or spine slot that's wrong (missing spine width
+    or, for a jacket/case binding, missing flaps/board-size adjustments
+    entirely), so those callers now pass the real computed size directly
+    (see server.py's _target_inches_for_slot) instead of leaving this
+    function to guess it from trim size alone.
     """
     checks = []
 
@@ -415,7 +426,9 @@ def run_compliance_checks(
     else:
         w_px = file_metadata.get("width_px") or 0
         h_px = file_metadata.get("height_px") or 0
-        dpi_info = compute_effective_dpi(w_px, h_px, target_w + (bleed * 2), target_h + (bleed * 2))
+        expected_w = final_w if final_w is not None else target_w + (bleed * 2)
+        expected_h = final_h if final_h is not None else target_h + (bleed * 2)
+        dpi_info = compute_effective_dpi(w_px, h_px, expected_w, expected_h)
         checks.append({
             "id": "dpi",
             "label": f"Resolution ({dpi_info['effective_dpi']} DPI)",
@@ -509,6 +522,27 @@ def run_compliance_checks(
             file_path, platform_name or platform, target_w, target_h, max_pages=max_pages,
         )
         for f in margin_findings:
+            checks.append({
+                "id": f["id"],
+                "label": f["title"],
+                "status": f["severity"],
+                "message": f["why_it_fails"],
+                "auto_fix": False,
+            })
+
+    # Cover text/art safety margin -- the cover-file counterpart to the
+    # interior check above. Runs OCR (see pdfx_validator.check_cover_safety_margins
+    # for why a cover needs OCR rather than reading text-block positions
+    # directly) against the outer trim edge. Needs final_w/final_h (the real
+    # bleed-inclusive canvas size for this slot) to convert pixel positions
+    # to inches correctly -- without it, this can't reliably tell where the
+    # trim edge even is, so it's skipped rather than guessing.
+    if slot in ("full_wrap", "front_cover", "back_cover") and file_path and final_w and final_h:
+        from pdfx_validator import check_cover_safety_margins
+        cover_margin_findings = check_cover_safety_margins(
+            file_path, file_metadata.get("is_pdf", False), final_w, final_h, platform_name or platform,
+        )
+        for f in cover_margin_findings:
             checks.append({
                 "id": f["id"],
                 "label": f["title"],

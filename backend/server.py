@@ -37,7 +37,7 @@ from file_processor import (
 )
 from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
-from pdfx_validator import run_pdf_structure_audit, check_interior_safety_margins
+from pdfx_validator import run_pdf_structure_audit, check_interior_safety_margins, check_cover_safety_margins
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
 from report_export import generate_audit_report_pdf, generate_audit_brief_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
@@ -1079,9 +1079,14 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    # No explicit slot means the legacy full-cover path (see _replace_slot's
+    # legacy branch, which now keeps slots.full_wrap in sync for exactly
+    # this reason) -- treat it as full_wrap for sizing purposes too.
+    final_w, final_h = _target_inches_for_slot(p, slot or "full_wrap")
     compliance = run_compliance_checks(
         metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
         file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+        final_w=final_w, final_h=final_h,
     )
     # Branches above that didn't actually replace the file (no fix needed, or
     # Ghostscript unavailable) don't set stored_filename on the fresh
@@ -1149,7 +1154,13 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
         if not cover_meta:
             sections["cover"] = {"uploaded": False, "compliance": []}
         else:
-            sections["cover"] = {"uploaded": True, "compliance": run_compliance_checks(cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"])}
+            cover_path = UPLOAD_DIR / cover_meta["stored_filename"] if cover_meta.get("stored_filename") else None
+            final_w, final_h = _target_inches_for_slot(p, "full_wrap")
+            sections["cover"] = {"uploaded": True, "compliance": run_compliance_checks(
+                cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
+                file_path=str(cover_path) if cover_path else None, slot="full_wrap",
+                platform_name=plat.get("name"), final_w=final_w, final_h=final_h,
+            )}
     if needs_interior:
         interior_meta = (p.get("slots") or {}).get("interior")
         if not interior_meta:
@@ -1501,8 +1512,18 @@ async def batch_audit(payload: BatchIn, user: dict = Depends(get_current_user)):
         if project_type in ("cover", "combined"):
             cover_meta = _cover_file_meta(p)
             if cover_meta:
-                compliance += run_compliance_checks(cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"])
+                # _cover_file_meta resolves full_wrap, then front_cover, then
+                # the legacy field (itself always a full-wrap upload) -- mirror
+                # that same precedence here so the size check matches whichever
+                # slot actually got used.
+                cover_slot = "full_wrap" if (p.get("slots") or {}).get("full_wrap") or not (p.get("slots") or {}).get("front_cover") else "front_cover"
                 cover_path = UPLOAD_DIR / cover_meta["stored_filename"]
+                final_w, final_h = _target_inches_for_slot(p, cover_slot)
+                compliance += run_compliance_checks(
+                    cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
+                    file_path=str(cover_path) if cover_path.exists() else None, slot=cover_slot,
+                    platform_name=plat.get("name"), final_w=final_w, final_h=final_h,
+                )
                 if cover_meta.get("is_pdf") and cover_path.exists():
                     structure += run_pdf_structure_audit(str(cover_path), plat.get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
         if project_type in ("interior", "combined"):
@@ -2377,9 +2398,11 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
 
         trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
         plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+        final_w, final_h = _target_inches_for_slot(p, slot)
         compliance = run_compliance_checks(
             metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
             file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+            final_w=final_w, final_h=final_h,
         )
     except Exception as e:
         await log_failure(db, "slot_upload_analyze", e, project_id=project_id, user_id=user["id"],
@@ -2426,7 +2449,12 @@ def _save_generated_slot_file(p: dict, project_id: str, slot: str, file_id: str,
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    compliance = run_compliance_checks(metadata, trim["w"], trim["h"], plat["bleed"], p["platform"])
+    final_w, final_h = _target_inches_for_slot(p, slot)
+    compliance = run_compliance_checks(
+        metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
+        file_path=str(file_path), slot=slot, platform_name=plat.get("name"),
+        final_w=final_w, final_h=final_h,
+    )
     return metadata, compliance
 
 
@@ -2491,6 +2519,16 @@ def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     binding = p.get("binding", "paperback")
     platform_key = p.get("platform", "kdp")
+    if slot == "interior":
+        # Interior bleed is a flat platform-level constant regardless of
+        # binding (an interior page isn't a "hardcover jacket wrap" -- it
+        # doesn't get bigger because the cover binding is). Using the
+        # binding's cover bleed here (e.g. 0.625" for hardcover_case) would
+        # inflate the target canvas by up to 1" total on a hardcover project's
+        # interior page for no real reason.
+        bleed = PLATFORMS.get(platform_key, PLATFORMS["kdp"])["bleed"]
+        return round((trim["w"] + bleed * 2) * 300), round((trim["h"] + bleed * 2) * 300)
+
     # Cover bleed is a property of the (platform, binding) pair -- see the
     # export path's cover_bleed for the same fix and why it matters.
     bleed = resolve_binding_spec(binding, platform_key)["bleed"]
@@ -2511,6 +2549,19 @@ def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
         return round(spine_w * 300), round((trim["h"] + bleed * 2) * 300)
 
     return round((trim["w"] + bleed * 2) * 300), round((trim["h"] + bleed * 2) * 300)
+
+
+def _target_inches_for_slot(p: dict, slot: str) -> tuple[float, float]:
+    """Inches equivalent of _target_pixels_for_slot -- same bleed-inclusive
+    target size (correct per-slot: full wrap size for full_wrap, spine width
+    for spine, plain trim+bleed for a single cover panel or interior page),
+    used by compliance checks (DPI, cover safety margin) that need a
+    physical dimension rather than a pixel count. Keeping this as a thin
+    wrapper instead of duplicating the per-slot logic guarantees the DPI/
+    margin checks and the AI-upscale target always agree on what "correct
+    size" means for a given slot."""
+    w_px, h_px = _target_pixels_for_slot(p, slot)
+    return w_px / 300.0, h_px / 300.0
 
 
 @api_router.post("/projects/{project_id}/ai-enhance/{slot}")
@@ -2688,6 +2739,18 @@ AUDIT_PRICE_CENTS = 99
 class AuditStart(BaseModel):
     platform: str = "kdp"
     trim_size: str = "6x9"
+    # A cover isn't shaped like an interior page -- it's front+spine+back(+flaps),
+    # and the expected canvas size depends on binding and page count (for spine
+    # width), not just trim + bleed. Without this, the audit's size/DPI checks
+    # had no way to tell a cover from an interior page and always computed
+    # "expected size" as if it were an interior file, which produces a false
+    # "wrong size" / "resolution too low" verdict on essentially every real
+    # cover (its actual size legitimately includes spine width that the
+    # interior-only formula never accounted for).
+    file_type: str = "interior"  # "interior" or "cover"
+    binding: str = "paperback"
+    page_count: int = 0
+    paper_type: str = "white_50lb"
 
 
 class AuditCheckoutIn(BaseModel):
@@ -2700,11 +2763,19 @@ async def audit_start(payload: AuditStart):
         raise HTTPException(400, "Invalid platform")
     if payload.trim_size not in TRIM_SIZES:
         raise HTTPException(400, "Invalid trim size")
+    if payload.file_type not in ("interior", "cover"):
+        raise HTTPException(400, "file_type must be 'interior' or 'cover'")
+    if payload.file_type == "cover" and payload.binding not in BINDING_TYPES:
+        raise HTTPException(400, "Invalid binding")
     audit_id = uuid.uuid4().hex
     doc = {
         "audit_id": audit_id,
         "platform": payload.platform,
         "trim_size": payload.trim_size,
+        "file_type": payload.file_type,
+        "binding": payload.binding,
+        "page_count": payload.page_count,
+        "paper_type": payload.paper_type,
         "file_id": None,
         "file_metadata": None,
         "preview_findings": None,
@@ -2779,7 +2850,24 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
 
     trim = TRIM_SIZES[a["trim_size"]]
     plat = PLATFORMS[a["platform"]]
-    findings = deep_audit(metadata, trim["w"], trim["h"], plat["bleed"], plat["name"])
+    file_type = a.get("file_type", "interior")
+    if file_type == "cover":
+        binding = a.get("binding", "paperback")
+        paper = PAPER_TYPES.get(a.get("paper_type", "white_50lb"), PAPER_TYPES["white_50lb"])
+        spine_w, _ = calculate_spine_width_for_platform(a.get("page_count", 0), paper["ppi"], a["platform"], binding)
+        bleed = resolve_binding_spec(binding, a["platform"])["bleed"]
+        full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, a["platform"])
+        shape_note = f"front + back + {spine_w:.3f}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
+        findings = deep_audit(
+            metadata, full["total_width"], full["total_height"], bleed, plat["name"],
+            is_cover=True, shape_note=shape_note,
+        )
+        findings += check_cover_safety_margins(
+            str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
+        )
+    else:
+        bleed = plat["bleed"]
+        findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
     # Structural checks that require opening the actual PDF (not just its
     # source metadata): PDF/X-1a declaration, live transparency, layers,
     # embedded fonts, ICC output intent. Only applies to PDFs -- an image

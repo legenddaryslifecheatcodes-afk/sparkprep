@@ -583,3 +583,144 @@ def check_interior_safety_margins(
         ))
 
     return findings
+
+
+# Confirmed real gap: a cover has no compliance check that looks at where
+# text/art actually sits in the image at all -- DPI/color/transparency/PDF-X1a
+# all validate the *file*, none of them validate the *layout*. Distributors
+# reject covers for exactly this ("text too close to trim") routinely; a real
+# self-published book cover with the author's name near the bottom outside
+# the safety margin would pass every existing cover check clean.
+#
+# The interior check above works by reading real text-BLOCK positions out of
+# a genuine text-layer PDF (PyMuPDF). A cover almost never has that -- it's a
+# flat design export (raster image, or a flattened PDF with no text layer) --
+# so there's no "where is the text" data to read directly. This instead
+# rasterizes the cover and runs OCR (Tesseract, already a real dependency in
+# this codebase -- see engines/template/analyzer/ocr_extractor.py, used in
+# production for reading distributor cover templates) to find real text
+# bounding boxes, then measures each one against the outer trim edge.
+#
+# From IngramSpark's own Cover Requirements: "MARGINS: 0.25" (6 mm)
+# recommended margin on all sides from final trim size. LS templates allow
+# down to 0.125" (3 mm) safety." -- so this uses a two-tier severity the same
+# way the DPI check does (fail below the hard floor, warning below the
+# recommendation but above the floor), not a single fail/pass line.
+COVER_SAFETY_MARGIN_RECOMMENDED_IN = 0.25
+COVER_SAFETY_MARGIN_FLOOR_IN = 0.125
+_COVER_OCR_MIN_CONFIDENCE = 40
+_COVER_OCR_DPI = 200
+
+
+def check_cover_safety_margins(
+    file_path: str, is_pdf: bool, total_w_in: float, total_h_in: float, platform_name: str,
+) -> List[dict]:
+    """Checks whether any text detected on a cover sits too close to the
+    OUTER trim edge of the whole flat cover (top/bottom/left/right).
+
+    Scope: only the outer edges, using total_w_in/total_h_in (the full,
+    already bleed-inclusive canvas size for whatever this cover's binding
+    actually is -- see print_specs.calculate_full_cover_dimensions). The
+    tighter fold-line margins between panels (spine-to-cover, cover-to-flap)
+    aren't modeled here -- this catches the common, reported case (e.g. an
+    author name near the bottom edge), not every possible cover-layout
+    violation.
+
+    For a PDF, the file's own real page size is used to convert OCR pixel
+    positions to inches (more accurate than trusting total_w_in/total_h_in
+    against a file that might itself be the wrong size -- that's a separate,
+    already-covered mismatch). For a raster image there's no physical unit
+    to read from the file itself, so total_w_in/total_h_in is the only
+    available basis -- an approximation that assumes the image really is
+    close to that physical size, same assumption the DPI check already makes.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return []  # OCR stack unavailable -- don't block the rest of compliance on this
+
+    try:
+        if is_pdf:
+            import fitz
+            doc = fitz.open(file_path)
+            try:
+                page = doc[0]
+                img_w_in = page.rect.width / 72.0
+                img_h_in = page.rect.height / 72.0
+                pix = page.get_pixmap(dpi=_COVER_OCR_DPI, colorspace=fitz.csRGB, alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            finally:
+                doc.close()
+        else:
+            image = Image.open(file_path).convert("RGB")
+            img_w_in, img_h_in = total_w_in, total_h_in
+    except Exception:
+        return []  # unreadable file -- other checks already cover that
+
+    if img_w_in <= 0 or img_h_in <= 0:
+        return []
+    px_per_in_x = image.width / img_w_in
+    px_per_in_y = image.height / img_h_in
+
+    try:
+        data = pytesseract.image_to_data(image, config="--psm 11", output_type=pytesseract.Output.DICT)
+    except Exception:
+        return []  # Tesseract not available/failed at runtime -- don't block the rest of compliance on this
+
+    worst_margin_in = None
+    worst_word = None
+    flagged_count = 0
+    n = len(data.get("text", []))
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            continue
+        if conf < _COVER_OCR_MIN_CONFIDENCE:
+            continue
+
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        left_in = x / px_per_in_x
+        top_in = y / px_per_in_y
+        right_in = img_w_in - (x + w) / px_per_in_x
+        bottom_in = img_h_in - (y + h) / px_per_in_y
+        word_margin = min(left_in, top_in, right_in, bottom_in)
+
+        if word_margin < COVER_SAFETY_MARGIN_RECOMMENDED_IN:
+            flagged_count += 1
+            if worst_margin_in is None or word_margin < worst_margin_in:
+                worst_margin_in = word_margin
+                worst_word = text
+
+    if worst_margin_in is None:
+        return []
+
+    severity = "fail" if worst_margin_in < COVER_SAFETY_MARGIN_FLOOR_IN else "warning"
+    return [_finding(
+        id="cover_safety_margin",
+        severity=severity,
+        title=f"Text on your cover sits too close to the edge (\"{worst_word}\", {round(worst_margin_in, 2)}\" from trim)",
+        why_it_fails=(
+            f"OCR found the word \"{worst_word}\" only {round(worst_margin_in, 2)}\" from the nearest trim edge "
+            f"({flagged_count} word{'s' if flagged_count != 1 else ''} total flagged within the margin). "
+            f"{platform_name} recommends at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" clearance on every side "
+            f"(their absolute minimum is {COVER_SAFETY_MARGIN_FLOOR_IN}\") so normal cutting variance during "
+            "binding doesn't clip text. " + (
+                "This is below even their minimum tolerance -- a near-certain rejection or visibly cropped text."
+                if severity == "fail" else
+                "This is within their minimum tolerance but below their recommended margin -- risky, not a guaranteed fail."
+            )
+        ),
+        publisher_rule=f"{platform_name} — cover text/art must stay at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" from the trim edge",
+        pinpoint={"detected_text": worst_word, "margin_in": round(worst_margin_in, 2), "flagged_word_count": flagged_count},
+        fix_steps=[
+            f"Open your cover design file and move all text/logos at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" inside the trim edge on every side.",
+            "Re-export and re-upload.",
+        ],
+        fix_tools=["Adobe Photoshop", "Adobe Illustrator", "Canva", "SparkPrep Cover Editor"],
+        one_click_fix=False,
+    )]
