@@ -34,6 +34,7 @@ from print_specs import (
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks,
+    check_total_ink_coverage,
 )
 from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
@@ -2910,6 +2911,9 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
     else:
         bleed = plat["bleed"]
         findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
+    tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), a["platform"], plat["name"])
+    if tac_finding:
+        findings.append(tac_finding)
     # Structural checks that require opening the actual PDF (not just its
     # source metadata): PDF/X-1a declaration, live transparency, layers,
     # embedded fonts, ICC output intent. Only applies to PDFs -- an image
