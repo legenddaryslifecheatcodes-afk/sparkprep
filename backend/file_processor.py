@@ -3,6 +3,8 @@ import io
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+import numpy as np
 from PIL import Image, ImageCms
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
@@ -87,6 +89,136 @@ def compute_effective_dpi(width_px: int, height_px: int, target_w_inches: float,
     }
 
 
+def rgb_array_to_cmyk_array(rgb: np.ndarray) -> np.ndarray:
+    """Correct RGB -> CMYK conversion with real K-channel (black ink)
+    extraction, vectorized over a full image array (H, W, 3) uint8 -> (H, W, 4) uint8.
+
+    PIL's own `Image.convert("CMYK")` does NOT do this -- it hard-codes K=0
+    for every pixel and encodes black as C=255,M=255,Y=255 instead (verified
+    directly: RGB (0,0,0) -> CMYK (255,255,255,0)). That's not a cosmetic
+    difference -- it means every dark/black pixel in every file this app
+    auto-converts comes out at ~300% total ink coverage (three full-strength
+    inks stacked) instead of ~100% (single K channel), which is both a real
+    print defect (oversaturation: slow drying, dot gain, show-through, ink
+    that never fully dries on some stocks) and exactly what IngramSpark's
+    and Lulu's own rich-black/TAC rules exist to prevent -- their "recommended
+    rich black" (60/40/40/100) is nowhere near this. Using standard K
+    extraction (K = 1 - max(R,G,B), then removing that much from each of
+    C/M/Y) fixes both: black actually prints as black ink, and a normal
+    image no longer sits at 2-3x the ink density it should.
+
+    Not a full ICC-managed transform (this app deliberately doesn't bundle
+    licensed CMYK ICC profiles -- see print_specs.COLOR_PROFILES) -- this is
+    the standard naive-but-correct formula every simple CMYK converter uses
+    absent a real profile, and it's what actually matches "black prints as
+    100% K" instead of a stacked-ink fake.
+    """
+    rgb_f = rgb.astype(np.float64) / 255.0
+    r, g, b = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
+    k = 1.0 - np.maximum(np.maximum(r, g), b)
+    safe_denom = np.where(k < 1.0, 1.0 - k, 1.0)  # avoid divide-by-zero on pure black (k=1)
+    c = np.where(k < 1.0, (1.0 - r - k) / safe_denom, 0.0)
+    m = np.where(k < 1.0, (1.0 - g - k) / safe_denom, 0.0)
+    y = np.where(k < 1.0, (1.0 - b - k) / safe_denom, 0.0)
+    cmyk = np.stack([c, m, y, k], axis=-1)
+    return np.clip(cmyk * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+# Total (ink) Area Coverage -- the sum of all four CMYK channel percentages
+# at a given point. Printed too high, ink oversaturates: slow drying, dot
+# gain, show-through, and visible loss of detail in dark areas. Confirmed
+# from the real guides: IngramSpark ("CMYK total value should not exceed
+# 240%... Files sent with densities higher than 240% may be rejected for
+# correction") and Lulu ("TAC should never exceed 270%"). No confirmed
+# number exists yet for KDP/B&N specifically, so they fall back to
+# IngramSpark's (the more conservative of the two confirmed numbers) rather
+# than guessing something looser.
+TAC_THRESHOLD_DEFAULT = 240
+TAC_THRESHOLD_BY_PLATFORM = {"lulu": 270}
+# A handful of stray pixels over the line (JPEG ringing, anti-aliased edge
+# pixels) isn't a real print problem -- only flag when a meaningful share of
+# the actual image is affected.
+_TAC_MIN_AFFECTED_FRACTION = 0.005
+_TAC_SAMPLE_MAX_DIM = 1200  # downsample before the ink-coverage scan; doesn't need full resolution
+
+
+def check_total_ink_coverage(file_path: str, is_pdf: bool, platform: str, platform_name: str) -> Optional[dict]:
+    """Checks whether a meaningful share of a cover or interior page's real
+    CMYK ink coverage exceeds the distributor's rich-black/TAC ceiling.
+
+    For an already-CMYK file, actual channel values are read directly. For
+    RGB/other modes, this simulates the SAME conversion SparkPrep's own
+    Auto-Fix uses (rgb_array_to_cmyk_array, with real K-channel extraction)
+    so the check reflects what will actually happen to this file's ink
+    coverage, not PIL's naive convert("CMYK") (which would report every
+    dark pixel as ~300% and make this check fire constantly and
+    meaninglessly -- exactly the bug that convert_to_cmyk itself used to
+    have, fixed alongside this check rather than measured against).
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+
+        if is_pdf:
+            import fitz
+            doc = fitz.open(file_path)
+            try:
+                page = doc[0]
+                zoom = min(1.0, _TAC_SAMPLE_MAX_DIM / max(page.rect.width, page.rect.height))
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB, alpha=False)
+                rgb_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+                cmyk_arr = rgb_array_to_cmyk_array(rgb_arr)
+            finally:
+                doc.close()
+        else:
+            img = Image.open(file_path)
+            if img.mode == "CMYK":
+                img.thumbnail((_TAC_SAMPLE_MAX_DIM, _TAC_SAMPLE_MAX_DIM))
+                cmyk_arr = np.array(img)
+            else:
+                if img.mode in ("RGBA", "LA"):
+                    bg = Image.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[-1])
+                    img = bg
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.thumbnail((_TAC_SAMPLE_MAX_DIM, _TAC_SAMPLE_MAX_DIM))
+                cmyk_arr = rgb_array_to_cmyk_array(np.array(img))
+    except Exception:
+        return None  # unreadable/unsupported file -- other checks already cover that
+
+    tac_percent = cmyk_arr.astype(np.float64).sum(axis=-1) / 255.0 * 100.0
+    threshold = TAC_THRESHOLD_BY_PLATFORM.get(platform, TAC_THRESHOLD_DEFAULT)
+    over_mask = tac_percent > threshold
+    affected_fraction = float(over_mask.mean())
+    if affected_fraction < _TAC_MIN_AFFECTED_FRACTION:
+        return None
+
+    worst_tac = float(tac_percent.max())
+    from pdfx_validator import _finding
+    return _finding(
+        id="total_ink_coverage",
+        severity="warning",
+        title=f"Ink coverage runs up to {round(worst_tac)}% in places (limit {threshold}%)",
+        why_it_fails=(
+            f"About {round(affected_fraction * 100, 1)}% of this file's area exceeds {threshold}% total ink "
+            f"coverage (peaking around {round(worst_tac)}%). {platform_name} recommends a rich black of "
+            "60% Cyan / 40% Magenta / 40% Yellow / 100% Black rather than stacking full-strength inks -- "
+            "oversaturated ink can print slow-drying, show through the page, or lose fine detail in dark areas. "
+            "This may still print without being rejected, but is worth checking against a real proof."
+        ),
+        publisher_rule=f"{platform_name} — total CMYK ink coverage should not exceed {threshold}%",
+        pinpoint={"affected_fraction": round(affected_fraction, 4), "worst_tac_percent": round(worst_tac), "threshold_percent": threshold},
+        fix_steps=[
+            "In Photoshop: Image → Adjustments → Levels/Curves on the CMYK channels, or use a rich-black action to cap total ink.",
+            "Avoid building black from 100% C+M+Y+K stacked together -- use a single rich-black formula instead (e.g. 60/40/40/100).",
+            "Re-export and re-upload.",
+        ],
+        fix_tools=["Adobe Photoshop", "Adobe Illustrator"],
+        one_click_fix=False,
+    )
+
+
 def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300) -> dict:
     """Convert image to CMYK color space at target DPI, flatten transparency."""
     with Image.open(input_path) as img:
@@ -100,9 +232,12 @@ def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300) ->
             img = img.convert("RGB")
         elif img.mode == "L":
             img = img.convert("RGB")
-        # Convert RGB to CMYK using default ImageCms profile
+        # Convert RGB to CMYK with real K-channel extraction -- see
+        # rgb_array_to_cmyk_array's docstring for why PIL's own .convert("CMYK")
+        # is unsafe to use here (it fakes black with 300% stacked ink).
         if img.mode == "RGB":
-            img = img.convert("CMYK")
+            cmyk_arr = rgb_array_to_cmyk_array(np.array(img))
+            img = Image.fromarray(cmyk_arr, mode="CMYK")
         elif img.mode != "CMYK":
             img = img.convert("CMYK")
         # Save as TIFF with 300 DPI (CMYK support)
@@ -510,6 +645,21 @@ def run_compliance_checks(
         "auto_fix": True,
         "fix_action": "export_pdfx1a",
     })
+
+    # Total ink coverage / rich black -- applies to both cover and interior
+    # content per the real distributor guides (IngramSpark and Lulu both
+    # cap this, at 240% and 270% respectively). Needs the actual file on
+    # disk (reads real pixel values), so only runs when file_path is given.
+    if file_path:
+        tac_finding = check_total_ink_coverage(file_path, file_metadata.get("is_pdf", False), platform, platform_name or platform)
+        if tac_finding:
+            checks.append({
+                "id": tac_finding["id"],
+                "label": tac_finding["title"],
+                "status": tac_finding["severity"],
+                "message": tac_finding["why_it_fails"],
+                "auto_fix": False,
+            })
 
     # Interior text safety margin + page-size check -- nothing above (DPI,
     # color space, transparency, bleed, PDF/X-1a) ever looks at where the
