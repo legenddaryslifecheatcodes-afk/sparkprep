@@ -1082,11 +1082,17 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
     # No explicit slot means the legacy full-cover path (see _replace_slot's
     # legacy branch, which now keeps slots.full_wrap in sync for exactly
     # this reason) -- treat it as full_wrap for sizing purposes too.
-    final_w, final_h = _target_inches_for_slot(p, slot or "full_wrap")
+    effective_slot = slot or "full_wrap"
+    final_w, final_h = _target_inches_for_slot(p, effective_slot)
+    spine_kwargs = {}
+    if effective_slot == "full_wrap":
+        geom = _full_wrap_geometry(p)
+        spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                         "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
     compliance = run_compliance_checks(
         metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
         file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
-        final_w=final_w, final_h=final_h,
+        final_w=final_w, final_h=final_h, **spine_kwargs,
     )
     # Branches above that didn't actually replace the file (no fix needed, or
     # Ghostscript unavailable) don't set stored_filename on the fresh
@@ -1156,10 +1162,13 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
         else:
             cover_path = UPLOAD_DIR / cover_meta["stored_filename"] if cover_meta.get("stored_filename") else None
             final_w, final_h = _target_inches_for_slot(p, "full_wrap")
+            geom = _full_wrap_geometry(p)
             sections["cover"] = {"uploaded": True, "compliance": run_compliance_checks(
                 cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
                 file_path=str(cover_path) if cover_path else None, slot="full_wrap",
                 platform_name=plat.get("name"), final_w=final_w, final_h=final_h,
+                spine_x_in=geom["spine_x"], spine_w_in=geom["spine_width"],
+                page_count=p.get("page_count"), binding=p.get("binding", "paperback"),
             )}
     if needs_interior:
         interior_meta = (p.get("slots") or {}).get("interior")
@@ -1519,10 +1528,15 @@ async def batch_audit(payload: BatchIn, user: dict = Depends(get_current_user)):
                 cover_slot = "full_wrap" if (p.get("slots") or {}).get("full_wrap") or not (p.get("slots") or {}).get("front_cover") else "front_cover"
                 cover_path = UPLOAD_DIR / cover_meta["stored_filename"]
                 final_w, final_h = _target_inches_for_slot(p, cover_slot)
+                spine_kwargs = {}
+                if cover_slot == "full_wrap":
+                    geom = _full_wrap_geometry(p)
+                    spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                                     "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
                 compliance += run_compliance_checks(
                     cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
                     file_path=str(cover_path) if cover_path.exists() else None, slot=cover_slot,
-                    platform_name=plat.get("name"), final_w=final_w, final_h=final_h,
+                    platform_name=plat.get("name"), final_w=final_w, final_h=final_h, **spine_kwargs,
                 )
                 if cover_meta.get("is_pdf") and cover_path.exists():
                     structure += run_pdf_structure_audit(str(cover_path), plat.get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
@@ -2399,10 +2413,15 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
         trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
         plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
         final_w, final_h = _target_inches_for_slot(p, slot)
+        spine_kwargs = {}
+        if slot == "full_wrap":
+            geom = _full_wrap_geometry(p)
+            spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                             "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
         compliance = run_compliance_checks(
             metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
             file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
-            final_w=final_w, final_h=final_h,
+            final_w=final_w, final_h=final_h, **spine_kwargs,
         )
     except Exception as e:
         await log_failure(db, "slot_upload_analyze", e, project_id=project_id, user_id=user["id"],
@@ -2450,10 +2469,15 @@ def _save_generated_slot_file(p: dict, project_id: str, slot: str, file_id: str,
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
     final_w, final_h = _target_inches_for_slot(p, slot)
+    spine_kwargs = {}
+    if slot == "full_wrap":
+        geom = _full_wrap_geometry(p)
+        spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                         "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
     compliance = run_compliance_checks(
         metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
         file_path=str(file_path), slot=slot, platform_name=plat.get("name"),
-        final_w=final_w, final_h=final_h,
+        final_w=final_w, final_h=final_h, **spine_kwargs,
     )
     return metadata, compliance
 
@@ -2562,6 +2586,22 @@ def _target_inches_for_slot(p: dict, slot: str) -> tuple[float, float]:
     size" means for a given slot."""
     w_px, h_px = _target_pixels_for_slot(p, slot)
     return w_px / 300.0, h_px / 300.0
+
+
+def _full_wrap_geometry(p: dict) -> dict:
+    """The full calculate_full_cover_dimensions() breakdown for this
+    project's full_wrap cover (panel positions, spine_x/spine_width included)
+    -- used by the spine text-safety check, which needs to know exactly
+    where the spine column sits, not just the overall canvas size."""
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+    binding = p.get("binding", "paperback")
+    platform_key = p.get("platform", "kdp")
+    paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+    if p.get("spine_width_override"):
+        spine_w = float(p["spine_width_override"])
+    bleed = resolve_binding_spec(binding, platform_key)["bleed"]
+    return calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, platform_key)
 
 
 @api_router.post("/projects/{project_id}/ai-enhance/{slot}")
@@ -2864,6 +2904,8 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
         )
         findings += check_cover_safety_margins(
             str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
+            spine_x_in=full["spine_x"], spine_w_in=full["spine_width"],
+            page_count=a.get("page_count"), binding=binding,
         )
     else:
         bleed = plat["bleed"]

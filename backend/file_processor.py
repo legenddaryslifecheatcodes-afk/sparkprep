@@ -395,6 +395,7 @@ def run_compliance_checks(
     file_metadata: dict, target_w: float, target_h: float, bleed: float, platform: str = "kdp",
     file_path: str = None, slot: str = None, platform_name: str = None, max_pages: int = None,
     final_w: float = None, final_h: float = None,
+    spine_x_in: float = None, spine_w_in: float = None, page_count: int = None, binding: str = None,
 ) -> list:
     """Return a list of compliance issues with severity and auto-fix availability.
 
@@ -541,6 +542,7 @@ def run_compliance_checks(
         from pdfx_validator import check_cover_safety_margins
         cover_margin_findings = check_cover_safety_margins(
             file_path, file_metadata.get("is_pdf", False), final_w, final_h, platform_name or platform,
+            spine_x_in=spine_x_in, spine_w_in=spine_w_in, page_count=page_count, binding=binding,
         )
         for f in cover_margin_findings:
             checks.append({

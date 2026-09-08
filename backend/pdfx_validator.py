@@ -611,20 +611,33 @@ COVER_SAFETY_MARGIN_FLOOR_IN = 0.125
 _COVER_OCR_MIN_CONFIDENCE = 40
 _COVER_OCR_DPI = 200
 
+# From IngramSpark's Cover Requirements, "Spine Type Safety":
+# "0.0625" (2 mm) left/right sides for spines 0.35" and larger.
+# 0.03125" (1 mm) left/right sides for spines smaller than 0.35".
+# NO spine text allowed for Perfect Bound books with page counts below 48."
+SPINE_SAFETY_WIDE_IN = 0.0625
+SPINE_SAFETY_NARROW_IN = 0.03125
+SPINE_WIDTH_TIER_THRESHOLD_IN = 0.35
+SPINE_TEXT_MIN_PAGES_PERFECT_BOUND = 48
+
 
 def check_cover_safety_margins(
     file_path: str, is_pdf: bool, total_w_in: float, total_h_in: float, platform_name: str,
+    spine_x_in: Optional[float] = None, spine_w_in: Optional[float] = None,
+    page_count: Optional[int] = None, binding: Optional[str] = None,
 ) -> List[dict]:
     """Checks whether any text detected on a cover sits too close to the
-    OUTER trim edge of the whole flat cover (top/bottom/left/right).
+    OUTER trim edge of the whole flat cover (top/bottom/left/right), and --
+    when spine_x_in/spine_w_in are given -- whether any text sits inside the
+    spine column too close to ITS edges, using IngramSpark's own tighter
+    spine-specific margins (which are much narrower than the outer-edge
+    margin: a 2mm or even 1mm tolerance, not 6mm) and their "no spine text
+    below 48 pages" rule for Perfect Bound books.
 
-    Scope: only the outer edges, using total_w_in/total_h_in (the full,
-    already bleed-inclusive canvas size for whatever this cover's binding
-    actually is -- see print_specs.calculate_full_cover_dimensions). The
-    tighter fold-line margins between panels (spine-to-cover, cover-to-flap)
-    aren't modeled here -- this catches the common, reported case (e.g. an
-    author name near the bottom edge), not every possible cover-layout
-    violation.
+    Passing spine_x_in/spine_w_in is optional so callers that only have the
+    outer canvas size (or a binding with no spine, though there's no such
+    binding today) still get the outer-edge check; the spine check is
+    skipped, not guessed, when that geometry isn't available.
 
     For a PDF, the file's own real page size is used to convert OCR pixel
     positions to inches (more accurate than trusting total_w_in/total_h_in
@@ -668,9 +681,26 @@ def check_cover_safety_margins(
     except Exception:
         return []  # Tesseract not available/failed at runtime -- don't block the rest of compliance on this
 
-    worst_margin_in = None
-    worst_word = None
-    flagged_count = 0
+    has_spine_geometry = spine_x_in is not None and spine_w_in is not None and spine_w_in > 0
+    spine_left_in = spine_x_in if has_spine_geometry else None
+    spine_right_in = (spine_x_in + spine_w_in) if has_spine_geometry else None
+    spine_margin_required = (
+        (SPINE_SAFETY_WIDE_IN if spine_w_in >= SPINE_WIDTH_TIER_THRESHOLD_IN else SPINE_SAFETY_NARROW_IN)
+        if has_spine_geometry else None
+    )
+    spine_text_forbidden = (
+        has_spine_geometry and binding == "paperback"
+        and page_count is not None and page_count < SPINE_TEXT_MIN_PAGES_PERFECT_BOUND
+    )
+
+    outer_worst_in = None
+    outer_worst_word = None
+    outer_flagged = 0
+    spine_words_found = []  # any word overlapping the spine column, for the forbidden-text case
+    spine_worst_in = None
+    spine_worst_word = None
+    spine_flagged = 0
+
     n = len(data.get("text", []))
     for i in range(n):
         text = (data["text"][i] or "").strip()
@@ -684,43 +714,98 @@ def check_cover_safety_margins(
             continue
 
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        left_in = x / px_per_in_x
-        top_in = y / px_per_in_y
-        right_in = img_w_in - (x + w) / px_per_in_x
-        bottom_in = img_h_in - (y + h) / px_per_in_y
-        word_margin = min(left_in, top_in, right_in, bottom_in)
+        word_left_in = x / px_per_in_x
+        word_top_in = y / px_per_in_y
+        word_right_in = (x + w) / px_per_in_x
+        word_bottom_in = (y + h) / px_per_in_y
 
-        if word_margin < COVER_SAFETY_MARGIN_RECOMMENDED_IN:
-            flagged_count += 1
-            if worst_margin_in is None or word_margin < worst_margin_in:
-                worst_margin_in = word_margin
-                worst_word = text
+        outer_margin = min(word_left_in, word_top_in, img_w_in - word_right_in, img_h_in - word_bottom_in)
+        if outer_margin < COVER_SAFETY_MARGIN_RECOMMENDED_IN:
+            outer_flagged += 1
+            if outer_worst_in is None or outer_margin < outer_worst_in:
+                outer_worst_in = outer_margin
+                outer_worst_word = text
 
-    if worst_margin_in is None:
-        return []
+        if has_spine_geometry and word_right_in > spine_left_in and word_left_in < spine_right_in:
+            spine_words_found.append(text)
+            if spine_text_forbidden:
+                continue  # already a violation just by being here -- no margin math needed
+            spine_margin = min(word_left_in - spine_left_in, spine_right_in - word_right_in)
+            if spine_margin < spine_margin_required:
+                spine_flagged += 1
+                if spine_worst_in is None or spine_margin < spine_worst_in:
+                    spine_worst_in = spine_margin
+                    spine_worst_word = text
 
-    severity = "fail" if worst_margin_in < COVER_SAFETY_MARGIN_FLOOR_IN else "warning"
-    return [_finding(
-        id="cover_safety_margin",
-        severity=severity,
-        title=f"Text on your cover sits too close to the edge (\"{worst_word}\", {round(worst_margin_in, 2)}\" from trim)",
-        why_it_fails=(
-            f"OCR found the word \"{worst_word}\" only {round(worst_margin_in, 2)}\" from the nearest trim edge "
-            f"({flagged_count} word{'s' if flagged_count != 1 else ''} total flagged within the margin). "
-            f"{platform_name} recommends at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" clearance on every side "
-            f"(their absolute minimum is {COVER_SAFETY_MARGIN_FLOOR_IN}\") so normal cutting variance during "
-            "binding doesn't clip text. " + (
-                "This is below even their minimum tolerance -- a near-certain rejection or visibly cropped text."
-                if severity == "fail" else
-                "This is within their minimum tolerance but below their recommended margin -- risky, not a guaranteed fail."
-            )
-        ),
-        publisher_rule=f"{platform_name} — cover text/art must stay at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" from the trim edge",
-        pinpoint={"detected_text": worst_word, "margin_in": round(worst_margin_in, 2), "flagged_word_count": flagged_count},
-        fix_steps=[
-            f"Open your cover design file and move all text/logos at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" inside the trim edge on every side.",
-            "Re-export and re-upload.",
-        ],
-        fix_tools=["Adobe Photoshop", "Adobe Illustrator", "Canva", "SparkPrep Cover Editor"],
-        one_click_fix=False,
-    )]
+    findings = []
+
+    if outer_worst_in is not None:
+        severity = "fail" if outer_worst_in < COVER_SAFETY_MARGIN_FLOOR_IN else "warning"
+        findings.append(_finding(
+            id="cover_safety_margin",
+            severity=severity,
+            title=f"Text on your cover sits too close to the edge (\"{outer_worst_word}\", {round(outer_worst_in, 2)}\" from trim)",
+            why_it_fails=(
+                f"OCR found the word \"{outer_worst_word}\" only {round(outer_worst_in, 2)}\" from the nearest trim edge "
+                f"({outer_flagged} word{'s' if outer_flagged != 1 else ''} total flagged within the margin). "
+                f"{platform_name} recommends at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" clearance on every side "
+                f"(their absolute minimum is {COVER_SAFETY_MARGIN_FLOOR_IN}\") so normal cutting variance during "
+                "binding doesn't clip text. " + (
+                    "This is below even their minimum tolerance -- a near-certain rejection or visibly cropped text."
+                    if severity == "fail" else
+                    "This is within their minimum tolerance but below their recommended margin -- risky, not a guaranteed fail."
+                )
+            ),
+            publisher_rule=f"{platform_name} — cover text/art must stay at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" from the trim edge",
+            pinpoint={"detected_text": outer_worst_word, "margin_in": round(outer_worst_in, 2), "flagged_word_count": outer_flagged},
+            fix_steps=[
+                f"Open your cover design file and move all text/logos at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" inside the trim edge on every side.",
+                "Re-export and re-upload.",
+            ],
+            fix_tools=["Adobe Photoshop", "Adobe Illustrator", "Canva", "SparkPrep Cover Editor"],
+            one_click_fix=False,
+        ))
+
+    if spine_text_forbidden and spine_words_found:
+        findings.append(_finding(
+            id="cover_spine_text_forbidden",
+            severity="fail",
+            title=f"Spine text found, but this book is too thin to carry spine text ({page_count} pages)",
+            why_it_fails=(
+                f"OCR found text (\"{spine_words_found[0]}\"{'…' if len(spine_words_found) > 1 else ''}) on the spine, but "
+                f"{platform_name} does not allow spine text at all on a Perfect Bound book under "
+                f"{SPINE_TEXT_MIN_PAGES_PERFECT_BOUND} pages -- at this page count the spine is too narrow for text to "
+                "print reliably without bleeding onto the front or back cover during normal binding variance."
+            ),
+            publisher_rule=f"{platform_name} — no spine text allowed on Perfect Bound books under {SPINE_TEXT_MIN_PAGES_PERFECT_BOUND} pages",
+            pinpoint={"detected_text": spine_words_found[0], "page_count": page_count, "min_pages_for_spine_text": SPINE_TEXT_MIN_PAGES_PERFECT_BOUND},
+            fix_steps=["Remove all text from the spine panel of your cover design.", "Re-export and re-upload."],
+            fix_tools=["Adobe Photoshop", "Adobe Illustrator", "Canva"],
+            one_click_fix=False,
+        ))
+    elif spine_worst_in is not None:
+        severity = "fail" if spine_worst_in < 0 else "warning"
+        findings.append(_finding(
+            id="cover_spine_text_margin",
+            severity=severity,
+            title=f"Spine text sits too close to the spine's own edge (\"{spine_worst_word}\", {round(spine_worst_in, 3)}\" clearance)",
+            why_it_fails=(
+                f"OCR found the word \"{spine_worst_word}\" only {round(spine_worst_in, 3)}\" from where the spine folds "
+                f"into the front or back cover ({spine_flagged} word{'s' if spine_flagged != 1 else ''} flagged). "
+                f"{platform_name} requires {spine_margin_required}\" clearance from the spine's own edges for a "
+                f"{spine_w_in:.3f}\" spine -- any less and normal binding variance can shift spine text onto the front "
+                "or back cover, or cut it off entirely." + (
+                    " This measured as actually crossing the fold line." if severity == "fail" else ""
+                )
+            ),
+            publisher_rule=f"{platform_name} — spine text must stay {spine_margin_required}\" from the spine's own left/right edges",
+            pinpoint={"detected_text": spine_worst_word, "clearance_in": round(spine_worst_in, 3), "required_in": spine_margin_required},
+            fix_steps=[
+                f"Open your cover design file and shrink or reposition the spine text so it stays at least {spine_margin_required}\" from both edges of the spine panel.",
+                "Re-export and re-upload.",
+            ],
+            fix_tools=["Adobe Photoshop", "Adobe Illustrator", "Canva"],
+            one_click_fix=False,
+        ))
+
+    return findings
