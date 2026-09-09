@@ -2632,8 +2632,14 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     if not source_path.exists():
         raise HTTPException(404, "Source file is missing on the server")
     ext = source_path.suffix.lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
-        raise HTTPException(400, f"AI Upscale supports PNG/JPEG/WEBP source images, not {ext} files.")
+    # .tif/.tiff was excluded here, but upscale_to_size() opens it fine --
+    # Image.open(...).convert("RGB") handles CMYK TIFF natively. That
+    # mattered in practice: SparkPrep's own CMYK Auto-Fix always saves its
+    # output as .tif (see convert_to_cmyk), so running Auto-Fix before AI
+    # Upscale silently locked a user out of AI Upscale on that exact file --
+    # a real, self-inflicted dead end, not a genuine format limitation.
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"):
+        raise HTTPException(400, f"AI Upscale supports PNG/JPEG/WEBP/TIFF source images, not {ext} files.")
 
     target_w_px, target_h_px = _target_pixels_for_slot(p, slot)
     try:
