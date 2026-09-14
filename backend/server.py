@@ -3298,8 +3298,10 @@ app.add_middleware(
     allow_origins=[
         os.environ.get("FRONTEND_URL", "https://sparkprep.legenddary.com"),
         "https://sparkprepfinal.pages.dev",
+        "https://sparkprep-live.pages.dev",
         "http://localhost:3000",
     ],
+    allow_origin_regex=r"https://[a-z0-9]+\.sparkprep-live\.pages\.dev",
     allow_methods=["*"],
     allow_headers=["*"],
 )
