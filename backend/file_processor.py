@@ -164,17 +164,26 @@ def clamp_total_ink_coverage(cmyk: np.ndarray, limit_percent: float = TAC_THRESH
         return cmyk
 
     cmy_sum = c + m + y
-    excess = total - limit_255
-    # scale = (limit - k) / cmy_sum, algebraically simplified to avoid a
-    # separate limit-k term; clipped to [0, 1] so a pixel whose K channel
-    # alone already exceeds the limit just zeroes out C/M/Y rather than
+    # Target a hair under the limit (not exactly at it) and floor rather
+    # than round when converting back to uint8 -- rounding to nearest was
+    # landing most clamped pixels a fraction of a percent OVER the limit
+    # (e.g. 240.4% for a 240% target), which check_total_ink_coverage's own
+    # strict `> threshold` comparison then flagged right back -- so Auto-Fix
+    # looked like it hadn't done anything even though it had visibly reduced
+    # ink from ~264% down to ~240%.
+    safety_margin_255 = 0.5  # ~0.2%, absorbs float rounding, invisible in print
+    target_255 = limit_255 - safety_margin_255
+    excess = total - target_255
+    # scale = (target - k) / cmy_sum, algebraically simplified to avoid a
+    # separate target-k term; clipped to [0, 1] so a pixel whose K channel
+    # alone already exceeds the target just zeroes out C/M/Y rather than
     # going negative.
     scale = np.clip((cmy_sum - excess) / np.maximum(cmy_sum, 1e-6), 0.0, 1.0)
     c = np.where(over, c * scale, c)
     m = np.where(over, m * scale, m)
     y = np.where(over, y * scale, y)
     out = np.stack([c, m, y, k], axis=-1)
-    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    return np.clip(out, 0, 255).astype(np.uint8)  # floor, never round up past the target
 
 
 def autofix_cover_safe_margin(input_path: str, output_path: str, worst_margin_in: float,
