@@ -188,7 +188,7 @@ def clamp_total_ink_coverage(cmyk: np.ndarray, limit_percent: float = TAC_THRESH
 
 def autofix_cover_safe_margin(input_path: str, output_path: str, worst_margin_in: float,
                                img_w_in: float, img_h_in: float,
-                               target_margin_in: float = 0.25) -> dict:
+                               target_margin_in: float = 0.27) -> dict:
     """Pulls near-edge cover content inward so text that OCR flagged as too
     close to the trim edge (check_cover_safety_margins' cover_safety_margin
     finding) lands back inside the recommended safe margin, without
