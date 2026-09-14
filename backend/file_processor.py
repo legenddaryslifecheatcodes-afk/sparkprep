@@ -142,6 +142,91 @@ _TAC_MIN_AFFECTED_FRACTION = 0.005
 _TAC_SAMPLE_MAX_DIM = 1200  # downsample before the ink-coverage scan; doesn't need full resolution
 
 
+def clamp_total_ink_coverage(cmyk: np.ndarray, limit_percent: float = TAC_THRESHOLD_DEFAULT) -> np.ndarray:
+    """Scales down C/M/Y (never K) wherever a pixel's total ink coverage
+    exceeds limit_percent, so files coming out of convert_to_cmyk() satisfy
+    the distributor's TAC ceiling by construction instead of merely being
+    flagged for it afterward by check_total_ink_coverage().
+
+    K is left untouched even when it alone pushes a pixel over the limit --
+    a single solid ink channel doesn't compound the wet-ink/dot-gain problem
+    the TAC limit exists to prevent the way multiple stacked full-strength
+    inks do, and reducing K would visibly wash out real blacks. Operates on
+    a uint8 (H, W, 4) array (255 = 100% ink), matching
+    rgb_array_to_cmyk_array's output.
+    """
+    cmyk_f = cmyk.astype(np.float64)
+    c, m, y, k = cmyk_f[..., 0], cmyk_f[..., 1], cmyk_f[..., 2], cmyk_f[..., 3]
+    limit_255 = limit_percent / 100.0 * 255.0
+    total = c + m + y + k
+    over = total > limit_255
+    if not np.any(over):
+        return cmyk
+
+    cmy_sum = c + m + y
+    excess = total - limit_255
+    # scale = (limit - k) / cmy_sum, algebraically simplified to avoid a
+    # separate limit-k term; clipped to [0, 1] so a pixel whose K channel
+    # alone already exceeds the limit just zeroes out C/M/Y rather than
+    # going negative.
+    scale = np.clip((cmy_sum - excess) / np.maximum(cmy_sum, 1e-6), 0.0, 1.0)
+    c = np.where(over, c * scale, c)
+    m = np.where(over, m * scale, m)
+    y = np.where(over, y * scale, y)
+    out = np.stack([c, m, y, k], axis=-1)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def autofix_cover_safe_margin(input_path: str, output_path: str, worst_margin_in: float,
+                               img_w_in: float, img_h_in: float,
+                               target_margin_in: float = 0.25) -> dict:
+    """Pulls near-edge cover content inward so text that OCR flagged as too
+    close to the trim edge (check_cover_safety_margins' cover_safety_margin
+    finding) lands back inside the recommended safe margin, without
+    cropping anything or changing the cover's overall dimensions.
+
+    Approach: uniformly scale the whole flat cover inward about its center
+    by just enough to move the worst-case violation out to target_margin_in,
+    then edge-extend (replicate the outermost pixels) back out to the
+    original canvas size. This is the standard prepress trick for this
+    exact problem -- imperceptible on photographic/background art at the
+    small scale factors involved, and it moves every element (not just the
+    flagged word) inward together, so nothing gets re-cropped or distorted.
+    Only handles flat raster cover images; PDF covers use the Ghostscript
+    PDF/X-1a path instead, since rescaling arbitrary flattened PDF content
+    would mean rasterizing away vector text and embedded fonts -- a much
+    bigger tradeoff than an image resample, and not attempted here.
+    """
+    half_short_axis_in = min(img_w_in, img_h_in) / 2.0
+    # Solve s such that a point currently at distance (D - m) from center
+    # lands at distance (D - target) after scaling: s = (D - target) / (D - m).
+    denom = half_short_axis_in - worst_margin_in
+    scale = (half_short_axis_in - target_margin_in) / denom if denom > 1e-6 else 1.0
+    scale = float(np.clip(scale, 0.90, 1.0))
+
+    with Image.open(input_path) as img:
+        mode = img.mode
+        w, h = img.size
+        new_w = max(1, round(w * scale))
+        new_h = max(1, round(h * scale))
+        scaled = img.resize((new_w, new_h), Image.LANCZOS)
+        arr = np.array(scaled)
+        pad_left = (w - new_w) // 2
+        pad_right = w - new_w - pad_left
+        pad_top = (h - new_h) // 2
+        pad_bottom = h - new_h - pad_top
+        pad_width = ((pad_top, pad_bottom), (pad_left, pad_right)) + (((0, 0),) if arr.ndim == 3 else ())
+        padded = np.pad(arr, pad_width, mode="edge")
+        Image.fromarray(padded, mode=mode).save(output_path)
+
+    return {
+        "output_path": output_path,
+        "scale_factor": round(scale, 4),
+        "worst_margin_before_in": round(worst_margin_in, 3),
+        "target_margin_in": target_margin_in,
+    }
+
+
 def check_total_ink_coverage(file_path: str, is_pdf: bool, platform: str, platform_name: str) -> Optional[dict]:
     """Checks whether a meaningful share of a cover or interior page's real
     CMYK ink coverage exceeds the distributor's rich-black/TAC ceiling.
@@ -210,17 +295,19 @@ def check_total_ink_coverage(file_path: str, is_pdf: bool, platform: str, platfo
         publisher_rule=f"{platform_name} — total CMYK ink coverage should not exceed {threshold}%",
         pinpoint={"affected_fraction": round(affected_fraction, 4), "worst_tac_percent": round(worst_tac), "threshold_percent": threshold},
         fix_steps=[
-            "In Photoshop: Image → Adjustments → Levels/Curves on the CMYK channels, or use a rich-black action to cap total ink.",
-            "Avoid building black from 100% C+M+Y+K stacked together -- use a single rich-black formula instead (e.g. 60/40/40/100).",
-            "Re-export and re-upload.",
+            "SparkPrep's Auto-Fix now clamps ink coverage to this limit automatically during CMYK conversion -- just run Auto-Fix again.",
+            "If you're fixing this in your own design tool instead: avoid building black from 100% C+M+Y+K stacked together -- use a single rich-black formula instead (e.g. 60/40/40/100).",
         ],
-        fix_tools=["Adobe Photoshop", "Adobe Illustrator"],
-        one_click_fix=False,
+        fix_tools=["SparkPrep Auto-Fix", "Adobe Photoshop", "Adobe Illustrator"],
+        one_click_fix=True,
     )
 
 
-def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300) -> dict:
-    """Convert image to CMYK color space at target DPI, flatten transparency."""
+def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300,
+                     tac_limit: float = TAC_THRESHOLD_DEFAULT) -> dict:
+    """Convert image to CMYK color space at target DPI, flatten transparency,
+    and clamp total ink coverage to tac_limit (see clamp_total_ink_coverage)
+    so the output satisfies the distributor's TAC ceiling by construction."""
     with Image.open(input_path) as img:
         original_mode = img.mode
         # Flatten transparency onto white
@@ -237,9 +324,13 @@ def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300) ->
         # is unsafe to use here (it fakes black with 300% stacked ink).
         if img.mode == "RGB":
             cmyk_arr = rgb_array_to_cmyk_array(np.array(img))
-            img = Image.fromarray(cmyk_arr, mode="CMYK")
         elif img.mode != "CMYK":
             img = img.convert("CMYK")
+            cmyk_arr = np.array(img)
+        else:
+            cmyk_arr = np.array(img)
+        cmyk_arr = clamp_total_ink_coverage(cmyk_arr, tac_limit)
+        img = Image.fromarray(cmyk_arr, mode="CMYK")
         # Save as TIFF with 300 DPI (CMYK support)
         img.save(output_path, format="TIFF", dpi=(target_dpi, target_dpi), compression="tiff_lzw")
         return {
@@ -248,6 +339,7 @@ def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300) ->
             "dpi": target_dpi,
             "output_path": output_path,
             "flattened": True,
+            "tac_limit_applied": tac_limit,
         }
 
 

@@ -34,7 +34,8 @@ from print_specs import (
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks,
-    check_total_ink_coverage,
+    check_total_ink_coverage, autofix_cover_safe_margin,
+    TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
 )
 from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
@@ -1060,19 +1061,62 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         else:
             metadata = analyze_file(str(file_path))
     else:
-        # Convert to CMYK TIFF
+        plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+        # Cover text sitting too close to the trim edge can be pulled back
+        # into the safe margin automatically by scaling the whole flat
+        # cover slightly inward before the CMYK conversion below, so both
+        # fixes land in the same Auto-Fix pass -- see
+        # autofix_cover_safe_margin's docstring for why this only applies
+        # to image covers (PDFs use the Ghostscript path above instead).
+        margin_source_path = file_path
+        effective_slot_for_margins = slot or "full_wrap"
+        final_w, final_h = _target_inches_for_slot(p, effective_slot_for_margins)
+        margin_geom_kwargs = {}
+        if effective_slot_for_margins == "full_wrap":
+            geom = _full_wrap_geometry(p)
+            margin_geom_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                                   "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
+        margin_findings = check_cover_safety_margins(
+            str(file_path), False, final_w, final_h, plat.get("name", "your distributor"),
+            **margin_geom_kwargs,
+        )
+        outer_margin_finding = next((f for f in margin_findings if f["id"] == "cover_safety_margin"), None)
+        if outer_margin_finding:
+            margin_fixed_name = f"{project_id}_{slot or 'cover'}_marginfixed_{uuid.uuid4().hex[:6]}{Path(file_path).suffix}"
+            margin_fixed_path = UPLOAD_DIR / margin_fixed_name
+            try:
+                autofix_cover_safe_margin(
+                    str(file_path), str(margin_fixed_path),
+                    outer_margin_finding["pinpoint"]["margin_in"], final_w, final_h,
+                )
+                margin_source_path = margin_fixed_path
+            except Exception as e:
+                await log_failure(db, "autofix_cover_margin", e, project_id=project_id, user_id=user["id"],
+                                   context={"slot": slot})
+
+        # Convert to CMYK TIFF, clamped to this platform's total-ink-coverage limit
         fixed_name = f"{project_id}_{slot or 'cover'}_fixed_{uuid.uuid4().hex[:6]}.tif"
         fixed_path = UPLOAD_DIR / fixed_name
+        tac_limit = TAC_THRESHOLD_BY_PLATFORM.get(p["platform"], TAC_THRESHOLD_DEFAULT)
         try:
-            convert_to_cmyk(str(file_path), str(fixed_path), 300)
+            convert_to_cmyk(str(margin_source_path), str(fixed_path), 300, tac_limit=tac_limit)
         except Exception as e:
             await log_failure(db, "autofix_cmyk", e, project_id=project_id, user_id=user["id"],
                                context={"file_ext": Path(file_path).suffix.lower(), "slot": slot})
             raise HTTPException(500, f"CMYK conversion failed: {e}")
         try:
             os.remove(file_path)
+            if margin_source_path != file_path:
+                os.remove(margin_source_path)
         except OSError:
             pass
+        # The compliance re-check below (and the response's file_metadata)
+        # need to look at the actual fixed file, not the original this
+        # branch just deleted -- without this, the re-check after autofix
+        # was silently running against a missing file, and every
+        # file-dependent check (ink coverage, cover-text OCR, DPI) would
+        # come back empty regardless of whether the fix actually worked.
+        file_path = fixed_path
         metadata = analyze_file(str(fixed_path))
         metadata["original_filename"] = current_metadata.get("original_filename")
         metadata["stored_filename"] = fixed_name
