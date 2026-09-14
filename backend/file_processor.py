@@ -750,7 +750,8 @@ def run_compliance_checks(
                 "label": tac_finding["title"],
                 "status": tac_finding["severity"],
                 "message": tac_finding["why_it_fails"],
-                "auto_fix": False,
+                "auto_fix": tac_finding.get("one_click_fix", False),
+                "fix_action": "convert_cmyk",
             })
 
     # Interior text safety margin + page-size check -- nothing above (DPI,
@@ -792,7 +793,8 @@ def run_compliance_checks(
                 "label": f["title"],
                 "status": f["severity"],
                 "message": f["why_it_fails"],
-                "auto_fix": False,
+                "auto_fix": f.get("one_click_fix", False),
+                "fix_action": "scale_safe_margin" if f["id"] == "cover_safety_margin" else None,
             })
 
     return checks
