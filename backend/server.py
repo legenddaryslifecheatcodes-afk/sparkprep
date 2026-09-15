@@ -939,6 +939,53 @@ async def upload_file(project_id: str, file: UploadFile = File(...), user: dict 
     return {"file_metadata": metadata, "compliance": compliance, "file_id": file_id}
 
 
+_WEB_SAFE_PREVIEW_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def _render_web_preview(fp: Path) -> Response:
+    """Renders any uploaded cover/interior file as a browser-safe RGB image
+    -- a PNG of page 1 for a PDF, otherwise a JPEG.
+
+    Serving a stored file's raw bytes (what this used to do unconditionally)
+    is fine for a plain PNG/JPEG, but browsers can't decode a raw PDF at all,
+    and neither browsers nor WebGL textures can decode CMYK -- exactly what
+    Auto-Fix's own CMYK conversion always saves as a .tif. That combination
+    meant the 3D cover mockup (a WebGL texture, not an <img> tag) would load
+    a CMYK TIFF with no error at all and just render the whole book solid
+    black, because the texture "loaded" a file whose pixel data the GPU has
+    no way to interpret.
+    """
+    if fp.suffix.lower() == ".pdf":
+        import fitz
+        with fitz.open(str(fp)) as doc:
+            pix = doc[0].get_pixmap(dpi=150)
+            png_bytes = pix.tobytes("png")
+        return Response(content=png_bytes, media_type="image/png")
+
+    if fp.suffix.lower() in _WEB_SAFE_PREVIEW_EXTS:
+        try:
+            from PIL import Image
+            with Image.open(fp) as img:
+                if img.mode in ("RGB", "RGBA", "P", "L"):
+                    return FileResponse(str(fp))
+        except Exception:
+            pass  # mislabeled/corrupt -- fall through and try to re-encode it below
+
+    # CMYK (Auto-Fix's TIFF output), or anything else a browser/WebGL can't
+    # decode natively -- convert to a clean sRGB JPEG.
+    from PIL import Image
+    with Image.open(fp) as img:
+        if img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+
 @api_router.get("/projects/{project_id}/preview")
 async def preview_file(project_id: str, request: Request):
     # Public-ish read (require token via query or cookie)
@@ -956,7 +1003,12 @@ async def preview_file(project_id: str, request: Request):
     file_path = UPLOAD_DIR / p["uploaded_file"]
     if not file_path.exists():
         raise HTTPException(404, "File missing")
-    return FileResponse(str(file_path))
+    try:
+        return _render_web_preview(file_path)
+    except Exception as e:
+        await log_failure(db, "preview_render", e, project_id=project_id, user_id=user_id,
+                           context={"filename": p["uploaded_file"]})
+        raise HTTPException(500, f"Couldn't render a preview of this file: {e}")
 
 
 @api_router.post("/projects/{project_id}/autofix")
@@ -2786,25 +2838,12 @@ async def slot_preview(project_id: str, slot: str, request: Request):
     fp = UPLOAD_DIR / slot_data["stored_filename"]
     if not fp.exists():
         raise HTTPException(404, "File missing")
-    # A browser <img> tag can't render a PDF at all -- it just shows a
-    # broken image, indistinguishable from "no file" to whoever's looking
-    # at it. This was serving the interior slot's PDF (or a PDF-format
-    # cover) directly and unconditionally, so its preview never actually
-    # rendered; rasterize page 1 to a real PNG instead, same as any other
-    # image-based slot already displays.
-    if fp.suffix.lower() == ".pdf":
-        try:
-            import fitz
-            from fastapi.responses import Response
-            with fitz.open(str(fp)) as doc:
-                pix = doc[0].get_pixmap(dpi=150)
-                png_bytes = pix.tobytes("png")
-            return Response(content=png_bytes, media_type="image/png")
-        except Exception as e:
-            await log_failure(db, "slot_preview_rasterize", e, project_id=project_id, user_id=user_id,
-                               context={"slot": slot, "filename": slot_data["stored_filename"]})
-            raise HTTPException(500, f"Couldn't render a preview of this PDF: {e}")
-    return FileResponse(str(fp))
+    try:
+        return _render_web_preview(fp)
+    except Exception as e:
+        await log_failure(db, "slot_preview_render", e, project_id=project_id, user_id=user_id,
+                           context={"slot": slot, "filename": slot_data["stored_filename"]})
+        raise HTTPException(500, f"Couldn't render a preview of this file: {e}")
 
 
 @api_router.patch("/projects/{project_id}/adjustments")
