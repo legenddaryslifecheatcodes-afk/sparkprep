@@ -34,7 +34,7 @@ from print_specs import (
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks,
-    check_total_ink_coverage, autofix_cover_safe_margin,
+    check_total_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
     TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
 )
 from audit_engine import deep_audit, audit_summary
@@ -1042,7 +1042,43 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
 
     file_path = UPLOAD_DIR / stored_filename
     ghostscript_result = None
+    interior_margin_fix = None
     if current_metadata.get("is_pdf"):
+        # Interior manuscripts get a geometry pass FIRST, before the
+        # Ghostscript/PDF-X pass below -- a wrong page size or a too-tight
+        # safety margin is the #1 reason distributors reject an interior
+        # (IngramSpark's own rejection reason is literally "content extends
+        # outside the safety area" / "content is not centered"), and unlike
+        # font/ICC issues this one WAS actually fixable, just never wired up:
+        # scaling+recentering a real text-layer PDF via a content-stream
+        # transform is lossless (no rasterizing, no re-flowed text), so
+        # there's no reason to leave it as manual-fix-only guidance the way
+        # pdfx_validator's one_click_fix=False currently claims.
+        if slot == "interior":
+            trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+            plat_name = PLATFORMS.get(p["platform"], {}).get("name", "your distributor")
+            margin_findings = check_interior_safety_margins(
+                str(file_path), plat_name, trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES,
+            )
+            needs_geometry_fix = any(
+                f["id"] in ("interior_page_size_mismatch", "interior_safety_margin") for f in margin_findings
+            )
+            if needs_geometry_fix:
+                geom_fixed_name = f"{project_id}_interior_marginfixed_{uuid.uuid4().hex[:6]}.pdf"
+                geom_fixed_path = UPLOAD_DIR / geom_fixed_name
+                try:
+                    interior_margin_fix = autofix_interior_safety_margins(
+                        str(file_path), str(geom_fixed_path), trim["w"], trim["h"],
+                    )
+                    interior_margin_fix["attempted"] = True
+                    interior_margin_fix["succeeded"] = True
+                    os.remove(file_path)
+                    file_path = geom_fixed_path
+                    stored_filename = geom_fixed_name
+                except Exception as e:
+                    interior_margin_fix = {"attempted": True, "succeeded": False, "reason": str(e)}
+                    await log_failure(db, "autofix_interior_margin", e, project_id=project_id, user_id=user["id"])
+
         # Check what actually needs fixing before touching the file --
         # only PDF/X-1a declaration, live transparency, and layers are
         # things Ghostscript's -dPDFX pipeline can genuinely repair (it
@@ -1226,7 +1262,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             existing_slots["full_wrap"] = {**metadata, "compliance": compliance}
             update["slots"] = existing_slots
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
-    return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "check_type": "basic"}
+    return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "interior_margin_fix": interior_margin_fix, "check_type": "basic"}
 
 
 @api_router.post("/projects/{project_id}/final-review")
