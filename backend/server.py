@@ -1783,6 +1783,101 @@ ADVANCED_INTERIOR_PRICE_CENTS = {
     "studio": 2999,
 }
 ADVANCED_INTERIOR_MAX_PAGES = 300
+# Customer-facing limit: how many times the customer can SUBMIT the
+# Advanced workflow (scan -> repair -> recheck) for one purchase. Distinct
+# from ADVANCED_MAX_INTERNAL_ITERATIONS below, which bounds how many
+# repair/recheck passes happen INSIDE one submitted run -- those internal
+# passes are invisible to this counter.
+ADVANCED_MAX_RUNS = 3
+ADVANCED_MAX_INTERNAL_ITERATIONS = 3
+# Findings the Advanced repair loop actually knows how to fix, split by
+# which repair function handles them -- same underlying fixers autofix()
+# uses for the Basic check, just applied here across up to 300 pages
+# instead of 1, and looped instead of a single pass.
+ADVANCED_GEOMETRY_FIXABLE_IDS = {"interior_page_size_mismatch", "interior_safety_margin"}
+ADVANCED_GHOSTSCRIPT_FIXABLE_IDS = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent"}
+
+
+async def _advanced_interior_repair_loop(
+    project_id: str, p: dict, file_path: Path, original_path: Path,
+    trim_w: float, trim_h: float, platform_name: str, user_id: str,
+) -> dict:
+    """Bounded internal repair loop for ONE submitted Advanced Interior
+    Check run: scan (up to ADVANCED_INTERIOR_MAX_PAGES pages) -> apply
+    whatever's safely fixable -> rescan -> repeat, until nothing fixable
+    remains or ADVANCED_MAX_INTERNAL_ITERATIONS is hit. This entire loop,
+    however many passes it takes, counts as exactly one submitted run --
+    the customer-facing ADVANCED_MAX_RUNS limit is enforced by the caller,
+    not in here.
+
+    Never deletes original_path (same guarantee as autofix() and
+    _replace_slot() -- see their original_stored_filename handling); an
+    intermediate file from an earlier iteration in THIS loop that a later
+    iteration supersedes is disposable and does get cleaned up, exactly
+    like autofix()'s own multi-step repair chain within a single call.
+    """
+    fixed_log = []
+    iterations_used = 0
+    current_path = Path(file_path)
+
+    for iteration in range(1, ADVANCED_MAX_INTERNAL_ITERATIONS + 1):
+        findings = run_pdf_structure_audit(str(current_path), platform_name, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        findings += check_interior_safety_margins(str(current_path), platform_name, trim_w, trim_h, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+
+        geometry_findings = [f for f in findings if f["id"] in ADVANCED_GEOMETRY_FIXABLE_IDS]
+        ghostscript_findings = [f for f in findings if f["id"] in ADVANCED_GHOSTSCRIPT_FIXABLE_IDS]
+        if not geometry_findings and not ghostscript_findings:
+            break  # nothing left that this loop knows how to fix
+
+        iterations_used = iteration
+        made_progress = False
+
+        if geometry_findings:
+            try:
+                geom_fixed_path = UPLOAD_DIR / f"{project_id}_interior_adv_geom_{uuid.uuid4().hex[:6]}.pdf"
+                autofix_interior_safety_margins(str(current_path), str(geom_fixed_path), trim_w, trim_h)
+                if current_path != Path(original_path):
+                    try: os.remove(current_path)
+                    except OSError: pass
+                current_path = geom_fixed_path
+                fixed_log.append({
+                    "iteration": iteration, "ids": [f["id"] for f in geometry_findings],
+                    "action": "Resized and recentered interior pages onto the ordered trim size.",
+                })
+                made_progress = True
+            except Exception as e:
+                await log_failure(db, "advanced_interior_geometry_fix", e, project_id=project_id, user_id=user_id)
+
+        if ghostscript_findings and find_ghostscript():
+            try:
+                gs_fixed_path = UPLOAD_DIR / f"{project_id}_interior_adv_gs_{uuid.uuid4().hex[:6]}.pdf"
+                convert_to_pdfx1a(str(current_path), str(gs_fixed_path), title=p.get("name", "SparkPrep Export"))
+                if current_path != Path(original_path):
+                    try: os.remove(current_path)
+                    except OSError: pass
+                current_path = gs_fixed_path
+                fixed_log.append({
+                    "iteration": iteration, "ids": [f["id"] for f in ghostscript_findings],
+                    "action": "Declared PDF/X-1a and flattened live transparency/layers.",
+                })
+                made_progress = True
+            except Exception as e:
+                await log_failure(db, "advanced_interior_ghostscript_fix", e, project_id=project_id, user_id=user_id)
+
+        if not made_progress:
+            break  # every repair attempt this pass failed -- stop rather than spin
+
+    final_findings = run_pdf_structure_audit(str(current_path), platform_name, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+    final_findings += check_interior_safety_margins(str(current_path), platform_name, trim_w, trim_h, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+    final_findings = _annotate_export_time_fixes(final_findings)
+    unresolved = [f for f in final_findings if f["severity"] in ("fail", "warning")]
+
+    return {
+        "final_path": current_path,
+        "iterations_used": iterations_used,
+        "fixed": fixed_log,
+        "unresolved": unresolved,
+    }
 
 
 class InteriorCheckCheckoutIn(BaseModel):
@@ -1849,6 +1944,8 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
         "price_cents": price_cents,
         "tier_at_purchase": tier,
         "paid": False,
+        "runs_used": 0,
+        "last_run": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     await db.payment_transactions.insert_one({
@@ -1865,44 +1962,49 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
     return {"checkout_url": session.url, "session_id": session.id}
 
 
+def _interior_check_stale(check: dict, interior_meta: Optional[dict]) -> bool:
+    """True only when the customer has uploaded a genuinely NEW interior
+    (a different original_stored_filename lineage) since the last submitted
+    run -- NOT simply because the run itself changed the file (repairing it
+    is supposed to change stored_filename; that's not staleness, that's the
+    record of what the run did)."""
+    last_run = (check or {}).get("last_run")
+    if not last_run or not interior_meta:
+        return False
+    checked_original = (last_run.get("file_checked") or {}).get("original_stored_filename")
+    current_original = interior_meta.get("original_stored_filename")
+    return bool(checked_original and current_original and checked_original != current_original)
+
+
 @api_router.get("/projects/{project_id}/interior-check/status")
 async def interior_check_status(project_id: str, user: dict = Depends(get_current_user)):
-    """Lets the UI show the unlocked report again on a page reload/revisit,
-    without needing the Stripe session_id to still be in the URL.
-    """
+    """Lets the UI show where things stand on a page reload/revisit -- returns
+    the STORED result of the last submitted run, never re-scans live (a page
+    reload must never itself consume one of the customer's 3 runs, and the
+    result shown must be traceable to a specific file, not silently
+    recomputed against whatever the file happens to be right now)."""
     check = await db.interior_checks.find_one(
         {"project_id": project_id, "user_id": user["id"], "paid": True},
         sort=[("created_at", -1)],
     )
     if not check:
         return {"paid": False}
-
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     interior_meta = _interior_file_meta(p) if p else None
-    if not p or not interior_meta:
-        raise HTTPException(404, "Interior file not found")
-    file_path = UPLOAD_DIR / interior_meta["stored_filename"]
-    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
-    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    findings = []
-    total_pages = interior_meta.get("pdf_pages") or 0
-    if interior_meta.get("is_pdf"):
-        findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
-        findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
-        findings = _annotate_export_time_fixes(findings)
-    # Real proof of scope, not just a marketing claim -- the actual page
-    # count of this file (recorded by analyze_file() at upload time) and
-    # how many of those were actually examined, so "full check" means
-    # something the person looking at it can verify against their own book.
     return {
-        "paid": True, "findings": findings, "check_type": "advanced",
-        "total_pages": total_pages,
-        "pages_checked": min(total_pages, ADVANCED_INTERIOR_MAX_PAGES),
+        "paid": True, "check_type": "advanced",
+        "runs_used": check.get("runs_used", 0), "max_runs": ADVANCED_MAX_RUNS,
+        "last_run": check.get("last_run"),
+        "is_stale": _interior_check_stale(check, interior_meta),
     }
 
 
 @api_router.get("/projects/{project_id}/interior-check/verify")
 async def interior_check_verify(project_id: str, session_id: str, user: dict = Depends(get_current_user)):
+    """Confirms a just-completed Stripe purchase and returns the same
+    stored-state shape as /status -- paying does NOT itself run the check;
+    the customer explicitly submits their first run afterward via
+    POST .../interior-check/run."""
     check = await db.interior_checks.find_one({"project_id": project_id, "session_id": session_id, "user_id": user["id"]})
     if not check:
         raise HTTPException(404, "Interior check purchase not found")
@@ -1916,28 +2018,113 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
             check["paid"] = True
     if not check.get("paid"):
         return {"paid": False}
-
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     interior_meta = _interior_file_meta(p) if p else None
-    if not p or not interior_meta:
-        raise HTTPException(404, "Interior file not found")
+    return {
+        "paid": True, "check_type": "advanced",
+        "runs_used": check.get("runs_used", 0), "max_runs": ADVANCED_MAX_RUNS,
+        "last_run": check.get("last_run"),
+        "is_stale": _interior_check_stale(check, interior_meta),
+    }
+
+
+@api_router.post("/projects/{project_id}/interior-check/run")
+async def interior_check_run(project_id: str, user: dict = Depends(get_current_user)):
+    """Submits ONE Advanced Interior Check run: scans up to
+    ADVANCED_INTERIOR_MAX_PAGES pages, repairs whatever SparkPrep can
+    safely fix via a bounded internal loop, rechecks, and returns exactly
+    what got fixed vs. what still needs the customer's own action --
+    with the exact page, the problem, the requirement, and plain-English
+    fix steps for anything left over (the same finding shape every other
+    check in this app already produces). Counts one against the
+    purchase's ADVANCED_MAX_RUNS submitted-run limit; the internal
+    repair/recheck passes inside this one call do not."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    if p.get("project_type") not in ("interior", "combined"):
+        raise HTTPException(400, "Advanced Interior Check only applies to projects with an interior")
+    interior_meta = _interior_file_meta(p)
+    if not interior_meta or not interior_meta.get("stored_filename"):
+        raise HTTPException(404, "No interior file uploaded yet")
+    if not interior_meta.get("is_pdf"):
+        raise HTTPException(400, "Advanced Interior Check only applies to a PDF interior")
+
+    check = await db.interior_checks.find_one(
+        {"project_id": project_id, "user_id": user["id"], "paid": True},
+        sort=[("created_at", -1)],
+    )
+    if not check:
+        raise HTTPException(402, "Purchase the Advanced Interior Check for this book first.")
+    runs_used = check.get("runs_used", 0)
+    if runs_used >= ADVANCED_MAX_RUNS:
+        raise HTTPException(400, f"You've used all {ADVANCED_MAX_RUNS} Advanced Interior Check runs for this book.")
+
     file_path = UPLOAD_DIR / interior_meta["stored_filename"]
+    if not file_path.exists():
+        raise HTTPException(404, "Interior file missing on disk")
+    original_stored_filename = interior_meta.get("original_stored_filename") or interior_meta["stored_filename"]
+    original_path = UPLOAD_DIR / original_stored_filename
+
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    findings = []
-    total_pages = interior_meta.get("pdf_pages") or 0
-    if interior_meta.get("is_pdf"):
-        # The only call site allowed to scan beyond page 1 -- explicitly
-        # capped at ADVANCED_INTERIOR_MAX_PAGES regardless of the file's
-        # actual page count, enforcing the 300-page limit defense-in-depth
-        # (on top of the page_count check already done at checkout time).
-        findings = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=ADVANCED_INTERIOR_MAX_PAGES)
-        findings += check_interior_safety_margins(str(file_path), plat.get("name", "your distributor"), trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES)
-        findings = _annotate_export_time_fixes(findings)
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    result = await _advanced_interior_repair_loop(
+        project_id, p, file_path, original_path,
+        trim["w"], trim["h"], plat.get("name", "your distributor"), user["id"],
+    )
+    finished_at = datetime.now(timezone.utc).isoformat()
+
+    final_path = Path(result["final_path"])
+    final_stored_filename = final_path.name
+    metadata = analyze_file(str(final_path))
+    metadata["original_filename"] = interior_meta.get("original_filename")
+    metadata["stored_filename"] = final_stored_filename
+    metadata["slot"] = "interior"
+    # This slot's regular (Basic-depth) compliance stays computed the usual
+    # way -- Advanced's own 300-page findings live in last_run below, kept
+    # deliberately separate so Basic/Final Review/Export don't silently
+    # start reflecting a different check's scope than they always have.
+    metadata["original_stored_filename"] = original_stored_filename
+    compliance = run_compliance_checks(
+        metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
+        file_path=str(final_path), slot="interior", platform_name=plat.get("name"),
+        max_pages=BASIC_CHECK_MAX_PAGES,
+    )
+    slots = p.get("slots") or {}
+    slots["interior"] = {**metadata, "compliance": compliance}
+    await db.projects.update_one(
+        {"_id": ObjectId(project_id)},
+        {"$set": {"slots": slots, "updated_at": finished_at}},
+    )
+
+    run_number = runs_used + 1
+    total_pages = metadata.get("pdf_pages") or 0
+    last_run = {
+        "run_number": run_number,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "file_checked": {
+            "stored_filename": final_stored_filename,
+            "original_stored_filename": original_stored_filename,
+            "total_pages": total_pages,
+            "pages_checked": min(total_pages, ADVANCED_INTERIOR_MAX_PAGES),
+        },
+        "iterations_used": result["iterations_used"],
+        "fixed": result["fixed"],
+        "unresolved": result["unresolved"],
+        "status": "clean" if not result["unresolved"] else "issues_remain",
+    }
+    await db.interior_checks.update_one(
+        {"_id": check["_id"]},
+        {"$set": {"last_run": last_run, "runs_used": run_number}},
+    )
+
     return {
-        "paid": True, "findings": findings, "check_type": "advanced",
-        "total_pages": total_pages,
-        "pages_checked": min(total_pages, ADVANCED_INTERIOR_MAX_PAGES),
+        "paid": True, "check_type": "advanced",
+        "runs_used": run_number, "max_runs": ADVANCED_MAX_RUNS,
+        "last_run": last_run, "is_stale": False,
     }
 
 
@@ -3119,6 +3306,18 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
     else:
         bleed = plat["bleed"]
         findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
+        # deep_audit() only looks at file-level metadata (dimensions/DPI/
+        # bleed/color) -- it never looks at where the actual text sits on
+        # the page, so an interior audit was never able to catch "content
+        # extends outside the safety area" / "not centered" at all, the
+        # single most common real distributor rejection reason (this is
+        # the exact issue IngramSpark rejected a real customer's book for).
+        # Kept at BASIC_CHECK_MAX_PAGES (page 1), same depth as the
+        # structural check two lines below and the Basic $19.99 check --
+        # this $0.99 diagnostic is priced and positioned below Basic, so it
+        # shouldn't see deeper into the file than the paid tier above it.
+        if metadata.get("is_pdf"):
+            findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES)
     tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), a["platform"], plat["name"])
     if tac_finding:
         findings.append(tac_finding)
