@@ -2739,12 +2739,15 @@ def _full_wrap_geometry(p: dict) -> dict:
 
 @api_router.post("/projects/{project_id}/ai-enhance/{slot}")
 async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_current_user)):
-    """'AI Upscale' fix option for a low-DPI compliance failure: runs the
-    existing slot image through Real-ESRGAN (self-hosted, CPU, no external
-    API) to add genuine pixel detail and resize it to the exact size needed
-    to hit 300 DPI at this project's trim + bleed -- unlike the old
-    OpenAI-based approach, which re-painted the image generatively and
-    couldn't reliably reach the needed resolution. See the compliance
+    """'AI Upscale' fix option for a low-DPI compliance failure: resizes the
+    existing slot image up to the exact pixel size needed to hit 300 DPI at
+    this project's trim + bleed, via LANCZOS resampling + an adaptive
+    unsharp mask (see image_upscale_engine.py) -- self-hosted, CPU, no
+    external API, and consistently under 2 seconds regardless of image
+    size. A prior Real-ESRGAN-based version added marginally more pixel
+    detail but ran 90s-4.5min per image on this service's 1-core instance
+    and regularly timed out (502/499) on real requests; this trades a
+    small amount of sharpness for actually finishing. See the compliance
     re-check the frontend runs immediately after this to confirm it
     actually cleared the DPI failure."""
     if slot not in ALLOWED_SLOTS:
@@ -2784,10 +2787,10 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
         await log_failure(db, "ai_enhance", e, project_id=project_id, user_id=user["id"], context={"slot": slot})
         raise HTTPException(502, f"AI Upscale failed: {e}")
 
-    file_id = f"{project_id}_{slot}_enhanced_{uuid.uuid4().hex[:6]}.png"
+    file_id = f"{project_id}_{slot}_enhanced_{uuid.uuid4().hex[:6]}.jpg"
     metadata, compliance = _save_generated_slot_file(
         p, project_id, slot, file_id, image_bytes,
-        original_filename=slot_data.get("original_filename") or "enhanced.png",
+        original_filename=slot_data.get("original_filename") or "enhanced.jpg",
         extra_meta={"ai_enhanced": True},
     )
     await _replace_slot(project_id, p, slot, metadata, compliance)

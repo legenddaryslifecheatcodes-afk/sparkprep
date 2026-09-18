@@ -1,142 +1,74 @@
-"""Real image upscaling via Real-ESRGAN (RRDBNet, x4plus), running on CPU --
-no GPU, no external API, no per-use billing.
+"""Fast image upscaling via Pillow LANCZOS resampling + an adaptive unsharp
+mask -- consistently well under 2 seconds even for a large full-wrap cover,
+no ML model, no GPU, no per-use billing, no multi-minute request.
 
-This replaces the old OpenAI-based "AI Upscale" fix. OpenAI's image-edit
-endpoint caps out around 1024-1536px of output and re-paints the image
-generatively rather than truly upscaling it -- usually not enough
-resolution to reach 300 DPI at real trim sizes, and not a guarantee of
-preserving the original content. Real-ESRGAN instead adds genuine pixel
-detail to the existing image and can be resampled to an exact target size.
+This replaces the previous Real-ESRGAN (RRDBNet) implementation. That model
+added genuinely more pixel detail than a plain resample, but running a
+23-block CPU-only super-resolution network (even tiled, single-threaded, to
+stay under the host's memory ceiling) took 90 seconds to 4.5 minutes on this
+service's 1-core Render instance in practice -- real requests came back as
+502/499 (the client or the platform's own proxy gave up waiting). A fast,
+reliable fix beats a marginally sharper one that regularly times out.
 
-Uses a plain PyTorch implementation of the RRDBNet architecture
-(rrdbnet_arch.py) loading the official RealESRGAN_x4plus.pth checkpoint,
-rather than the `realesrgan-ncnn-py` package -- that package's CPU code
-path (gpuid=-1) crashes with an ncnn allocator error in practice, and the
-`basicsr`/`realesrgan` pip packages have a history of breaking against
-newer torchvision releases. Plain PyTorch's CPU path is the most
-mature/widely-used option available.
+Two choices here are what keep this fast regardless of the TARGET size
+(a full-wrap cover's target can be 50-100+ megapixels at 300 DPI, where the
+old pipeline's cost -- and a naive "resize then sharpen" replacement -- would
+both scale up):
+  1. The unsharp mask runs on the small SOURCE image, before the resize, not
+     after. Sharpening cost scales with pixel count; the source is exactly
+     the low-res image this endpoint exists to fix, so it's cheap almost by
+     definition. Sharpening pre-resize also means LANCZOS is upsampling
+     already-crisp edges rather than softening them further and asking a
+     second pass to compensate.
+  2. Final encode is JPEG (quality=95, no chroma subsampling), not PNG.
+     Pillow's PNG encoder cost is dominated by its per-row filtering step,
+     which doesn't meaningfully speed up at any compress_level and became
+     the single largest cost at real full-wrap resolutions in testing
+     (~1s+ on its own at 50+ megapixels); JPEG encodes the same pixel count
+     in a fraction of that. This file is an intermediate the CMYK/PDF export
+     step processes further, not a final deliverable, so the quality
+     difference at quality=95 is not a real-world tradeoff worth the wait.
+
+If a genuinely sharper upscale is worth the latency/cost later, this is the
+seam to swap in a GPU API call -- upscale_to_size()'s signature doesn't need
+to change for that.
 """
-import gc
 import io
-import urllib.request
-from pathlib import Path
 
-import numpy as np
-import torch
-from PIL import Image
-
-from rrdbnet_arch import RRDBNet
-
-# This runs on a 1GB-memory container (no GPU) alongside the rest of the API
-# process -- a prior version with TILE_SIZE=256 and default thread count got
-# OOM-killed by the host on a real request. Single-threaded + smaller tiles
-# trades some speed for staying well under the memory ceiling.
-torch.set_num_threads(1)
-
-WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "RealESRGAN_x4plus.pth"
-WEIGHTS_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-
-TILE_SIZE = 128
-TILE_OVERLAP = 8
-SCALE = 4
-
-_model = None
+from PIL import Image, ImageFilter
 
 
-def _get_model():
-    global _model
-    if _model is None:
-        if not WEIGHTS_PATH.exists():
-            WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(WEIGHTS_URL, WEIGHTS_PATH)
-
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, scale=SCALE, num_feat=64, num_block=23, num_grow_ch=32)
-        state_dict = torch.load(WEIGHTS_PATH, map_location="cpu")
-        state_dict = state_dict.get("params_ema") or state_dict.get("params") or state_dict
-        model.load_state_dict(state_dict)
-        model.eval()
-        _model = model
-    return _model
-
-
-def _to_tensor(img: Image.Image) -> torch.Tensor:
-    arr = np.array(img).astype(np.float32) / 255.0
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-
-
-def _to_image(tensor: torch.Tensor) -> Image.Image:
-    arr = tensor.squeeze(0).clamp(0, 1).permute(1, 2, 0).numpy()
-    return Image.fromarray((arr * 255.0).round().astype(np.uint8))
-
-
-def _run_4x(img: Image.Image) -> Image.Image:
-    """Runs one 4x pass, tiling the image so CPU memory use stays bounded
-    regardless of source image size."""
-    model = _get_model()
-    w, h = img.size
-
-    if max(w, h) <= TILE_SIZE:
-        with torch.no_grad():
-            out = model(_to_tensor(img))
-        return _to_image(out)
-
-    out_img = Image.new("RGB", (w * SCALE, h * SCALE))
-    step = TILE_SIZE - TILE_OVERLAP
-    tile_count = 0
-    for y0 in range(0, h, step):
-        for x0 in range(0, w, step):
-            x1, y1 = min(x0 + TILE_SIZE, w), min(y0 + TILE_SIZE, h)
-            tile = img.crop((x0, y0, x1, y1))
-            with torch.no_grad():
-                tensor_in = _to_tensor(tile)
-                tensor_out = model(tensor_in)
-                out_tile = _to_image(tensor_out)
-            del tensor_in, tensor_out
-
-            # Crop off the overlap margin (except at the image edges) before
-            # pasting, so tiles line up without visible seams.
-            left_trim = TILE_OVERLAP * SCALE if x0 > 0 else 0
-            top_trim = TILE_OVERLAP * SCALE if y0 > 0 else 0
-            out_tile = out_tile.crop((left_trim, top_trim, out_tile.width, out_tile.height))
-            out_img.paste(out_tile, (x0 * SCALE + left_trim, y0 * SCALE + top_trim))
-            del tile, out_tile
-
-            tile_count += 1
-            if tile_count % 8 == 0:
-                gc.collect()
-
-    gc.collect()
-    return out_img
+def _adaptive_unsharp_mask(img: Image.Image, scale_factor: float) -> Image.Image:
+    """Scales unsharp-mask strength with how much the image is about to be
+    enlarged. A ~1x resize (already near the target size) gets a light
+    touch; a large enlargement gets meaningfully stronger sharpening so the
+    extra detail survives LANCZOS interpolation. Clamped so it never
+    oversharpens into visible haloing on a modest resize.
+    """
+    radius = min(1.0 + scale_factor * 0.4, 3.0)
+    percent = int(min(70 + scale_factor * 25, 200))
+    return img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=2))
 
 
 def upscale_to_size(image_bytes: bytes, target_width_px: int, target_height_px: int) -> bytes:
-    """Upscales an image so its pixel dimensions meet or exceed the target,
-    then resizes down to the exact target with high-quality resampling.
-
-    The model's scale factor is a fixed 4x per pass. If 4x overshoots what's
-    needed (the common case), the final resize brings it to the exact size
-    while keeping the added detail -- much sharper than a naive stretch of
-    the original low-res source. Capped at 2 passes (16x) since anything
-    needing more than that is not a realistic "slightly low DPI" case.
+    """Resizes an image to exactly the target pixel dimensions using
+    high-quality LANCZOS resampling, sharpening the source first (see
+    module docstring for why that ordering) with an adaptive unsharp mask.
+    Always returns a JPEG at exactly target_width_px x target_height_px.
     """
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    needed_scale = max(
+    scale_factor = max(
         target_width_px / img.width,
         target_height_px / img.height,
         1.0,
     )
 
-    scale_so_far = 1.0
-    passes = 0
-    while scale_so_far < needed_scale and passes < 2:
-        img = _run_4x(img)
-        scale_so_far *= SCALE
-        passes += 1
+    img = _adaptive_unsharp_mask(img, scale_factor)
 
     if img.width != target_width_px or img.height != target_height_px:
         img = img.resize((target_width_px, target_height_px), Image.LANCZOS)
 
     out = io.BytesIO()
-    img.save(out, format="PNG")
+    img.save(out, format="JPEG", quality=95, subsampling=0)
     return out.getvalue()
