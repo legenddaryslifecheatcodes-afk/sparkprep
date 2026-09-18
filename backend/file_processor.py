@@ -8,10 +8,11 @@ import numpy as np
 from PIL import Image, ImageCms
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter, Transformation
 import pikepdf
 
 from print_specs import COLOR_PROFILES, DEFAULT_COLOR_PROFILE, calculate_full_cover_dimensions
+from pdfx_validator import MIN_BODY_BLOCK_CHARS
 
 # Enable large images
 Image.MAX_IMAGE_PIXELS = None
@@ -232,6 +233,97 @@ def autofix_cover_safe_margin(input_path: str, output_path: str, worst_margin_in
         "output_path": output_path,
         "scale_factor": round(scale, 4),
         "worst_margin_before_in": round(worst_margin_in, 3),
+        "target_margin_in": target_margin_in,
+    }
+
+
+def autofix_interior_safety_margins(input_path: str, output_path: str,
+                                     trim_w_in: float, trim_h_in: float,
+                                     target_margin_in: float = 0.6) -> dict:
+    """Fits and recenters an interior PDF's real content into the ordered trim
+    size, resolving both pdfx_validator's interior_page_size_mismatch and
+    interior_safety_margin findings in one pass.
+
+    Unlike a flattened cover (no text layer, so the only way to move content
+    is to resample pixels), an interior PDF is a real vector/text document --
+    moving it is a graphics-state transform on the existing content stream
+    (`cm` scale+translate), which pypdf's Transformation applies losslessly.
+    No rasterizing, no re-flowing text, no font loss: every glyph and line
+    stays exactly as authored, just uniformly scaled and shifted.
+
+    Approach: read each page's real body-text bounding box (PyMuPDF, same
+    MIN_BODY_BLOCK_CHARS filter pdfx_validator's check uses, so furniture
+    like page numbers/running heads is ignored the same way), then find the
+    single largest scale factor that still keeps every page's content within
+    target_margin_in of the new trim-size page once centered. That one scale
+    is applied uniformly to every page -- not a per-page scale -- so body
+    text stays a consistent size throughout the book the way a real print
+    layout should. Pages with no detectable body text (title page, etc.)
+    are still recentered onto the correct trim size, just not a factor in
+    the scale calculation.
+    """
+    import fitz  # PyMuPDF -- see check_interior_safety_margins for why this import is local
+
+    new_w_pt = trim_w_in * 72.0
+    new_h_pt = trim_h_in * 72.0
+    avail_w = new_w_pt - 2 * target_margin_in * 72.0
+    avail_h = new_h_pt - 2 * target_margin_in * 72.0
+
+    doc = fitz.open(input_path)
+    try:
+        per_page_geom = []
+        worst_scale = None
+        for page in doc:
+            w0, h0 = page.rect.width, page.rect.height
+            blocks = [b for b in page.get_text("blocks") if str(b[4]).strip()]
+            body_blocks = [b for b in blocks if len(str(b[4]).strip()) >= MIN_BODY_BLOCK_CHARS]
+            if not body_blocks:
+                per_page_geom.append((w0, h0, None))
+                continue
+            x0 = min(b[0] for b in body_blocks)
+            y0 = min(b[1] for b in body_blocks)
+            x1 = max(b[2] for b in body_blocks)
+            y1 = max(b[3] for b in body_blocks)
+            per_page_geom.append((w0, h0, (x0, y0, x1, y1)))
+
+            old_cx, old_cy = w0 / 2.0, h0 / 2.0
+            half_w_needed = max(x1 - old_cx, old_cx - x0)
+            half_h_needed = max(y1 - old_cy, old_cy - y0)
+            s_w = (avail_w / 2.0) / half_w_needed if half_w_needed > 1e-6 else float("inf")
+            s_h = (avail_h / 2.0) / half_h_needed if half_h_needed > 1e-6 else float("inf")
+            page_scale = min(s_w, s_h)
+            if worst_scale is None or page_scale < worst_scale:
+                worst_scale = page_scale
+    finally:
+        doc.close()
+
+    # Never enlarge by more than 15% (a page with almost no content shouldn't
+    # balloon its text size) and never shrink past legibility as a sanity floor.
+    scale = 1.0 if worst_scale is None else worst_scale
+    scale = float(np.clip(scale, 0.4, 1.15))
+
+    reader = PdfReader(input_path)
+    writer = PdfWriter()
+    for i, page in enumerate(reader.pages):
+        w0, h0, _ = per_page_geom[i]
+        old_cx, old_cy = float(w0) / 2.0, float(h0) / 2.0
+        new_cx, new_cy = new_w_pt / 2.0, new_h_pt / 2.0
+        tx = new_cx - scale * old_cx
+        ty = new_cy - scale * old_cy
+        page.add_transformation(Transformation().scale(scale, scale).translate(tx, ty))
+        page.mediabox.lower_left = (0, 0)
+        page.mediabox.upper_right = (new_w_pt, new_h_pt)
+        if page.cropbox:
+            page.cropbox.lower_left = (0, 0)
+            page.cropbox.upper_right = (new_w_pt, new_h_pt)
+        writer.add_page(page)
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    return {
+        "output_path": output_path,
+        "scale_factor": round(scale, 4),
+        "trim_in": [trim_w_in, trim_h_in],
         "target_margin_in": target_margin_in,
     }
 
@@ -780,7 +872,8 @@ def run_compliance_checks(
                 "label": f["title"],
                 "status": f["severity"],
                 "message": f["why_it_fails"],
-                "auto_fix": False,
+                "auto_fix": f.get("one_click_fix", False),
+                "fix_action": "fit_recenter_interior" if f["id"] in ("interior_page_size_mismatch", "interior_safety_margin") else None,
             })
 
     # Cover text/art safety margin -- the cover-file counterpart to the

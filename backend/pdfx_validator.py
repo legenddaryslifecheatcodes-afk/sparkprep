@@ -550,13 +550,14 @@ def check_interior_safety_margins(
             publisher_rule=f"{platform_name} — interior pages must match the ordered trim size exactly",
             pinpoint={"pages": [b["page"] for b in bad_size_pages[:10]], "expected_in": [trim_w_in, trim_h_in]},
             fix_steps=[
-                f"Set your document's page size to exactly {trim_w_in}\" × {trim_h_in}\" in whatever tool exported "
-                "this PDF (Word: Layout → Size → More Paper Sizes; Google Docs: File → Page setup; InDesign/Vellum: "
-                "document setup).",
-                "Re-export and re-upload -- this is the actual page geometry, so it can't be auto-fixed by resampling.",
+                "Run Auto-Fix -- it fits and recenters your existing pages onto the correct trim size directly in "
+                "the PDF (a lossless content-stream scale, not a rasterize/resample), so no re-export is needed.",
+                f"Prefer to fix it at the source instead? Set your document's page size to exactly {trim_w_in}\" × "
+                f"{trim_h_in}\" in whatever tool exported this PDF (Word: Layout → Size → More Paper Sizes; Google "
+                "Docs: File → Page setup; InDesign/Vellum: document setup) and re-upload.",
             ],
             fix_tools=["Microsoft Word", "Google Docs", "Adobe InDesign", "Vellum"],
-            one_click_fix=False,
+            one_click_fix=True,
         ))
 
     if tight_margin_pages and not bad_size_pages:
@@ -575,11 +576,13 @@ def check_interior_safety_margins(
             publisher_rule=f"{platform_name} — all text/borders must be at least {SAFETY_MARGIN_IN}\" from the trim edge",
             pinpoint={"pages": [tp["page"] for tp in tight_margin_pages[:10]], "required_in": SAFETY_MARGIN_IN},
             fix_steps=[
-                f"Increase your document's margins to at least {SAFETY_MARGIN_IN}\" on every side (top/bottom/left/right).",
-                "Re-export and re-upload -- like page size, this needs the source file's layout fixed, not a one-click resample.",
+                "Run Auto-Fix -- it shrinks and recenters your existing pages just enough to clear the required "
+                "margin on every side (a lossless content-stream scale, not a rasterize/resample), so no re-export is needed.",
+                f"Prefer to fix it at the source instead? Increase your document's margins to at least "
+                f"{SAFETY_MARGIN_IN}\" on every side (top/bottom/left/right) and re-upload.",
             ],
             fix_tools=["Microsoft Word", "Google Docs", "Adobe InDesign", "Vellum"],
-            one_click_fix=False,
+            one_click_fix=True,
         ))
 
     return findings
