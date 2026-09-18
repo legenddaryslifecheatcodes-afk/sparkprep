@@ -1041,6 +1041,23 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         current_metadata = p.get("file_metadata", {})
 
     file_path = UPLOAD_DIR / stored_filename
+    # The customer's actual uploaded source, preserved forever once set --
+    # never deleted by a repair pass below, only by the customer explicitly
+    # replacing (slot_upload) or deleting (slot_delete) this slot. If this
+    # is the first repair ever run on this slot, current_metadata has no
+    # original_stored_filename yet, so the file we're about to fix IS the
+    # original -- every os.remove() below is guarded against removing
+    # whichever path this resolves to.
+    original_stored_filename = current_metadata.get("original_stored_filename") or stored_filename
+    original_path = UPLOAD_DIR / original_stored_filename
+
+    def _remove_if_not_original(path: Path):
+        if Path(path) != original_path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     ghostscript_result = None
     interior_margin_fix = None
     if current_metadata.get("is_pdf"):
@@ -1072,7 +1089,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     )
                     interior_margin_fix["attempted"] = True
                     interior_margin_fix["succeeded"] = True
-                    os.remove(file_path)
+                    _remove_if_not_original(file_path)
                     file_path = geom_fixed_path
                     stored_filename = geom_fixed_name
                 except Exception as e:
@@ -1102,10 +1119,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 fixed_path = UPLOAD_DIR / fixed_name
                 try:
                     convert_to_pdfx1a(str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
-                    try:
-                        os.remove(file_path)
-                    except OSError:
-                        pass
+                    _remove_if_not_original(file_path)
                     file_path = fixed_path
                     metadata = analyze_file(str(fixed_path))
                     metadata["original_filename"] = current_metadata.get("original_filename")
@@ -1192,12 +1206,9 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             await log_failure(db, "autofix_cmyk", e, project_id=project_id, user_id=user["id"],
                                context={"file_ext": Path(file_path).suffix.lower(), "slot": slot})
             raise HTTPException(500, f"CMYK conversion failed: {e}")
-        try:
-            os.remove(file_path)
-            if margin_source_path != file_path:
-                os.remove(margin_source_path)
-        except OSError:
-            pass
+        _remove_if_not_original(file_path)
+        if margin_source_path != file_path:
+            _remove_if_not_original(margin_source_path)
         # The compliance re-check below (and the response's file_metadata)
         # need to look at the actual fixed file, not the original this
         # branch just deleted -- without this, the re-check after autofix
@@ -1232,6 +1243,11 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
     # metadata -- fall back to the file we started with so it doesn't go
     # missing from the project record.
     metadata.setdefault("stored_filename", stored_filename)
+    # Carry the preserved original forward into the saved record -- so the
+    # *next* autofix call (or _replace_slot, e.g. a later AI Upscale) still
+    # knows which file on disk must never be deleted, even though
+    # stored_filename itself has now moved on to this fix's output.
+    metadata["original_stored_filename"] = original_stored_filename
 
     if slot:
         metadata["slot"] = slot
@@ -2529,17 +2545,26 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
             await log_failure(db, "slot_upload_compose", e, project_id=project_id, user_id=user["id"],
                                context={"filename": file.filename, "ext": ext, "slot": slot})
             raise HTTPException(400, f"Couldn't convert this file into a print-ready interior: {e}")
-        finally:
-            try: os.remove(file_path)  # the raw docx/txt was only a staging step
-            except OSError: pass
+        # The raw .docx/.txt is the customer's actual source manuscript --
+        # preserved on disk (not deleted as a mere "staging step" the way
+        # this used to work) so they can always get the file they actually
+        # wrote back, independent of how the composer interpreted it.
+        raw_manuscript_stored_filename = file_id
         file_id = composed_id
         file_path = composed_path
+    else:
+        raw_manuscript_stored_filename = None
 
     try:
         metadata = analyze_file(str(file_path))
         metadata["original_filename"] = file.filename
         metadata["stored_filename"] = file_id
         metadata["slot"] = slot
+        # A direct (non-composed) upload is its own original -- the first
+        # file in this slot's new lineage; a composed interior's original
+        # is the raw manuscript preserved above instead of the PDF it
+        # produced.
+        metadata["original_stored_filename"] = raw_manuscript_stored_filename or file_id
         if compose_warnings:
             metadata["compose_warnings"] = compose_warnings
 
@@ -2562,11 +2587,17 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
         raise HTTPException(500, f"Couldn't analyze this file: {e}. It may be corrupted or an unsupported variant of {ext}.")
 
     slots = p.get("slots") or {}
-    # Clean up prior file for this slot
+    # The customer is directly replacing this slot's content with a new
+    # upload -- unlike a repair/regeneration, this genuinely starts a new
+    # lineage, so both the prior working file AND its preserved original
+    # (if one had survived past repairs) are cleaned up here rather than
+    # kept around orphaned forever.
     prior = slots.get(slot)
-    if prior and prior.get("stored_filename"):
-        try: os.remove(UPLOAD_DIR / prior["stored_filename"])
-        except OSError: pass
+    if prior:
+        for stale in {prior.get("stored_filename"), prior.get("original_stored_filename")}:
+            if stale:
+                try: os.remove(UPLOAD_DIR / stale)
+                except OSError: pass
     slots[slot] = {**metadata, "compliance": compliance}
 
     # If uploading full_wrap, also mirror into legacy uploaded_file for existing flows
@@ -2616,13 +2647,26 @@ def _save_generated_slot_file(p: dict, project_id: str, slot: str, file_id: str,
 
 
 async def _replace_slot(project_id: str, p: dict, slot: str, metadata: dict, compliance: list):
+    """Shared by autofix's AI Upscale, AI Cover generation, and Cover
+    Template rendering -- all system-driven regenerations of whatever is
+    CURRENTLY in a slot, as opposed to slot_upload/slot_delete (the
+    customer directly choosing to replace or remove content). Preserves
+    the slot's original_stored_filename (the first file this slot's
+    current lineage ever held) the same way autofix() does: never delete
+    it, and carry it forward so the next regeneration still knows what to
+    protect."""
     slots = p.get("slots") or {}
     prior = slots.get(slot)
-    if prior and prior.get("stored_filename"):
-        try:
-            os.remove(UPLOAD_DIR / prior["stored_filename"])
-        except OSError:
-            pass
+    original_stored_filename = None
+    if prior:
+        original_stored_filename = prior.get("original_stored_filename") or prior.get("stored_filename")
+        if prior.get("stored_filename") and prior["stored_filename"] != original_stored_filename:
+            try:
+                os.remove(UPLOAD_DIR / prior["stored_filename"])
+            except OSError:
+                pass
+    if original_stored_filename:
+        metadata["original_stored_filename"] = original_stored_filename
     slots[slot] = {**metadata, "compliance": compliance}
     update = {"slots": slots, "updated_at": datetime.now(timezone.utc).isoformat()}
     if slot == "full_wrap":
@@ -2850,9 +2894,14 @@ async def slot_delete(project_id: str, slot: str, user: dict = Depends(get_curre
         raise HTTPException(404, "Project not found")
     slots = p.get("slots") or {}
     prior = slots.pop(slot, None)
-    if prior and prior.get("stored_filename"):
-        try: os.remove(UPLOAD_DIR / prior["stored_filename"])
-        except OSError: pass
+    if prior:
+        # Explicit customer-directed removal -- unlike a repair, this is
+        # the one case where cleaning up the preserved original too is
+        # correct: the customer said to delete this content entirely.
+        for stale in {prior.get("stored_filename"), prior.get("original_stored_filename")}:
+            if stale:
+                try: os.remove(UPLOAD_DIR / stale)
+                except OSError: pass
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"slots": slots}})
     return {"ok": True, "slot": slot}
 
@@ -2883,6 +2932,37 @@ async def slot_preview(project_id: str, slot: str, request: Request):
         await log_failure(db, "slot_preview_render", e, project_id=project_id, user_id=user_id,
                            context={"slot": slot, "filename": slot_data["stored_filename"]})
         raise HTTPException(500, f"Couldn't render a preview of this file: {e}")
+
+
+@api_router.get("/projects/{project_id}/slot/{slot}/original")
+async def slot_original_download(project_id: str, slot: str, user: dict = Depends(get_current_user)):
+    """Lets the customer retrieve exactly what they originally uploaded to
+    this slot, independent of anything Auto-Fix/AI Upscale/AI Cover/Cover
+    Template have since done to it -- SparkPrep's repair pipeline updates
+    a slot's *working* file in place, but never deletes the file recorded
+    here (see autofix()/_replace_slot()'s original_stored_filename
+    handling), so this is always the true as-uploaded source, not a
+    repaired copy. A project created before this endpoint existed has no
+    original_stored_filename on file and gets a clear 404 rather than
+    silently serving the current (possibly already-repaired) file under
+    a misleading name.
+    """
+    if slot not in ALLOWED_SLOTS:
+        raise HTTPException(400, "Unknown slot")
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    slot_data = (p.get("slots") or {}).get(slot)
+    if not slot_data:
+        raise HTTPException(404, "Slot empty")
+    original_stored_filename = slot_data.get("original_stored_filename")
+    if not original_stored_filename:
+        raise HTTPException(404, "No preserved original on file for this slot")
+    fp = UPLOAD_DIR / original_stored_filename
+    if not fp.exists():
+        raise HTTPException(404, "Original file missing on disk")
+    download_name = slot_data.get("original_filename") or original_stored_filename
+    return FileResponse(str(fp), filename=download_name)
 
 
 @api_router.patch("/projects/{project_id}/adjustments")
