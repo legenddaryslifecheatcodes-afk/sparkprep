@@ -1796,6 +1796,17 @@ ADVANCED_MAX_INTERNAL_ITERATIONS = 3
 # instead of 1, and looped instead of a single pass.
 ADVANCED_GEOMETRY_FIXABLE_IDS = {"interior_page_size_mismatch", "interior_safety_margin"}
 ADVANCED_GHOSTSCRIPT_FIXABLE_IDS = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent"}
+# Ghostscript's -dPDFX pass doesn't reliably stamp /GTS_PDFXVersion in
+# practice (confirmed directly: converting a real file through
+# convert_to_pdfx1a() and rechecking it still reports pdfx1a_not_declared)
+# -- but this doesn't actually matter, because build_interior_pdf_x1a()/
+# build_print_ready_pdf() unconditionally (re)stamp both of these at
+# export time regardless of what happened here (see autofix()'s identical
+# ALWAYS_FIXED_AT_EXPORT set). Without this exemption the loop burned all
+# ADVANCED_MAX_INTERNAL_ITERATIONS passes re-attempting a "fix" that Ghostscript
+# was never going to make stick, and then told the paying customer these
+# were unresolved problems they needed to act on, when they're not.
+ADVANCED_ALWAYS_FIXED_AT_EXPORT = {"pdfx1a_not_declared", "pdfx1a_missing_output_intent"}
 
 
 async def _advanced_interior_repair_loop(
@@ -1826,8 +1837,13 @@ async def _advanced_interior_repair_loop(
 
         geometry_findings = [f for f in findings if f["id"] in ADVANCED_GEOMETRY_FIXABLE_IDS]
         ghostscript_findings = [f for f in findings if f["id"] in ADVANCED_GHOSTSCRIPT_FIXABLE_IDS]
-        if not geometry_findings and not ghostscript_findings:
-            break  # nothing left that this loop knows how to fix
+        # Only live_transparency_detected/layers_detected genuinely need
+        # (and benefit from) another Ghostscript pass -- see
+        # ADVANCED_ALWAYS_FIXED_AT_EXPORT above for why the other two
+        # ghostscript-fixable ids don't count toward "is there more to do".
+        genuinely_needs_gs = [f for f in ghostscript_findings if f["id"] not in ADVANCED_ALWAYS_FIXED_AT_EXPORT]
+        if not geometry_findings and not genuinely_needs_gs:
+            break  # nothing left that this loop knows how to fix (or that export doesn't fix anyway)
 
         iterations_used = iteration
         made_progress = False
@@ -1848,7 +1864,7 @@ async def _advanced_interior_repair_loop(
             except Exception as e:
                 await log_failure(db, "advanced_interior_geometry_fix", e, project_id=project_id, user_id=user_id)
 
-        if ghostscript_findings and find_ghostscript():
+        if genuinely_needs_gs and find_ghostscript():
             try:
                 gs_fixed_path = UPLOAD_DIR / f"{project_id}_interior_adv_gs_{uuid.uuid4().hex[:6]}.pdf"
                 convert_to_pdfx1a(str(current_path), str(gs_fixed_path), title=p.get("name", "SparkPrep Export"))
@@ -1870,7 +1886,15 @@ async def _advanced_interior_repair_loop(
     final_findings = run_pdf_structure_audit(str(current_path), platform_name, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
     final_findings += check_interior_safety_margins(str(current_path), platform_name, trim_w, trim_h, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
     final_findings = _annotate_export_time_fixes(final_findings)
-    unresolved = [f for f in final_findings if f["severity"] in ("fail", "warning")]
+    # Excluded outright, not just annotated: these two don't actually block
+    # or survive export (see ADVANCED_ALWAYS_FIXED_AT_EXPORT above), so
+    # showing them to a customer who just paid for "tell me exactly what I
+    # need to fix myself" as something needing their attention would be
+    # actively wrong, not just unhelpful.
+    unresolved = [
+        f for f in final_findings
+        if f["severity"] in ("fail", "warning") and f["id"] not in ADVANCED_ALWAYS_FIXED_AT_EXPORT
+    ]
 
     return {
         "final_path": current_path,
