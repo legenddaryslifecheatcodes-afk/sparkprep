@@ -19,6 +19,7 @@ import stripe
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 try:
     from motor.motor_asyncio import AsyncIOMotorClient
 except Exception:  # pragma: no cover - fallback for local/dev environments
@@ -215,6 +216,58 @@ logger = logging.getLogger("sparkprep")
 # ADVANCED_INTERIOR_MAX_PAGES, defined below near its checkout endpoint) is
 # the only thing allowed to scan beyond page 1 -- these must never be mixed.
 BASIC_CHECK_MAX_PAGES = 1
+
+# ---- Hard ceiling on any single request's processing time ----
+# Cloudflare sits in front of this backend (confirmed: Render's own edge is
+# Cloudflare, independent of whatever the frontend uses) and cuts an idle
+# connection at ~100s with an opaque 524 -- the client gets no useful error
+# and, worse, has no way to know whether the backend actually finished the
+# work or not, since nothing here tracks jobs asynchronously. Also found
+# live: a single slow/heavy request (AI Upscale's old neural model) could
+# run 280+ seconds and get OOM-killed by the host, taking the whole API
+# down for every user, not just the one who triggered it. REQUEST_TIMEOUT_S
+# is set well under Cloudflare's ceiling so a slow request fails fast with a
+# real, friendly error instead of hanging into a 524.
+REQUEST_TIMEOUT_S = 45.0
+
+
+class RequestTimeoutMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # A file upload's duration is the user's connection speed, not our
+        # processing time -- a 100MB cover on a slow home uplink can
+        # legitimately take over a minute just to arrive. The processing
+        # that happens *after* the bytes land is bounded separately by
+        # run_with_timeout inside each upload handler, so multipart uploads
+        # are exempt from this outer clock.
+        if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            return await call_next(request)
+        try:
+            return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "This is taking longer than expected and was stopped automatically. Try again, or try a smaller/simpler file."},
+            )
+
+
+async def run_with_timeout(fn, *args, **kwargs):
+    """Runs a synchronous, potentially-slow function in a worker thread and
+    enforces REQUEST_TIMEOUT_S on it. Plain `asyncio.wait_for` around a
+    request handler doesn't actually interrupt synchronous CPU-bound code --
+    it only reports the timeout once that code finally returns control to
+    the event loop, which is too late to matter. Dispatching to a thread via
+    asyncio.to_thread lets the event loop keep servicing the timeout timer
+    while the real work runs, so the HTTP response comes back on time even
+    though the orphaned thread (Python can't force-kill a thread) keeps
+    running to completion in the background."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=REQUEST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504,
+            f"This step is taking longer than {int(REQUEST_TIMEOUT_S)} seconds and was stopped automatically. "
+            "Try again, or try a smaller/simpler file.",
+        )
 
 
 def _cover_file_meta(p: dict) -> Optional[dict]:
@@ -1118,7 +1171,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 fixed_name = f"{project_id}_{slot or 'cover'}_gsfixed_{uuid.uuid4().hex[:6]}.pdf"
                 fixed_path = UPLOAD_DIR / fixed_name
                 try:
-                    convert_to_pdfx1a(str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
+                    await run_with_timeout(convert_to_pdfx1a, str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
                     _remove_if_not_original(file_path)
                     file_path = fixed_path
                     metadata = analyze_file(str(fixed_path))
@@ -1187,11 +1240,14 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             margin_fixed_name = f"{project_id}_{slot or 'cover'}_marginfixed_{uuid.uuid4().hex[:6]}{Path(file_path).suffix}"
             margin_fixed_path = UPLOAD_DIR / margin_fixed_name
             try:
-                autofix_cover_safe_margin(
+                await run_with_timeout(
+                    autofix_cover_safe_margin,
                     str(file_path), str(margin_fixed_path),
                     outer_margin_finding["pinpoint"]["margin_in"], final_w, final_h,
                 )
                 margin_source_path = margin_fixed_path
+            except HTTPException:
+                raise
             except Exception as e:
                 await log_failure(db, "autofix_cover_margin", e, project_id=project_id, user_id=user["id"],
                                    context={"slot": slot})
@@ -1201,7 +1257,9 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         fixed_path = UPLOAD_DIR / fixed_name
         tac_limit = TAC_THRESHOLD_BY_PLATFORM.get(p["platform"], TAC_THRESHOLD_DEFAULT)
         try:
-            convert_to_cmyk(str(margin_source_path), str(fixed_path), 300, tac_limit=tac_limit)
+            await run_with_timeout(convert_to_cmyk, str(margin_source_path), str(fixed_path), 300, tac_limit=tac_limit)
+        except HTTPException:
+            raise
         except Exception as e:
             await log_failure(db, "autofix_cmyk", e, project_id=project_id, user_id=user["id"],
                                context={"file_ext": Path(file_path).suffix.lower(), "slot": slot})
@@ -1233,7 +1291,8 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         geom = _full_wrap_geometry(p)
         spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
                          "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
-    compliance = run_compliance_checks(
+    compliance = await run_with_timeout(
+        run_compliance_checks,
         metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
         file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
         final_w=final_w, final_h=final_h, **spine_kwargs,
@@ -1312,7 +1371,8 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
             cover_path = UPLOAD_DIR / cover_meta["stored_filename"] if cover_meta.get("stored_filename") else None
             final_w, final_h = _target_inches_for_slot(p, "full_wrap")
             geom = _full_wrap_geometry(p)
-            sections["cover"] = {"uploaded": True, "compliance": run_compliance_checks(
+            sections["cover"] = {"uploaded": True, "compliance": await run_with_timeout(
+                run_compliance_checks,
                 cover_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
                 file_path=str(cover_path) if cover_path else None, slot="full_wrap",
                 platform_name=plat.get("name"), final_w=final_w, final_h=final_h,
@@ -1325,7 +1385,8 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
             sections["interior"] = {"uploaded": False, "compliance": []}
         else:
             interior_path = UPLOAD_DIR / interior_meta["stored_filename"] if interior_meta.get("stored_filename") else None
-            sections["interior"] = {"uploaded": True, "compliance": run_compliance_checks(
+            sections["interior"] = {"uploaded": True, "compliance": await run_with_timeout(
+                run_compliance_checks,
                 interior_meta, trim["w"], trim["h"], plat["bleed"], p["platform"],
                 file_path=str(interior_path) if interior_path else None, slot="interior",
                 platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
@@ -1481,7 +1542,8 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
             except Exception:
                 barcode_png = None
         try:
-            cover_result = build_print_ready_pdf(
+            cover_result = await run_with_timeout(
+                build_print_ready_pdf,
                 str(cover_path), str(cover_export_path),
                 trim_w=trim["w"], trim_h=trim["h"],
                 bleed=cover_bleed, spine_w=spine_w,
@@ -1493,6 +1555,8 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
                 binding=binding,
                 platform=platform_key,
             )
+        except HTTPException:
+            raise
         except Exception as e:
             await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
                                context={"project_type": project_type, "part": "cover", "platform": p["platform"]})
@@ -1505,7 +1569,8 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
         try:
             if interior_ext == ".pdf":
                 # Multi-page interior branch: source is a PDF → preserve vector text + fonts, tag PDF/X-1a
-                interior_result = build_interior_pdf_x1a(
+                interior_result = await run_with_timeout(
+                    build_interior_pdf_x1a,
                     str(interior_path), str(interior_export_path),
                     trim_w=trim["w"], trim_h=trim["h"],
                     bleed=plat["bleed"],
@@ -1516,7 +1581,8 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
                 )
             else:
                 # Image-source interior (e.g. a single scanned page) → rasterized single-page flow
-                interior_result = build_print_ready_pdf(
+                interior_result = await run_with_timeout(
+                    build_print_ready_pdf,
                     str(interior_path), str(interior_export_path),
                     trim_w=trim["w"], trim_h=trim["h"],
                     bleed=plat["bleed"], spine_w=0,
@@ -1525,6 +1591,8 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
                     color_profile=color_profile,
                     producer_name=producer_name,
                 )
+        except HTTPException:
+            raise
         except Exception as e:
             await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
                                context={"project_type": project_type, "part": "interior", "platform": p["platform"], "file_ext": interior_ext})
@@ -2748,10 +2816,13 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
             trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
             composed_id = f"{project_id}_interior_composed_{uuid.uuid4().hex[:6]}.pdf"
             composed_path = UPLOAD_DIR / composed_id
-            compose_manuscript_pdf(
+            await run_with_timeout(
+                compose_manuscript_pdf,
                 str(composed_path), "fiction_novel", p.get("name") or "Untitled Book", "",
                 source_text, trim["w"], trim["h"], p["platform"],
             )
+        except HTTPException:
+            raise
         except Exception as e:
             await log_failure(db, "slot_upload_compose", e, project_id=project_id, user_id=user["id"],
                                context={"filename": file.filename, "ext": ext, "slot": slot})
@@ -2787,11 +2858,14 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
             geom = _full_wrap_geometry(p)
             spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
                              "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
-        compliance = run_compliance_checks(
+        compliance = await run_with_timeout(
+            run_compliance_checks,
             metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
             file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
             final_w=final_w, final_h=final_h, **spine_kwargs,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         await log_failure(db, "slot_upload_analyze", e, project_id=project_id, user_id=user["id"],
                            context={"filename": file.filename, "ext": ext, "slot": slot})
@@ -3035,9 +3109,9 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     try:
         with open(source_path, "rb") as f:
             source_bytes = f.read()
-        # CPU-bound (no GPU) -- runs in a thread so it doesn't block the
-        # event loop for every other request while one image upscales.
-        image_bytes = await asyncio.to_thread(upscale_to_size, source_bytes, target_w_px, target_h_px)
+        image_bytes = await run_with_timeout(upscale_to_size, source_bytes, target_w_px, target_h_px)
+    except HTTPException:
+        raise
     except Exception as e:
         await log_failure(db, "ai_enhance", e, project_id=project_id, user_id=user["id"], context={"slot": slot})
         raise HTTPException(502, f"AI Upscale failed: {e}")
@@ -3304,53 +3378,57 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
                 raise HTTPException(413, f"File exceeds {max_mb}MB limit for audit")
             f.write(chunk)
 
-    metadata = analyze_file(str(file_path))
-    metadata["original_filename"] = file.filename
-    metadata["stored_filename"] = file_id
+    def _run_audit_checks():
+        metadata = analyze_file(str(file_path))
+        metadata["original_filename"] = file.filename
+        metadata["stored_filename"] = file_id
 
-    trim = TRIM_SIZES[a["trim_size"]]
-    plat = PLATFORMS[a["platform"]]
-    file_type = a.get("file_type", "interior")
-    if file_type == "cover":
-        binding = a.get("binding", "paperback")
-        paper = PAPER_TYPES.get(a.get("paper_type", "white_50lb"), PAPER_TYPES["white_50lb"])
-        spine_w, _ = calculate_spine_width_for_platform(a.get("page_count", 0), paper["ppi"], a["platform"], binding)
-        bleed = resolve_binding_spec(binding, a["platform"])["bleed"]
-        full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, a["platform"])
-        shape_note = f"front + back + {spine_w:.3f}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
-        findings = deep_audit(
-            metadata, full["total_width"], full["total_height"], bleed, plat["name"],
-            is_cover=True, shape_note=shape_note,
-        )
-        findings += check_cover_safety_margins(
-            str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
-            spine_x_in=full["spine_x"], spine_w_in=full["spine_width"],
-            page_count=a.get("page_count"), binding=binding,
-        )
-    else:
-        bleed = plat["bleed"]
-        findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
-        # deep_audit() only looks at file-level metadata (dimensions/DPI/
-        # bleed/color) -- it never looks at where the actual text sits on
-        # the page, so an interior audit was never able to catch "content
-        # extends outside the safety area" / "not centered" at all, the
-        # single most common real distributor rejection reason (this is
-        # the exact issue IngramSpark rejected a real customer's book for).
-        # Kept at BASIC_CHECK_MAX_PAGES (page 1), same depth as the
-        # structural check two lines below and the Basic $19.99 check --
-        # this $0.99 diagnostic is priced and positioned below Basic, so it
-        # shouldn't see deeper into the file than the paid tier above it.
+        trim = TRIM_SIZES[a["trim_size"]]
+        plat = PLATFORMS[a["platform"]]
+        file_type = a.get("file_type", "interior")
+        if file_type == "cover":
+            binding = a.get("binding", "paperback")
+            paper = PAPER_TYPES.get(a.get("paper_type", "white_50lb"), PAPER_TYPES["white_50lb"])
+            spine_w, _ = calculate_spine_width_for_platform(a.get("page_count", 0), paper["ppi"], a["platform"], binding)
+            bleed = resolve_binding_spec(binding, a["platform"])["bleed"]
+            full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, a["platform"])
+            shape_note = f"front + back + {spine_w:.3f}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
+            findings = deep_audit(
+                metadata, full["total_width"], full["total_height"], bleed, plat["name"],
+                is_cover=True, shape_note=shape_note,
+            )
+            findings += check_cover_safety_margins(
+                str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
+                spine_x_in=full["spine_x"], spine_w_in=full["spine_width"],
+                page_count=a.get("page_count"), binding=binding,
+            )
+        else:
+            bleed = plat["bleed"]
+            findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
+            # deep_audit() only sees file-level metadata, never where text sits on the
+            # page -- so an interior audit couldn't catch "content extends outside the
+            # safety area" / "not centered" (the most common real distributor rejection).
+            # Kept at page 1 (BASIC_CHECK_MAX_PAGES), same depth as the structural check
+            # below and the Basic check -- this $0.99 diagnostic is priced below Basic, so
+            # it shouldn't see deeper into the file than the paid tier above it.
+            if metadata.get("is_pdf"):
+                findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES)
+        tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), a["platform"], plat["name"])
+        if tac_finding:
+            findings.append(tac_finding)
+        # Structural checks that require opening the actual PDF (not just its
+        # source metadata): PDF/X-1a declaration, live transparency, layers,
+        # embedded fonts, ICC output intent. Only applies to PDFs -- an image
+        # upload has none of this structure yet.
         if metadata.get("is_pdf"):
-            findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES)
-    tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), a["platform"], plat["name"])
-    if tac_finding:
-        findings.append(tac_finding)
-    # Structural checks that require opening the actual PDF (not just its
-    # source metadata): PDF/X-1a declaration, live transparency, layers,
-    # embedded fonts, ICC output intent. Only applies to PDFs -- an image
-    # upload has none of this structure yet.
-    if metadata.get("is_pdf"):
-        findings += run_pdf_structure_audit(str(file_path), plat["name"], max_pages=BASIC_CHECK_MAX_PAGES)
+            findings += run_pdf_structure_audit(str(file_path), plat["name"], max_pages=BASIC_CHECK_MAX_PAGES)
+        return metadata, findings
+
+    # The whole synchronous check sequence above (OCR, PDF structure audit,
+    # ink-coverage scan) runs in one worker thread under one time budget --
+    # see run_with_timeout's docstring for why a bare asyncio.wait_for
+    # around this wouldn't actually enforce anything.
+    metadata, findings = await run_with_timeout(_run_audit_checks)
     summary = audit_summary(findings)
 
     preview = [
@@ -3716,6 +3794,8 @@ async def admin_revoke_pass(code: str, _: dict = Depends(require_admin)):
 
 
 app.include_router(api_router)
+
+app.add_middleware(RequestTimeoutMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

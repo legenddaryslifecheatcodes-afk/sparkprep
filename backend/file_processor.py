@@ -649,10 +649,19 @@ def build_print_ready_pdf(
                     img = img.convert("RGBA")
                 bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
                 img = bg
-            # Save temp RGB copy (reportlab handles RGB best)
+            # Save as a temp JPEG in whatever color mode the source actually
+            # is -- this used to force RGB unconditionally regardless of
+            # mode (both branches of what looked like a CMYK/else split did
+            # the identical .convert("RGB")), so a file Auto-Fix had
+            # genuinely converted to CMYK still landed back in the exported
+            # "PDF/X-1a" PDF as an RGB image, contradicting the file's own
+            # declared CMYK OutputIntent. Verified directly: reportlab
+            # embeds a CMYK JPEG as real DeviceCMYK with exact channel
+            # values preserved, no Adobe-marker inversion, so there's no
+            # reason to flatten to RGB when the source is already CMYK.
             tmp_path = image_path + ".rgb.jpg"
             if img.mode == "CMYK":
-                img.convert("RGB").save(tmp_path, "JPEG", quality=95, dpi=(300, 300))
+                img.save(tmp_path, "JPEG", quality=95, dpi=(300, 300))
             else:
                 img.convert("RGB").save(tmp_path, "JPEG", quality=95, dpi=(300, 300))
             c.drawImage(tmp_path, 0, 0, width=page_w, height=page_h)
