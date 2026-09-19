@@ -53,6 +53,7 @@ from series_engine import check_series_consistency
 from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
 from image_upscale_engine import upscale_to_size
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
+import storage
 
 class MemoryCursor:
     def __init__(self, docs):
@@ -912,6 +913,7 @@ async def upload_file(project_id: str, file: UploadFile = File(...), user: dict 
                 os.remove(file_path)
                 raise HTTPException(413, f"File exceeds {max_mb}MB limit for {tier} tier")
             f.write(chunk)
+    storage.upload_file(file_path)
 
     try:
         metadata = analyze_file(str(file_path))
@@ -1001,6 +1003,7 @@ async def preview_file(project_id: str, request: Request):
     if not p or not p.get("uploaded_file"):
         raise HTTPException(404, "No file")
     file_path = UPLOAD_DIR / p["uploaded_file"]
+    storage.ensure_local(file_path)
     if not file_path.exists():
         raise HTTPException(404, "File missing")
     try:
@@ -1011,8 +1014,7 @@ async def preview_file(project_id: str, request: Request):
         raise HTTPException(500, f"Couldn't render a preview of this file: {e}")
 
 
-@api_router.post("/projects/{project_id}/autofix")
-async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_current_user)):
+async def _autofix_core(project_id: str, slot: str, user: dict) -> dict:
     """Run all auto-fixes (convert to CMYK, upscale, flatten transparency,
     declare PDF/X-1a) and re-check the result in one pass, so the response
     reflects what's actually true now rather than a promise -- this is the
@@ -1041,6 +1043,11 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         current_metadata = p.get("file_metadata", {})
 
     file_path = UPLOAD_DIR / stored_filename
+    # The web service and the RQ worker run on separate disks -- this
+    # slot's file may have been uploaded (or last written) by whichever of
+    # the two didn't handle this request, so make sure it's actually here
+    # before anything below tries to read it.
+    storage.ensure_local(file_path)
     # The customer's actual uploaded source, preserved forever once set --
     # never deleted by a repair pass below, only by the customer explicitly
     # replacing (slot_upload) or deleting (slot_delete) this slot. If this
@@ -1278,7 +1285,29 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             existing_slots["full_wrap"] = {**metadata, "compliance": compliance}
             update["slots"] = existing_slots
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
+    # Push the fixed file up to shared storage so whichever process didn't
+    # produce it (web vs. worker) can still serve previews/downloads of it.
+    storage.upload_file(UPLOAD_DIR / metadata["stored_filename"])
     return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "interior_margin_fix": interior_margin_fix, "check_type": "basic"}
+
+
+@api_router.post("/projects/{project_id}/autofix")
+async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_current_user)):
+    return await _autofix_core(project_id, slot, user)
+
+
+@api_router.post("/projects/{project_id}/autofix/enqueue")
+async def autofix_enqueue(project_id: str, slot: str = None, user: dict = Depends(get_current_user)):
+    """Same as POST .../autofix, but runs on the RQ worker and returns
+    immediately with a job_id to poll via GET /jobs/{job_id} -- use this
+    for large interiors where the fix pass can take long enough to risk
+    a client/proxy timeout on a synchronous response."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    from job_queue import job_queue
+    job = job_queue.enqueue("jobs.run_autofix_job", project_id, user["id"], slot)
+    return {"job_id": job.id}
 
 
 @api_router.post("/projects/{project_id}/final-review")
@@ -1470,6 +1499,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
 
     if needs_cover:
         cover_path = UPLOAD_DIR / cover_data["stored_filename"]
+        storage.ensure_local(cover_path)
         cover_export_path = EXPORT_DIR / f"{project_id}_cover_{export_id}.pdf"
         # If a valid ISBN is set on the project, generate the barcode PNG for the back cover --
         # unless the uploaded cover art already has its own barcode built in, in which case
@@ -1500,6 +1530,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
 
     if needs_interior:
         interior_path = UPLOAD_DIR / interior_data["stored_filename"]
+        storage.ensure_local(interior_path)
         interior_ext = Path(interior_path).suffix.lower()
         interior_export_path = EXPORT_DIR / f"{project_id}_interior_{export_id}.pdf"
         try:
@@ -1579,6 +1610,9 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
         "result": result,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
+    # The download endpoint may be hit on whichever process (web vs.
+    # worker) didn't produce this export -- push it to shared storage now.
+    storage.upload_file(export_path)
     return {
         "export_name": export_name,
         "download_url": f"/api/projects/{project_id}/download/{export_name}",
@@ -1596,6 +1630,20 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
 @api_router.post("/projects/{project_id}/export")
 async def export_project(project_id: str, user: dict = Depends(get_current_user)):
     return await _export_project_core(project_id, user)
+
+
+@api_router.post("/projects/{project_id}/export/enqueue")
+async def export_project_enqueue(project_id: str, user: dict = Depends(get_current_user)):
+    """Same as POST .../export, but runs on the RQ worker and returns
+    immediately with a job_id to poll via GET /jobs/{job_id} -- export
+    processes every page of the interior, so this is the endpoint most
+    likely to outrun a synchronous request on a long book."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    from job_queue import job_queue
+    job = job_queue.enqueue("jobs.run_export_job", project_id, user["id"])
+    return {"job_id": job.id}
 
 
 @api_router.get("/projects/{project_id}/download/{export_name}")
@@ -1618,6 +1666,7 @@ async def download_export(project_id: str, export_name: str, request: Request):
     if not project:
         raise HTTPException(403, "Forbidden")
     fp = EXPORT_DIR / export_name
+    storage.ensure_local(fp)
     if not fp.exists():
         raise HTTPException(404, "Export not found")
     # A combined (cover + interior) project's export is a .zip bundling both
@@ -2052,8 +2101,7 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
     }
 
 
-@api_router.post("/projects/{project_id}/interior-check/run")
-async def interior_check_run(project_id: str, user: dict = Depends(get_current_user)):
+async def _interior_check_run_core(project_id: str, user: dict) -> dict:
     """Submits ONE Advanced Interior Check run: scans up to
     ADVANCED_INTERIOR_MAX_PAGES pages, repairs whatever SparkPrep can
     safely fix via a bounded internal loop, rechecks, and returns exactly
@@ -2085,6 +2133,7 @@ async def interior_check_run(project_id: str, user: dict = Depends(get_current_u
         raise HTTPException(400, f"You've used all {ADVANCED_MAX_RUNS} Advanced Interior Check runs for this book.")
 
     file_path = UPLOAD_DIR / interior_meta["stored_filename"]
+    storage.ensure_local(file_path)
     if not file_path.exists():
         raise HTTPException(404, "Interior file missing on disk")
     original_stored_filename = interior_meta.get("original_stored_filename") or interior_meta["stored_filename"]
@@ -2122,6 +2171,9 @@ async def interior_check_run(project_id: str, user: dict = Depends(get_current_u
         {"_id": ObjectId(project_id)},
         {"$set": {"slots": slots, "updated_at": finished_at}},
     )
+    # Push the repaired interior up to shared storage so whichever process
+    # didn't produce it (web vs. worker) can still serve previews/downloads.
+    storage.upload_file(final_path)
 
     run_number = runs_used + 1
     total_pages = metadata.get("pdf_pages") or 0
@@ -2150,6 +2202,25 @@ async def interior_check_run(project_id: str, user: dict = Depends(get_current_u
         "runs_used": run_number, "max_runs": ADVANCED_MAX_RUNS,
         "last_run": last_run, "is_stale": False,
     }
+
+
+@api_router.post("/projects/{project_id}/interior-check/run")
+async def interior_check_run(project_id: str, user: dict = Depends(get_current_user)):
+    return await _interior_check_run_core(project_id, user)
+
+
+@api_router.post("/projects/{project_id}/interior-check/run/enqueue")
+async def interior_check_run_enqueue(project_id: str, user: dict = Depends(get_current_user)):
+    """Same as POST .../interior-check/run, but runs on the RQ worker and
+    returns immediately with a job_id to poll via GET /jobs/{job_id} --
+    the internal bounded repair loop (up to 3 iterations over up to 300
+    pages) is the longest-running check in the app."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    from job_queue import job_queue
+    job = job_queue.enqueue("jobs.run_interior_check_job", project_id, user["id"])
+    return {"job_id": job.id}
 
 
 # ---- Promo codes (free giveaway access, no Stripe involved -- these never
@@ -2266,6 +2337,33 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
 @api_router.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+@api_router.get("/jobs/{job_id}")
+async def get_job_status(job_id: str, user: dict = Depends(get_current_user)):
+    """Poll an RQ job enqueued by one of the /enqueue endpoints above.
+    status is one of RQ's own job states: queued, started, finished, failed
+    (plus "deferred"/"scheduled", unused here). result/error are only
+    populated once status is finished/failed."""
+    from rq.job import Job
+    from rq.exceptions import NoSuchJobError
+    from job_queue import redis_conn
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except NoSuchJobError:
+        raise HTTPException(404, "Job not found")
+    # Every job function's second positional arg is the user_id it was
+    # enqueued for (see the /enqueue endpoints) -- enforce ownership the
+    # same way every other per-project endpoint in this file does.
+    if len(job.args) < 2 or job.args[1] != user["id"]:
+        raise HTTPException(404, "Job not found")
+    status = job.get_status(refresh=True)
+    response = {"job_id": job.id, "status": status}
+    if status == "finished":
+        response["result"] = job.result
+    elif status == "failed":
+        response["error"] = str(job.exc_info or "Job failed")
+    return response
 
 
 @api_router.get("/season")
@@ -2797,6 +2895,10 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
                            context={"filename": file.filename, "ext": ext, "slot": slot})
         raise HTTPException(500, f"Couldn't analyze this file: {e}. It may be corrupted or an unsupported variant of {ext}.")
 
+    storage.upload_file(file_path)
+    if raw_manuscript_stored_filename:
+        storage.upload_file(UPLOAD_DIR / raw_manuscript_stored_filename)
+
     slots = p.get("slots") or {}
     # The customer is directly replacing this slot's content with a new
     # upload -- unlike a repair/regeneration, this genuinely starts a new
@@ -2807,8 +2909,7 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
     if prior:
         for stale in {prior.get("stored_filename"), prior.get("original_stored_filename")}:
             if stale:
-                try: os.remove(UPLOAD_DIR / stale)
-                except OSError: pass
+                storage.delete_file(UPLOAD_DIR / stale)
     slots[slot] = {**metadata, "compliance": compliance}
 
     # If uploading full_wrap, also mirror into legacy uploaded_file for existing flows
@@ -3111,8 +3212,7 @@ async def slot_delete(project_id: str, slot: str, user: dict = Depends(get_curre
         # correct: the customer said to delete this content entirely.
         for stale in {prior.get("stored_filename"), prior.get("original_stored_filename")}:
             if stale:
-                try: os.remove(UPLOAD_DIR / stale)
-                except OSError: pass
+                storage.delete_file(UPLOAD_DIR / stale)
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"slots": slots}})
     return {"ok": True, "slot": slot}
 
@@ -3135,6 +3235,7 @@ async def slot_preview(project_id: str, slot: str, request: Request):
     if not slot_data or not slot_data.get("stored_filename"):
         raise HTTPException(404, "Slot empty")
     fp = UPLOAD_DIR / slot_data["stored_filename"]
+    storage.ensure_local(fp)
     if not fp.exists():
         raise HTTPException(404, "File missing")
     try:
@@ -3170,6 +3271,7 @@ async def slot_original_download(project_id: str, slot: str, user: dict = Depend
     if not original_stored_filename:
         raise HTTPException(404, "No preserved original on file for this slot")
     fp = UPLOAD_DIR / original_stored_filename
+    storage.ensure_local(fp)
     if not fp.exists():
         raise HTTPException(404, "Original file missing on disk")
     download_name = slot_data.get("original_filename") or original_stored_filename
