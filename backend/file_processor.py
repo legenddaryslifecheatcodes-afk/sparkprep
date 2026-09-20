@@ -359,8 +359,15 @@ def check_total_ink_coverage(file_path: str, is_pdf: bool, platform: str, platfo
         else:
             img = Image.open(file_path)
             if img.mode == "CMYK":
-                img.thumbnail((_TAC_SAMPLE_MAX_DIM, _TAC_SAMPLE_MAX_DIM))
-                cmyk_arr = np.array(img)
+                # A file that is ALREADY CMYK (an Auto-Fix output being verified) is measured
+                # EXACTLY: every real pixel, in row bands, no shrinking. Shrinking rounds each
+                # ink channel to a whole number, and on a file whose pixels sit right at the
+                # limit that rounding noise (up to ~+1.6%) made a correctly clamped file look
+                # "still over 240%" -- so Auto-Fix could never verify its own fix.
+                full = np.asarray(img)
+                rows = max(1, _CMYK_BAND_PIXELS // max(full.shape[1], 1))
+                exact_totals = [full[y0:y0 + rows].sum(axis=-1, dtype=np.int32) for y0 in range(0, full.shape[0], rows)]
+                cmyk_arr = None
             else:
                 if img.mode in ("RGBA", "LA"):
                     bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -368,19 +375,29 @@ def check_total_ink_coverage(file_path: str, is_pdf: bool, platform: str, platfo
                     img = bg
                 elif img.mode != "RGB":
                     img = img.convert("RGB")
-                img.thumbnail((_TAC_SAMPLE_MAX_DIM, _TAC_SAMPLE_MAX_DIM))
+                # BOX (plain averaging), not PIL's default bicubic: bicubic overshoots at
+                # hard edges (white text on a dark bar), inventing pixels over the limit
+                # that don't exist in the real file -- which made a correctly clamped
+                # file look "still over 240%" and stopped Auto-Fix from ever verifying.
+                img.thumbnail((_TAC_SAMPLE_MAX_DIM, _TAC_SAMPLE_MAX_DIM), resample=Image.Resampling.BOX)
                 cmyk_arr = rgb_array_to_cmyk_array(np.array(img))
     except Exception:
         return None  # unreadable/unsupported file -- other checks already cover that
 
-    tac_percent = cmyk_arr.astype(np.float64).sum(axis=-1) / 255.0 * 100.0
     threshold = TAC_THRESHOLD_BY_PLATFORM.get(platform, TAC_THRESHOLD_DEFAULT)
-    over_mask = tac_percent > threshold
-    affected_fraction = float(over_mask.mean())
+    if cmyk_arr is None:      # exact full-resolution path (already-CMYK file)
+        totals = exact_totals
+    else:                     # sampled path (RGB sources / PDFs): one small array
+        totals = [cmyk_arr.astype(np.int32).sum(axis=-1)]
+    # Integer comparison (total_units/255*100 > threshold  <=>  total_units*100 > threshold*255): no
+    # float noise, so a pixel at exactly the limit is never reported as over it.
+    n_pixels = sum(t.size for t in totals)
+    n_over = sum(int((t * 100 > threshold * 255).sum()) for t in totals)
+    affected_fraction = n_over / max(n_pixels, 1)
     if affected_fraction < _TAC_MIN_AFFECTED_FRACTION:
         return None
 
-    worst_tac = float(tac_percent.max())
+    worst_tac = max(int(t.max()) for t in totals) / 255.0 * 100.0
     from pdfx_validator import _finding
     return _finding(
         id="total_ink_coverage",
@@ -404,6 +421,24 @@ def check_total_ink_coverage(file_path: str, is_pdf: bool, platform: str, platfo
     )
 
 
+_CMYK_BAND_PIXELS = int(os.environ.get("SPARKPREP_CMYK_BAND_PIXELS", 1_000_000))  # pixels per band: working set stays ~100 MB whatever the image size (env override only for testing)
+
+
+def _cmyk_in_bands(arr: np.ndarray, tac_limit: float, from_rgb: bool) -> np.ndarray:
+    """RGB (or already-CMYK) uint8 array -> ink-clamped CMYK uint8 array, one horizontal band
+    at a time. rgb_array_to_cmyk_array and clamp_total_ink_coverage are per-pixel, so this is
+    bit-for-bit identical to running them on the whole image at once (tests prove it)."""
+    h, w = arr.shape[:2]
+    out = np.empty((h, w, 4), dtype=np.uint8)
+    rows = max(1, _CMYK_BAND_PIXELS // max(w, 1))
+    for y0 in range(0, h, rows):
+        band = arr[y0:y0 + rows]
+        if from_rgb:
+            band = rgb_array_to_cmyk_array(band)
+        out[y0:y0 + rows] = clamp_total_ink_coverage(band, tac_limit)
+    return out
+
+
 def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300,
                      tac_limit: float = TAC_THRESHOLD_DEFAULT) -> dict:
     """Convert image to CMYK color space at target DPI, flatten transparency,
@@ -423,14 +458,17 @@ def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300,
         # Convert RGB to CMYK with real K-channel extraction -- see
         # rgb_array_to_cmyk_array's docstring for why PIL's own .convert("CMYK")
         # is unsafe to use here (it fakes black with 300% stacked ink).
+        # Both steps below are strictly per-pixel, so they run in horizontal bands
+        # (see _cmyk_in_bands) -- identical output, but peak memory stays small instead
+        # of needing several full-image float64 copies (~1.5 GB for a 10.6 MP cover,
+        # which is most of a 2 GB server).
         if img.mode == "RGB":
-            cmyk_arr = rgb_array_to_cmyk_array(np.array(img))
+            cmyk_arr = _cmyk_in_bands(np.array(img), tac_limit, from_rgb=True)
         elif img.mode != "CMYK":
             img = img.convert("CMYK")
-            cmyk_arr = np.array(img)
+            cmyk_arr = _cmyk_in_bands(np.array(img), tac_limit, from_rgb=False)
         else:
-            cmyk_arr = np.array(img)
-        cmyk_arr = clamp_total_ink_coverage(cmyk_arr, tac_limit)
+            cmyk_arr = _cmyk_in_bands(np.array(img), tac_limit, from_rgb=False)
         img = Image.fromarray(cmyk_arr, mode="CMYK")
         # Save as TIFF with 300 DPI (CMYK support)
         img.save(output_path, format="TIFF", dpi=(target_dpi, target_dpi), compression="tiff_lzw")

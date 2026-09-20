@@ -17,7 +17,7 @@ import bcrypt
 import jwt
 import stripe
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 try:
@@ -40,7 +40,7 @@ from file_processor import (
 )
 from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
-from pdfx_validator import run_pdf_structure_audit, check_interior_safety_margins, check_cover_safety_margins
+from pdfx_validator import run_pdf_structure_audit, check_interior_safety_margins, check_cover_safety_margins, ocr_status
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
 from report_export import generate_audit_report_pdf, generate_audit_brief_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
@@ -53,6 +53,7 @@ from beta_engine import (
 from series_engine import check_series_consistency
 from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
 from image_upscale_engine import upscale_to_size
+import autofix_agents
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -87,8 +88,12 @@ class MemoryCollection:
     async def create_index(self, *args, **kwargs):
         return None
 
-    async def find_one(self, filter=None):
-        for doc in self._docs:
+    async def find_one(self, filter=None, sort=None):
+        docs = self._docs
+        if sort:  # real Mongo honours sort=[(field, direction)]; mirror it so local runs match
+            for field, direction in reversed(sort):
+                docs = sorted(docs, key=lambda d: d.get(field, "") or "", reverse=direction != 1)
+        for doc in docs:
             if all(doc.get(key) == value for key, value in (filter or {}).items()):
                 # Shallow-copy before returning -- see the note on
                 # MemoryCursor.__anext__ above. Without this, code like
@@ -228,7 +233,12 @@ BASIC_CHECK_MAX_PAGES = 1
 # down for every user, not just the one who triggered it. REQUEST_TIMEOUT_S
 # is set well under Cloudflare's ceiling so a slow request fails fast with a
 # real, friendly error instead of hanging into a 524.
-REQUEST_TIMEOUT_S = 45.0
+# Launch-week guard rail, currently LIFTED on the owner's instruction ("correct,
+# not fast"): with SPARKPREP_TIME_LIMITS unset/off, the ceiling below is only a
+# 30-minute backstop against a wedged job. Set SPARKPREP_TIME_LIMITS=on to
+# restore the original 45s behaviour everywhere (this and the verified
+# auto-fix pipeline share the one switch).
+REQUEST_TIMEOUT_S = 45.0 if autofix_agents.common.time_limits_on() else autofix_agents.common.NO_LIMIT_CEILING_S
 
 
 class RequestTimeoutMiddleware(BaseHTTPMiddleware):
@@ -1340,6 +1350,161 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
     return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "interior_margin_fix": interior_margin_fix, "check_type": "basic"}
 
 
+# ---- Verified auto-fix (four-agent pipeline) ----
+# The repair engine above (autofix) is unchanged. This is the outside layer
+# around it: Agent 1 confirms the problem is real, Agent 2 runs autofix(),
+# Agent 3 independently verifies the result, Agent 4 audits the whole trail
+# -- and the customer watches all of it live. See backend/autofix_agents/.
+_BG_TASKS: set = set()
+SUPERVISOR_MODEL = os.environ.get("ANTHROPIC_SUPERVISOR_MODEL", "claude-haiku-4-5-20251001")
+
+
+def _resolve_slot_target(p: dict, slot: Optional[str]) -> tuple:
+    """(stored_filename, current_metadata) for the file autofix would act on --
+    same resolution as autofix()'s own opening block."""
+    if slot:
+        if slot not in ALLOWED_SLOTS:
+            raise HTTPException(400, f"Unknown slot: {slot}")
+        slot_data = (p.get("slots") or {}).get(slot)
+        if not slot_data or not slot_data.get("stored_filename"):
+            raise HTTPException(404, f"No uploaded file in slot '{slot}'")
+        return slot_data["stored_filename"], slot_data
+    if not p.get("uploaded_file"):
+        raise HTTPException(404, "No uploaded file")
+    return p["uploaded_file"], p.get("file_metadata", {})
+
+
+def _scan_slot_sync(p: dict, slot: Optional[str], stored_filename: str) -> dict:
+    """A fresh, from-scratch scan of one stored file -- the same checks (with
+    the same parameters) autofix()'s own final re-check and the upload scan
+    use. Blocking; callers run it through a worker thread with a time limit."""
+    file_path = UPLOAD_DIR / stored_filename
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    metadata = analyze_file(str(file_path))
+    effective_slot = slot or "full_wrap"
+    final_w, final_h = _target_inches_for_slot(p, effective_slot)
+    spine_kwargs = {}
+    if effective_slot == "full_wrap":
+        geom = _full_wrap_geometry(p)
+        spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                         "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
+    compliance = run_compliance_checks(
+        metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
+        file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+        final_w=final_w, final_h=final_h, **spine_kwargs,
+    )
+    structure = []
+    if metadata.get("is_pdf"):
+        structure = run_pdf_structure_audit(str(file_path), plat.get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
+    return {"metadata": metadata, "compliance": compliance, "structure": structure}
+
+
+@api_router.post("/projects/{project_id}/autofix/verified")
+async def autofix_verified(project_id: str, slot: str = None, stream: bool = True, user: dict = Depends(get_current_user)):
+    """Auto-fix with independent verification and live progress.
+
+    stream=true (default) returns newline-delimited JSON events as each agent
+    works, ending with a `result` event; stream=false runs the same pipeline
+    and returns the final result plus the full audit trail as one JSON body.
+    Either way the fix is only kept if Agent 3 and Agent 4 approve it --
+    otherwise the file and project record are rolled back."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    _resolve_slot_target(p, slot)  # fail fast (404/400) exactly like autofix()
+    if not autofix_agents.try_claim(project_id, slot):
+        raise HTTPException(409, "An auto-fix is already running for this file - hang tight.")
+
+    async def get_project():
+        return await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+
+    async def save_fields(fields: dict, unset: list):
+        upd = {}
+        if fields:
+            upd["$set"] = fields
+        if unset:
+            upd["$unset"] = {k: "" for k in unset}
+        if upd:
+            await db.projects.update_one({"_id": ObjectId(project_id)}, upd)
+
+    async def log(stage, exc, context):
+        await log_failure(db, stage, exc, project_id=project_id, user_id=user["id"], context=context)
+
+    ai_review = None
+    if ANTHROPIC_API_KEY:
+        async def ai_review(summary):
+            return await autofix_agents.anthropic_review(summary, api_key=ANTHROPIC_API_KEY, model=SUPERVISOR_MODEL)
+
+    deps = autofix_agents.Deps(
+        project_id=project_id, slot=slot, user_id=user["id"], upload_dir=UPLOAD_DIR,
+        get_project=get_project, save_fields=save_fields, resolve_target=_resolve_slot_target,
+        scan_fn=_scan_slot_sync,
+        repair_fn=lambda: autofix(project_id=project_id, slot=slot, user=user),
+        ai_review=ai_review, log=log,
+        budget_s=(85.0 if stream else REQUEST_TIMEOUT_S - 5.0) if autofix_agents.common.time_limits_on() else REQUEST_TIMEOUT_S,
+    )
+    queue: asyncio.Queue = asyncio.Queue()
+    # Detached from the HTTP response on purpose: if the customer closes the
+    # tab mid-run, the pipeline still finishes -- including its rollback --
+    # instead of being cancelled half-way with a repair applied but unverified.
+    task = asyncio.create_task(autofix_agents.run(deps, queue.put_nowait))
+    _BG_TASKS.add(task)
+
+    def _done(t):
+        _BG_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("verified autofix crashed: %r", t.exception())
+            queue.put_nowait({"type": "result", "agent": 0, "message": "Something went wrong.", "data": {
+                "pipeline": {"status": "error", "message": "Something unexpected went wrong. Please try again."}}})
+    task.add_done_callback(_done)
+
+    if not stream:
+        return await task
+
+    async def events():
+        while True:
+            ev = await queue.get()
+            yield _json.dumps(ev, default=str) + "\n"
+            if ev.get("type") == "result":
+                return
+
+    return StreamingResponse(events(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+
+
+@api_router.post("/projects/{project_id}/autofix/confirm")
+async def autofix_confirm(project_id: str, slot: str = None, user: dict = Depends(get_current_user)):
+    """The customer's "press Enter for system confirmation" step: re-runs the
+    original scan from scratch on the file as it is saved right now, stores
+    that fresh result as the project's current compliance, and returns it --
+    so the number the customer ends on is a brand-new measurement, not a
+    carried-over claim."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    stored_filename, current = _resolve_slot_target(p, slot)
+    scan = await run_with_timeout(_scan_slot_sync, p, slot, stored_filename)
+    compliance = scan["compliance"]
+    metadata = {**{k: v for k, v in current.items() if k != "compliance"}, **scan["metadata"]}
+    now = datetime.now(timezone.utc).isoformat()
+    if slot:
+        slots = p.get("slots") or {}
+        slots[slot] = {**metadata, "compliance": compliance}
+        update = {"slots": slots, "updated_at": now}
+        if slot == "full_wrap":
+            update.update({"uploaded_file": metadata.get("stored_filename", stored_filename),
+                           "file_metadata": metadata, "compliance": compliance})
+    else:
+        update = {"file_metadata": metadata, "compliance": compliance, "updated_at": now}
+        if (p.get("slots") or {}).get("full_wrap"):
+            slots = p["slots"]
+            slots["full_wrap"] = {**metadata, "compliance": compliance}
+            update["slots"] = slots
+    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
+    return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "check_type": "basic"}
+
+
 @api_router.post("/projects/{project_id}/final-review")
 async def final_review(project_id: str, user: dict = Depends(get_current_user)):
     """One last combined check across every file the project actually
@@ -2333,7 +2498,9 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
 
 @api_router.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    # "status" stays "ok" for the host's health probe; "ocr" makes a silently
+    # disabled cover text-margin check visible (see pdfx_validator.ocr_status).
+    return {"status": "ok", "ocr": ocr_status()}
 
 
 @api_router.get("/season")

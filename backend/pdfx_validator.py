@@ -14,6 +14,7 @@ Each check returns a finding in the same shape audit_engine.py uses
 fix_tools, est_fix_minutes, one_click_fix) or a list of findings, so
 these can be merged directly into the existing deep_audit() output.
 """
+import logging
 import io
 from typing import List, Optional
 import pikepdf
@@ -611,6 +612,28 @@ def check_interior_safety_margins(
 # recommendation but above the floor), not a single fail/pass line.
 COVER_SAFETY_MARGIN_RECOMMENDED_IN = 0.25
 COVER_SAFETY_MARGIN_FLOOR_IN = 0.125
+_OCR_LOG = logging.getLogger("sparkprep.ocr")
+_OCR_STATUS_CACHE = {"at": 0.0, "value": None}
+
+
+def ocr_status() -> dict:
+    """Is the text-recognition engine that powers the cover margin checks actually
+    usable right now? Exposed on /api/health so a silently-skipped check is visible.
+    Cached for 60s (it shells out to the tesseract binary)."""
+    import time
+    now = time.monotonic()
+    if _OCR_STATUS_CACHE["value"] is not None and now - _OCR_STATUS_CACHE["at"] < 60:
+        return _OCR_STATUS_CACHE["value"]
+    try:
+        import pytesseract
+        value = {"available": True, "version": str(pytesseract.get_tesseract_version())}
+    except Exception as e:  # noqa: BLE001
+        value = {"available": False, "error": f"{type(e).__name__}: {e}"[:200]}
+        _OCR_LOG.error("OCR engine unavailable: %s", value["error"])
+    _OCR_STATUS_CACHE.update(at=now, value=value)
+    return value
+
+
 _COVER_OCR_MIN_CONFIDENCE = 40
 _COVER_OCR_DPI = 200
 
@@ -653,8 +676,11 @@ def check_cover_safety_margins(
     try:
         import pytesseract
         from PIL import Image
-    except Exception:
-        return []  # OCR stack unavailable -- don't block the rest of compliance on this
+    except Exception as e:
+        # Still doesn't block the rest of compliance, but no longer silent: a cover
+        # that "passes" only because the text check never ran is a false all-clear.
+        _OCR_LOG.error("Cover text-margin check SKIPPED: OCR stack not importable (%r)", e)
+        return []
 
     try:
         if is_pdf:
@@ -681,8 +707,10 @@ def check_cover_safety_margins(
 
     try:
         data = pytesseract.image_to_data(image, config="--psm 11", output_type=pytesseract.Output.DICT)
-    except Exception:
-        return []  # Tesseract not available/failed at runtime -- don't block the rest of compliance on this
+    except Exception as e:
+        _OCR_LOG.error("Cover text-margin check SKIPPED: Tesseract failed at runtime (%r). "
+                       "Covers are passing this check WITHOUT being checked.", e)
+        return []  # still doesn't block the rest of compliance
 
     has_spine_geometry = spine_x_in is not None and spine_w_in is not None and spine_w_in > 0
     spine_left_in = spine_x_in if has_spine_geometry else None
