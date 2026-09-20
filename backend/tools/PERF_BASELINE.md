@@ -97,3 +97,19 @@ Idle server ~216 MB. Caveat: a real Render container OOM-KILLS the process at th
 MemoryError instead), so the old mode would have taken the API down, not just failed the job.
 Side effect worth knowing: with 1 core, another customer's plain request (health check) waited up to ~9-20 s
 while heavy cover jobs ran (median 0.02 s) -- CPU contention, not memory.
+
+---
+# UPDATE 2026-09-20 (evening): heavy steps moved off the server's main thread
+
+Cause of other customers stalling during heavy jobs: autofix() ran ~a dozen heavy steps (cover text/OCR check,
+interior margin repair, PDF audits, file analysis) directly on the event loop, freezing the whole API while they ran.
+They now run through run_with_timeout (worker thread) — identical results, same code.
+
+Worst wait for another customer's plain request while heavy jobs run (2 GB / 1 core harness):
+| Scenario | Before | After |
+|---|---|---|
+| 1 x 10.6 MP | 2.44 s | 0.44 s |
+| 1 x 27 MP | 17.38 s | 2.10 s |
+| 2 x 10.6 MP | 9.22 s | 1.19 s |
+Peak memory unchanged (482 / 672 / 747 MB); outputs still correct (ink 240.0%, DeviceCMYK); wall time 44 s / 136 s / 74 s.
+Production check after deploying 04f5590: /api/health -> ocr.available=true (Tesseract 5.5.0).

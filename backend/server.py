@@ -1137,7 +1137,8 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         if slot == "interior":
             trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
             plat_name = PLATFORMS.get(p["platform"], {}).get("name", "your distributor")
-            margin_findings = check_interior_safety_margins(
+            margin_findings = await run_with_timeout(
+                check_interior_safety_margins,
                 str(file_path), plat_name, trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES,
             )
             needs_geometry_fix = any(
@@ -1147,7 +1148,8 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 geom_fixed_name = f"{project_id}_interior_marginfixed_{uuid.uuid4().hex[:6]}.pdf"
                 geom_fixed_path = UPLOAD_DIR / geom_fixed_name
                 try:
-                    interior_margin_fix = autofix_interior_safety_margins(
+                    interior_margin_fix = await run_with_timeout(
+                        autofix_interior_safety_margins,
                         str(file_path), str(geom_fixed_path), trim["w"], trim["h"],
                     )
                     interior_margin_fix["attempted"] = True
@@ -1155,6 +1157,8 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     _remove_if_not_original(file_path)
                     file_path = geom_fixed_path
                     stored_filename = geom_fixed_name
+                except HTTPException:
+                    raise
                 except Exception as e:
                     interior_margin_fix = {"attempted": True, "succeeded": False, "reason": str(e)}
                     await log_failure(db, "autofix_interior_margin", e, project_id=project_id, user_id=user["id"])
@@ -1165,7 +1169,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         # flattens transparency and forces CMYK/PDF-X metadata in the same
         # pass). Font embedding and missing ICC profiles aren't safely
         # auto-fixable this way, so those are left as manual guidance.
-        structure_findings = run_pdf_structure_audit(str(file_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
+        structure_findings = await run_with_timeout(run_pdf_structure_audit, str(file_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
         fixable_ids = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent"}
         needs_gs_fix = any(f["id"] in fixable_ids for f in structure_findings)
 
@@ -1176,7 +1180,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     "succeeded": False,
                     "reason": "Ghostscript isn't installed on this server, so live transparency/layers/PDF-X1a declaration couldn't be auto-repaired. These issues still need a manual fix (see fix_steps below) until Ghostscript is set up.",
                 }
-                metadata = analyze_file(str(file_path))
+                metadata = await run_with_timeout(analyze_file, str(file_path))
             else:
                 fixed_name = f"{project_id}_{slot or 'cover'}_gsfixed_{uuid.uuid4().hex[:6]}.pdf"
                 fixed_path = UPLOAD_DIR / fixed_name
@@ -1184,13 +1188,13 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     await run_with_timeout(convert_to_pdfx1a, str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
                     _remove_if_not_original(file_path)
                     file_path = fixed_path
-                    metadata = analyze_file(str(fixed_path))
+                    metadata = await run_with_timeout(analyze_file, str(fixed_path))
                     metadata["original_filename"] = current_metadata.get("original_filename")
                     metadata["stored_filename"] = fixed_name
                     metadata["autofixed"] = True
                     # Re-run the structural audit against the fixed file so the
                     # response reflects what's actually true now, not a promise.
-                    after_findings = run_pdf_structure_audit(str(fixed_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
+                    after_findings = await run_with_timeout(run_pdf_structure_audit, str(fixed_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
                     still_broken_findings = [f for f in after_findings if f["id"] in fixable_ids]
                     still_broken = [f["id"] for f in still_broken_findings]
                     # pdfx1a_not_declared/pdfx1a_missing_output_intent get stamped
@@ -1220,11 +1224,11 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     }
                 except RuntimeError as e:
                     ghostscript_result = {"attempted": True, "succeeded": False, "reason": str(e)}
-                    metadata = analyze_file(str(file_path))
+                    metadata = await run_with_timeout(analyze_file, str(file_path))
                     await log_failure(db, "autofix_ghostscript", e, project_id=project_id, user_id=user["id"],
                                        context={"fixable_ids": [f["id"] for f in structure_findings if f["id"] in fixable_ids]})
         else:
-            metadata = analyze_file(str(file_path))
+            metadata = await run_with_timeout(analyze_file, str(file_path))
     else:
         plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
         # Cover text sitting too close to the trim edge can be pulled back
@@ -1241,7 +1245,8 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             geom = _full_wrap_geometry(p)
             margin_geom_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
                                    "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
-        margin_findings = check_cover_safety_margins(
+        margin_findings = await run_with_timeout(
+            check_cover_safety_margins,
             str(file_path), False, final_w, final_h, plat.get("name", "your distributor"),
             **margin_geom_kwargs,
         )
@@ -1284,7 +1289,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         # file-dependent check (ink coverage, cover-text OCR, DPI) would
         # come back empty regardless of whether the fix actually worked.
         file_path = fixed_path
-        metadata = analyze_file(str(fixed_path))
+        metadata = await run_with_timeout(analyze_file, str(fixed_path))
         metadata["original_filename"] = current_metadata.get("original_filename")
         metadata["stored_filename"] = fixed_name
         metadata["autofixed"] = True
