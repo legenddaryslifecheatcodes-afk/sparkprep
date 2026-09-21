@@ -2180,7 +2180,6 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
-            payment_method_types=["card", "cashapp"],
             line_items=[{
                 "price_data": {
                     "currency": "usd",
@@ -2470,7 +2469,6 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
-            payment_method_types=["card", "cashapp"],
             line_items=[{
                 "price_data": {
                     "currency": "usd",
@@ -2582,6 +2580,14 @@ async def stripe_webhook(request: Request):
             if record.get("product") == "audit_099" and record.get("audit_id"):
                 await db.audits.update_one(
                     {"audit_id": record["audit_id"]},
+                    {"$set": {"paid": True, "paid_at": now_iso}},
+                )
+            elif record.get("product") == "advanced_interior_check":
+                # Unlock from Stripe's own confirmation, not only when the customer's
+                # browser returns to the success page (interior_check_verify) -- someone
+                # who pays and closes the tab must not be charged and left locked out.
+                await db.interior_checks.update_one(
+                    {"session_id": session_id},
                     {"$set": {"paid": True, "paid_at": now_iso}},
                 )
             elif record.get("user_id") and record.get("tier"):
@@ -3694,7 +3700,6 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
-            payment_method_types=["card", "cashapp"],
             line_items=[{
                 "price_data": {
                     "currency": "usd",
