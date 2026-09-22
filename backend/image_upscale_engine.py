@@ -8,7 +8,10 @@ import io
 import os
 import logging
 import tempfile
+import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
+
+from file_processor import rgb_array_to_cmyk_array
 
 logger = logging.getLogger("sparkprep.upscale")
 
@@ -146,6 +149,18 @@ def upscale_to_size(image_bytes: bytes, target_width_px: int, target_height_px: 
         # same class of bug _render_web_preview() exists to prevent
         # elsewhere in this app. Normalize to RGB before handing off.
         needs_rgb = probe.mode not in ("RGB",)
+        # But losing track of "this was CMYK" here and never restoring it is
+        # its own real bug: Auto-Fix converts a cover to CMYK, the customer
+        # then runs AI Upscale, and the file that comes back is plain RGB
+        # with nothing downstream ever re-converting it -- export() (see
+        # build_print_ready_pdf) trusts whatever mode is currently on disk,
+        # so the final "print-ready" PDF silently ships RGB despite Auto-Fix
+        # having already confirmed the fix. _render_web_preview() already
+        # converts CMYK to RGB on the fly for display without touching the
+        # stored file, so there's no preview-safety reason to keep the
+        # SAVED result in RGB -- only upscale_image()'s own processing
+        # needs an RGB array to work on.
+        was_cmyk = probe.mode == "CMYK"
     # max(w_ratio, h_ratio) is exactly right when the source is already
     # roughly the target's aspect ratio (the normal case: a photo of a
     # cover that's already cover-shaped) -- but a linear-scale cap alone
@@ -192,9 +207,16 @@ def upscale_to_size(image_bytes: bytes, target_width_px: int, target_height_px: 
         with Image.open(out_path) as result:
             if result.mode != "RGB" or result.width != target_width_px or result.height != target_height_px:
                 result = result.convert("RGB").resize((target_width_px, target_height_px), Image.Resampling.LANCZOS)
+            if was_cmyk:
+                # Restore the CMYK-ness lost above -- see the note on
+                # was_cmyk near the top of this function. Uses the same
+                # real-K-channel conversion as Auto-Fix's own convert_to_cmyk
+                # (file_processor.py), not PIL's naive .convert("CMYK").
+                cmyk_arr = rgb_array_to_cmyk_array(np.array(result))
+                result = Image.fromarray(cmyk_arr, mode="CMYK")
             out_buf = io.BytesIO()
             save_kwargs = {"quality": 98, "subsampling": 0}
-            if icc_profile:
+            if icc_profile and not was_cmyk:  # an sRGB ICC profile doesn't apply to a CMYK image
                 save_kwargs["icc_profile"] = icc_profile
             result.save(out_buf, format="JPEG", **save_kwargs)
             return out_buf.getvalue()
