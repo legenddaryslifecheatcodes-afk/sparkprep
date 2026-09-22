@@ -66,7 +66,15 @@ class MemoryCursor:
         self._docs = list(docs)
 
     def sort(self, field, direction=-1):
-        self._docs = sorted(self._docs, key=lambda d: d.get(field, "") or "", reverse=direction != 1)
+        # `d.get(field) or ""` would also catch a real value of 0/False/0.0 as
+        # "missing" (falsy), mixing str and numeric keys and crashing sorted().
+        # Only a truly absent key should fall back to "".
+        self._docs = sorted(self._docs, key=lambda d: d[field] if d.get(field) is not None else "",
+                            reverse=direction != 1)
+        return self
+
+    def limit(self, n):
+        self._docs = self._docs[:n]
         return self
 
     def __aiter__(self):
@@ -97,7 +105,9 @@ class MemoryCollection:
         docs = self._docs
         if sort:  # real Mongo honours sort=[(field, direction)]; mirror it so local runs match
             for field, direction in reversed(sort):
-                docs = sorted(docs, key=lambda d: d.get(field, "") or "", reverse=direction != 1)
+                # See MemoryCursor.sort()'s note above -- same falsy-zero pitfall.
+                docs = sorted(docs, key=lambda d, field=field: d[field] if d.get(field) is not None else "",
+                             reverse=direction != 1)
         for doc in docs:
             if all(doc.get(key) == value for key, value in (filter or {}).items()):
                 # Shallow-copy before returning -- see the note on
