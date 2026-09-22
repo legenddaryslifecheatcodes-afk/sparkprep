@@ -237,6 +237,57 @@ def autofix_cover_safe_margin(input_path: str, output_path: str, worst_margin_in
     }
 
 
+def autofix_spine_text_margin(input_path: str, output_path: str, worst_margin_in: float,
+                              img_w_in: float, img_h_in: float,
+                              spine_x_in: float, spine_w_in: float,
+                              target_margin_in: float) -> dict:
+    """Pulls spine text that OCR flagged as too close to (or across) the spine's own fold
+    lines (check_cover_safety_margins' cover_spine_text_margin finding) back inside the
+    required clearance, without touching the front or back panels.
+
+    Same prepress trick as autofix_cover_safe_margin -- scale inward about a center point,
+    then edge-extend back to the original size -- but confined to just the spine's own
+    horizontal band instead of the whole cover: this problem is spine-local (a page-count/
+    spine-width sizing issue), so shrinking the whole cover around it would needlessly
+    re-shrink the front/back panels and could re-open an outer-margin fix already applied
+    to them earlier in the same Auto-Fix pass.
+    """
+    half_band_in = spine_w_in / 2.0
+    # Same derivation as autofix_cover_safe_margin, one-dimensional and about the spine
+    # band's own center rather than the whole canvas's.
+    denom = half_band_in - worst_margin_in
+    scale = (half_band_in - target_margin_in) / denom if denom > 1e-6 else 1.0
+    scale = float(np.clip(scale, 0.5, 1.0))
+
+    with Image.open(input_path) as img:
+        mode = img.mode
+        w, h = img.size
+        px_per_in = w / img_w_in
+        band_x0 = max(0, round(spine_x_in * px_per_in))
+        band_x1 = min(w, band_x0 + max(2, round(spine_w_in * px_per_in)))
+        band_w = max(2, band_x1 - band_x0)
+        band_x0 = band_x1 - band_w
+
+        arr = np.array(img)
+        band = np.ascontiguousarray(arr[:, band_x0:band_x1])
+        new_band_w = max(1, round(band_w * scale))
+        scaled_band = np.array(Image.fromarray(band, mode=mode).resize((new_band_w, h), Image.LANCZOS))
+
+        pad_left = (band_w - new_band_w) // 2
+        pad_right = band_w - new_band_w - pad_left
+        pad_width = ((0, 0), (pad_left, pad_right)) + (((0, 0),) if scaled_band.ndim == 3 else ())
+        arr[:, band_x0:band_x1] = np.pad(scaled_band, pad_width, mode="edge")
+        Image.fromarray(arr, mode=mode).save(output_path)
+
+    return {
+        "output_path": output_path,
+        "scale_factor": round(scale, 4),
+        "worst_margin_before_in": round(worst_margin_in, 3),
+        "target_margin_in": target_margin_in,
+        "band_px": [band_x0, band_x1],
+    }
+
+
 def autofix_interior_safety_margins(input_path: str, output_path: str,
                                      trim_w_in: float, trim_h_in: float,
                                      target_margin_in: float = 0.6) -> dict:
@@ -482,6 +533,55 @@ def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300,
         }
 
 
+def _shift_interior_pages_for_asymmetric_bleed(source_pdf_path: str, intermediate_path: str,
+                                                trim_w: float, trim_h: float, bleed: float) -> None:
+    """Real interior print bleed is NOT symmetric: per IngramSpark's own File Creation Guide,
+    "Bleed should be added...on the top, bottom and outside edges of the interior pages only.
+    Bleed should not be added to the bind/gutter side." (KDP's guide states the same rule.)
+
+    Before this existed, build_interior_pdf_x1a only re-declared each page's MediaBox/TrimBox to
+    be (trim + bleed*2) on every side WITHOUT moving the page's actual content -- so the real
+    content stayed flush against the page's own original (0,0) corner while the declared TrimBox
+    was centered `bleed` inches inward on every side. Proven empirically (render the exported
+    file and locate a known marker): the declared TrimBox did not correspond to where the content
+    actually was, off by exactly `bleed` in both axes. A distributor trimming to that TrimBox
+    would cut into real content on the bottom/left of every page and leave a spurious blank strip
+    on the top/right -- exactly the "extends outside the safety area" / "not centered" rejection
+    pattern this app exists to prevent, and it affected every interior export.
+
+    Fix: each page keeps its EXISTING trim-sized content untouched (autofix_interior_safety_margins
+    already fit and centered it onto exactly trim_w x trim_h) and is shifted, via a lossless
+    content-stream translation (same technique as autofix_interior_safety_margins -- no
+    rasterizing, no re-flowed text), to sit flush against its own gutter edge, with bleed-width
+    blank margin added on the outer edge and both the top and bottom. Page 1 is the right-hand
+    (recto) page in standard book convention, so odd page numbers have their gutter on the LEFT
+    and even page numbers have their gutter on the RIGHT -- alternating every page, same as a
+    real printed book. The new bleed margin is intentionally left blank (matches the page's own
+    background, plain white for the vast majority of real interiors) rather than attempting to
+    synthesize extended background art, which would require rasterizing -- a genuinely different,
+    harder problem this vector-preserving pipeline doesn't attempt; a page with real full-bleed
+    background art needs that art authored into the file already (see the docstring below).
+    """
+    new_w_pt = (trim_w + bleed) * 72.0
+    new_h_pt = (trim_h + bleed * 2) * 72.0
+    bleed_pt = bleed * 72.0
+
+    reader = PdfReader(source_pdf_path)
+    writer = PdfWriter()
+    for i, page in enumerate(reader.pages):
+        odd_page = (i % 2 == 0)  # page index 0 = page number 1 = recto/right-hand = gutter on the LEFT
+        tx = 0.0 if odd_page else bleed_pt
+        page.add_transformation(Transformation().translate(tx, bleed_pt))
+        page.mediabox.lower_left = (0, 0)
+        page.mediabox.upper_right = (new_w_pt, new_h_pt)
+        if page.cropbox:
+            page.cropbox.lower_left = (0, 0)
+            page.cropbox.upper_right = (new_w_pt, new_h_pt)
+        writer.add_page(page)
+    with open(intermediate_path, "wb") as f:
+        writer.write(f)
+
+
 def build_interior_pdf_x1a(
     source_pdf_path: str,
     output_pdf_path: str,
@@ -496,78 +596,94 @@ def build_interior_pdf_x1a(
     """Stream a multi-page manuscript PDF into a real PDF/X-1a:2001 output.
 
     - Preserves vector text and embedded fonts (no rasterization)
-    - Sets MediaBox / TrimBox / BleedBox on every page to (trim + bleed)
+    - Sets MediaBox / TrimBox / BleedBox on every page to the correct ASYMMETRIC interior bleed
+      (bleed on top/bottom/outer edge, none on the gutter edge -- see
+      _shift_interior_pages_for_asymmetric_bleed's docstring for why, and for the page-parity rule)
     - Writes required PDF/X-1a document metadata:
         · /Root/GTS_PDFXVersion = 'PDF/X-1a:2001'
         · /Root/Trapped = /False
         · /Root/OutputIntents (GTS_PDFX, U.S. Web Coated SWOP v2, CGATS TR 001)
         · XMP metadata with pdfx:GTS_PDFXVersion
     """
-    total_w_pts = (trim_w + bleed * 2) * 72
-    total_h_pts = (trim_h + bleed * 2) * 72
-    trim_left_pts = bleed * 72
-    trim_bottom_pts = bleed * 72
-    trim_right_pts = (bleed + trim_w) * 72
-    trim_top_pts = (bleed + trim_h) * 72
+    new_w_pt = (trim_w + bleed) * 72
+    new_h_pt = (trim_h + bleed * 2) * 72
+    bleed_pt = bleed * 72
+    trim_w_pt = trim_w * 72
+    trim_h_pt = trim_h * 72
     profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
 
-    with pikepdf.open(source_pdf_path, allow_overwriting_input=False) as src:
-        page_count = len(src.pages)
+    shifted_path = source_pdf_path + ".bleedshift.pdf"
+    _shift_interior_pages_for_asymmetric_bleed(source_pdf_path, shifted_path, trim_w, trim_h, bleed)
+    try:
+        with pikepdf.open(shifted_path, allow_overwriting_input=False) as src:
+            page_count = len(src.pages)
 
-        # Resize every page and set proper boxes
-        for page in src.pages:
-            page.mediabox = [0, 0, total_w_pts, total_h_pts]
-            page.trimbox = [trim_left_pts, trim_bottom_pts, trim_right_pts, trim_top_pts]
-            page.bleedbox = [0, 0, total_w_pts, total_h_pts]
-            page.cropbox = [0, 0, total_w_pts, total_h_pts]
+            # Resize every page and set proper boxes -- TrimBox tracks the SAME per-page gutter
+            # side _shift_interior_pages_for_asymmetric_bleed just shifted that page's content to.
+            for i, page in enumerate(src.pages):
+                odd_page = (i % 2 == 0)
+                trim_left_pts = 0.0 if odd_page else bleed_pt
+                trim_right_pts = trim_w_pt if odd_page else trim_w_pt + bleed_pt
+                page.mediabox = [0, 0, new_w_pt, new_h_pt]
+                page.trimbox = [trim_left_pts, bleed_pt, trim_right_pts, bleed_pt + trim_h_pt]
+                page.bleedbox = [0, 0, new_w_pt, new_h_pt]
+                page.cropbox = [0, 0, new_w_pt, new_h_pt]
 
-        # XMP metadata block
+            # XMP metadata block
+            try:
+                with src.open_metadata(set_pikepdf_as_editor=False) as meta:
+                    meta["dc:title"] = title
+                    if author:
+                        meta["dc:creator"] = [author]
+                    meta["xmp:CreatorTool"] = f"{producer_name} Book Production Engine"
+                    meta["pdfx:GTS_PDFXVersion"] = "PDF/X-1a:2001"
+                    meta["pdfx:GTS_PDFXConformance"] = "PDF/X-1a:2001"
+                    meta["pdf:Producer"] = f"{producer_name} (pikepdf)"
+                    meta["pdf:Trapped"] = "False"
+            except Exception:
+                pass
+
+            # PDF/X-1a required dictionary entries
+            src.Root.GTS_PDFXVersion = pikepdf.String("PDF/X-1a:2001")
+            src.Root.Trapped = pikepdf.Name("/False")
+
+            # Output intent — required by PDF/X-1a
+            output_intent = pikepdf.Dictionary(
+                Type=pikepdf.Name.OutputIntent,
+                S=pikepdf.Name("/GTS_PDFX"),
+                OutputCondition=pikepdf.String("CMYK"),
+                OutputConditionIdentifier=pikepdf.String(profile["condition_identifier"]),
+                RegistryName=pikepdf.String(profile["registry"]),
+                Info=pikepdf.String(profile["info"]),
+            )
+            src.Root.OutputIntents = pikepdf.Array([output_intent])
+
+            # Remove entries forbidden by PDF/X-1a (currently only /AA — /OpenAction is allowed if benign, /Metadata is REQUIRED by PDF/X-1a for XMP)
+            if "/AA" in src.Root:
+                del src.Root["/AA"]
+
+            # Force PDF version to 1.4 (PDF/X-1a:2001 baseline)
+            try:
+                src.pdf_version = "1.4"
+            except Exception:
+                pass
+
+            src.save(output_pdf_path, linearize=False, min_version="1.4")
+    finally:
         try:
-            with src.open_metadata(set_pikepdf_as_editor=False) as meta:
-                meta["dc:title"] = title
-                if author:
-                    meta["dc:creator"] = [author]
-                meta["xmp:CreatorTool"] = f"{producer_name} Book Production Engine"
-                meta["pdfx:GTS_PDFXVersion"] = "PDF/X-1a:2001"
-                meta["pdfx:GTS_PDFXConformance"] = "PDF/X-1a:2001"
-                meta["pdf:Producer"] = f"{producer_name} (pikepdf)"
-                meta["pdf:Trapped"] = "False"
-        except Exception:
+            os.remove(shifted_path)
+        except OSError:
             pass
-
-        # PDF/X-1a required dictionary entries
-        src.Root.GTS_PDFXVersion = pikepdf.String("PDF/X-1a:2001")
-        src.Root.Trapped = pikepdf.Name("/False")
-
-        # Output intent — required by PDF/X-1a
-        output_intent = pikepdf.Dictionary(
-            Type=pikepdf.Name.OutputIntent,
-            S=pikepdf.Name("/GTS_PDFX"),
-            OutputCondition=pikepdf.String("CMYK"),
-            OutputConditionIdentifier=pikepdf.String(profile["condition_identifier"]),
-            RegistryName=pikepdf.String(profile["registry"]),
-            Info=pikepdf.String(profile["info"]),
-        )
-        src.Root.OutputIntents = pikepdf.Array([output_intent])
-
-        # Remove entries forbidden by PDF/X-1a (currently only /AA — /OpenAction is allowed if benign, /Metadata is REQUIRED by PDF/X-1a for XMP)
-        if "/AA" in src.Root:
-            del src.Root["/AA"]
-
-        # Force PDF version to 1.4 (PDF/X-1a:2001 baseline)
-        try:
-            src.pdf_version = "1.4"
-        except Exception:
-            pass
-
-        src.save(output_pdf_path, linearize=False, min_version="1.4")
 
     return {
         "output_path": output_pdf_path,
         "page_count": page_count,
-        "page_size_inches": [round(trim_w + bleed * 2, 4), round(trim_h + bleed * 2, 4)],
+        # Every page is the SAME overall size -- only which side (left/right) carries the outer
+        # bleed differs by page parity; see _shift_interior_pages_for_asymmetric_bleed.
+        "page_size_inches": [round(trim_w + bleed, 4), round(trim_h + bleed * 2, 4)],
         "trim_box_inches": [round(trim_w, 4), round(trim_h, 4)],
         "bleed_inches": round(bleed, 4),
+        "bleed_convention": "top/bottom/outer edge only, none on the gutter (page 1 = right-hand/recto)",
         "pdf_standard": "PDF/X-1a:2001",
         "vector_preserved": True,
         "fonts_preserved": True,
@@ -870,8 +986,12 @@ def run_compliance_checks(
     checks.append({
         "id": "bleed",
         "label": f"Bleed ({bleed}\" required)",
-        "status": "warning",
-        "message": f"Bleed of {bleed}\" will be added automatically on export",
+        # Always added automatically at export, unconditionally, regardless of what happens here (same
+        # guarantee as pdfx1a below) -- there is no real scenario where this stays unresolved, so it must
+        # never show as a yellow "needs attention" warning; that scared customers into thinking their file
+        # was still broken right next to "you're ready to export".
+        "status": "pass",
+        "message": f"Bleed of {bleed}\" is added automatically on export",
         "auto_fix": True,
         "fix_action": "add_bleed",
     })
@@ -880,8 +1000,10 @@ def run_compliance_checks(
     checks.append({
         "id": "pdfx1a",
         "label": "PDF/X-1a:2001",
-        "status": "warning",
-        "message": "Will be generated on export — print-ready flattened output",
+        # Same guarantee: build_print_ready_pdf/build_interior_pdf_x1a unconditionally (re)stamp PDF/X-1a
+        # metadata at export regardless of anything upstream -- see server.py's ALWAYS_FIXED_AT_EXPORT.
+        "status": "pass",
+        "message": "Generated automatically on export — print-ready flattened output",
         "auto_fix": True,
         "fix_action": "export_pdfx1a",
     })

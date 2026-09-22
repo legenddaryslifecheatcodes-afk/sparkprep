@@ -157,7 +157,9 @@ class TestInteriorPdfX1a:
 
         # ---- response assertions ----
         assert data["page_count"] == 5, f"expected 5 pages, got {data['page_count']}"
-        assert data["page_size_inches"] == [6.25, 9.25]
+        # 6.0+0.125 x 9.0+0.125*2 -- interior bleed is asymmetric (top/bottom/outer edge
+        # only, none on the gutter side), not the old (wrong) symmetric trim+bleed*2 on both axes.
+        assert data["page_size_inches"] == [6.125, 9.25]
         assert data["trim_box_inches"] == [6.0, 9.0]
         assert data["bleed_inches"] == 0.125
         assert data["pdf_standard"] == "PDF/X-1a:2001"

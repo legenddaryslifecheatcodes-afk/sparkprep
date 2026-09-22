@@ -36,11 +36,15 @@ from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks,
     check_total_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
+    autofix_spine_text_margin,
     TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
 )
 from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
-from pdfx_validator import run_pdf_structure_audit, check_interior_safety_margins, check_cover_safety_margins, ocr_status
+from pdfx_validator import (
+    run_pdf_structure_audit, check_interior_safety_margins, check_cover_safety_margins, ocr_status,
+    SPINE_SAFETY_WIDE_IN, SPINE_SAFETY_NARROW_IN, SPINE_WIDTH_TIER_THRESHOLD_IN,
+)
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
 from report_export import generate_audit_report_pdf, generate_audit_brief_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
@@ -54,6 +58,7 @@ from series_engine import check_series_consistency
 from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
 from image_upscale_engine import upscale_to_size
 import autofix_agents
+import book_pass
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -486,6 +491,11 @@ async def get_current_user(request: Request) -> dict:
             raise HTTPException(status_code=401, detail="User not found")
         user["id"] = str(user.pop("_id"))
         user.pop("password_hash", None)
+        if book_pass.book_pass_on():
+            # Book model: a customer who holds a book (unused credit or an open window) gets the plan-locked
+            # features unlocked; everyone else is "free". Admins and beta testers keep what they have.
+            exempt = bool(user.get("beta_active")) or is_admin_user(user)
+            user["tier"] = await book_pass.entitlements.effective_tier(db, user, exempt=exempt)
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -546,6 +556,9 @@ async def get_billing_user(user: dict) -> dict:
         return user
     owner = dict(owner)
     owner["id"] = str(owner.pop("_id"))
+    if book_pass.book_pass_on():
+        owner["tier"] = await book_pass.entitlements.effective_tier(
+            db, owner, exempt=bool(owner.get("beta_active")) or is_admin_user(owner))
     return owner
 
 
@@ -1267,6 +1280,32 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 await log_failure(db, "autofix_cover_margin", e, project_id=project_id, user_id=user["id"],
                                    context={"slot": slot})
 
+        # Spine text sitting too close to (or across) the spine's own fold lines gets its
+        # own pass, confined to just the spine band -- see autofix_spine_text_margin's
+        # docstring for why this is separate from the whole-cover fix above. Applied on top
+        # of margin_source_path (the outer-margin-fixed file, if that ran) since the outer
+        # fix keeps the canvas the same size, so the spine's own inch geometry is still valid.
+        spine_margin_finding = next((f for f in margin_findings if f["id"] == "cover_spine_text_margin"), None)
+        if spine_margin_finding and margin_geom_kwargs.get("spine_w_in"):
+            target_margin_in = SPINE_SAFETY_WIDE_IN if margin_geom_kwargs["spine_w_in"] >= SPINE_WIDTH_TIER_THRESHOLD_IN else SPINE_SAFETY_NARROW_IN
+            spine_fixed_name = f"{project_id}_{slot or 'cover'}_spinefixed_{uuid.uuid4().hex[:6]}{Path(margin_source_path).suffix}"
+            spine_fixed_path = UPLOAD_DIR / spine_fixed_name
+            try:
+                await run_with_timeout(
+                    autofix_spine_text_margin,
+                    str(margin_source_path), str(spine_fixed_path),
+                    spine_margin_finding["pinpoint"]["clearance_in"], final_w, final_h,
+                    margin_geom_kwargs["spine_x_in"], margin_geom_kwargs["spine_w_in"], target_margin_in,
+                )
+                if margin_source_path != file_path:
+                    _remove_if_not_original(margin_source_path)
+                margin_source_path = spine_fixed_path
+            except HTTPException:
+                raise
+            except Exception as e:
+                await log_failure(db, "autofix_spine_margin", e, project_id=project_id, user_id=user["id"],
+                                   context={"slot": slot})
+
         # Convert to CMYK TIFF, clamped to this platform's total-ink-coverage limit
         fixed_name = f"{project_id}_{slot or 'cover'}_fixed_{uuid.uuid4().hex[:6]}.tif"
         fixed_path = UPLOAD_DIR / fixed_name
@@ -1647,20 +1686,31 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     used = billing_user.get("exports_this_month", 0)
     promo_bypass = p.get("promo_access") in ("full_access", "interior_only_access")
     beta_bypass = bool(user.get("beta_active") or billing_user.get("beta_active") or promo_bypass)
-    if not beta_bypass and used >= export_limit:
+    book_model = book_pass.book_pass_on() and not is_admin_user(user)
+    if book_model and not beta_bypass:
+        # Book model: exports are unlimited while THIS book's 7-day window is open, and only then.
+        try:
+            await book_pass.entitlements.require_active_book(db, billing_user["id"], project_id)
+        except book_pass.BookRequired as e:
+            raise HTTPException(402, {"code": "book_required", "has_credit": e.has_credit, "msg": (
+                "Start this book to export (you have a book ready to use)." if e.has_credit
+                else "Buy a book ($74.99) or subscribe ($49.99/month) to export. Cover, interior, or both — same price.")})
+    if book_model:
+        pass                                            # the legacy monthly/per-book/plan limits below do not apply
+    elif not beta_bypass and used >= export_limit:
         raise HTTPException(402, f"Monthly export limit reached ({used}/{export_limit}). Upgrade to continue.")
 
     # Per-book export cap -- flat 5 exports per book, independent of the
     # account's monthly allowance above.
     book_exports_used = p.get("exports_used", 0)
-    if not beta_bypass and book_exports_used >= EXPORTS_PER_BOOK:
+    if not book_model and not beta_bypass and book_exports_used >= EXPORTS_PER_BOOK:
         raise HTTPException(402, f"You have reached the {EXPORTS_PER_BOOK}-export limit for this book.")
 
     # Book counter — this project counts as a "book" the first time it's exported this period
     books_used = billing_user.get("books_this_month", 0)
     books_limit = tier_info["books_per_month"]
     is_new_book = not p.get("first_exported_at")
-    if is_new_book and not beta_bypass:
+    if is_new_book and not beta_bypass and not book_model:
         if books_limit <= 0:
             raise HTTPException(
                 402,
@@ -2148,6 +2198,8 @@ class InteriorCheckCheckoutIn(BaseModel):
 
 @api_router.post("/projects/{project_id}/interior-check/checkout")
 async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckoutIn, user: dict = Depends(get_current_user)):
+    if book_pass.book_pass_on():
+        raise HTTPException(410, "The interior deep-check is now included with every book. Start your book to use it.")
     """One-time purchase for a full structural interior check, up to
     ADVANCED_INTERIOR_MAX_PAGES pages. Priced by the buyer's current
     subscription tier. This is a one-time purchase, not a lifetime license --
@@ -2248,6 +2300,9 @@ async def interior_check_status(project_id: str, user: dict = Depends(get_curren
         {"project_id": project_id, "user_id": user["id"], "paid": True},
         sort=[("created_at", -1)],
     )
+    if not check and book_pass.book_pass_on() and await book_pass.entitlements.project_window(db, user["id"], project_id):
+        return {"paid": True, "check_type": "advanced", "runs_used": 0, "max_runs": ADVANCED_MAX_RUNS,
+                "last_run": None, "is_stale": False, "included_with_book": True}
     if not check:
         return {"paid": False}
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
@@ -2311,6 +2366,15 @@ async def interior_check_run(project_id: str, user: dict = Depends(get_current_u
     if not interior_meta.get("is_pdf"):
         raise HTTPException(400, "Advanced Interior Check only applies to a PDF interior")
 
+    if book_pass.book_pass_on() and not is_admin_user(user):
+        window = await book_pass.entitlements.project_window(db, user["id"], project_id)
+        if not window:
+            raise HTTPException(402, {"code": "book_required", "msg": "Start this book to use the full interior check -- it's included."})
+        if not await db.interior_checks.find_one({"project_id": project_id, "user_id": user["id"], "paid": True}):
+            await db.interior_checks.insert_one({
+                "project_id": project_id, "user_id": user["id"], "session_id": f"book:{window['credit_id']}",
+                "price_cents": 0, "tier_at_purchase": "book", "paid": True, "runs_used": 0, "last_run": None,
+                "created_at": datetime.now(timezone.utc).isoformat()})
     check = await db.interior_checks.find_one(
         {"project_id": project_id, "user_id": user["id"], "paid": True},
         sort=[("created_at", -1)],
@@ -2456,6 +2520,8 @@ async def redeem_promo_code(project_id: str, payload: RedeemPromoIn, user: dict 
 # ---- Stripe Payments ----
 @api_router.post("/payments/checkout")
 async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_user)):
+    if book_pass.book_pass_on():
+        raise HTTPException(410, "Plans have changed. See the new pricing page.")
     tier = payload.tier
     if tier not in ("author", "creator_pro", "publisher", "studio"):
         raise HTTPException(400, "Invalid tier")
@@ -2516,7 +2582,19 @@ async def payment_status(session_id: str):
     record = await db.payment_transactions.find_one({"session_id": session_id})
     if not record:
         raise HTTPException(404, "Transaction not found")
-    if record.get("payment_status") != "paid":
+    if record.get("payment_status") != "paid" and record.get("product") in book_pass.NEW_PRODUCTS:
+        try:
+            s = stripe.checkout.Session.retrieve(session_id)
+            if s.payment_status == "paid" or s.status == "complete":
+                await db.payment_transactions.update_one(          # safe to repeat: crediting below is idempotent
+                    {"session_id": session_id},
+                    {"$set": {"status": "completed", "payment_status": "paid",
+                              "updated_at": datetime.now(timezone.utc).isoformat()}})
+                record = await db.payment_transactions.find_one({"session_id": session_id})
+                await book_pass.purchases.on_session_paid(db, stripe, record, s)
+        except stripe.error.StripeError:
+            pass
+    elif record.get("payment_status") != "paid":
         try:
             s = stripe.checkout.Session.retrieve(session_id)
             if s.payment_status == "paid" or s.status == "complete":
@@ -2577,7 +2655,9 @@ async def stripe_webhook(request: Request):
                 {"$set": {"status": "completed", "payment_status": "paid", "updated_at": now_iso}},
             )
             # Route based on product
-            if record.get("product") == "audit_099" and record.get("audit_id"):
+            if record.get("product") in book_pass.NEW_PRODUCTS:
+                await book_pass.purchases.on_session_paid(db, stripe, record, obj)
+            elif record.get("product") == "audit_099" and record.get("audit_id"):
                 await db.audits.update_one(
                     {"audit_id": record["audit_id"]},
                     {"$set": {"paid": True, "paid_at": now_iso}},
@@ -2599,7 +2679,12 @@ async def stripe_webhook(request: Request):
                         "stripe_subscription_id": obj_get("subscription"),
                     }},
                 )
+    elif t == "invoice.paid":
+        await book_pass.purchases.on_invoice_paid(db, stripe, obj)
+    elif t == "checkout.session.expired":
+        await book_pass.purchases.on_session_expired(db, obj)
     elif t == "customer.subscription.deleted":
+        await book_pass.purchases.on_subscription_deleted(db, obj_get("id"))
         # Downgrade the user to free when their subscription cancels
         sub_id = obj_get("id")
         user_doc = await db.users.find_one({"stripe_subscription_id": sub_id})
@@ -3707,7 +3792,7 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
                         "name": "SparkPrep Print Failure Audit",
                         "description": "Full detailed report with pinpointed issues, publisher rules and step-by-step fixes.",
                     },
-                    "unit_amount": AUDIT_PRICE_CENTS,
+                    "unit_amount": book_pass.audit_price_cents(AUDIT_PRICE_CENTS),
                 },
                 "quantity": 1,
             }],
@@ -3722,7 +3807,7 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
     await db.payment_transactions.insert_one({
         "session_id": session.id,
         "audit_id": audit_id,
-        "amount": AUDIT_PRICE_CENTS,
+        "amount": book_pass.audit_price_cents(AUDIT_PRICE_CENTS),
         "currency": "usd",
         "status": "initiated",
         "payment_status": "pending",
@@ -3970,6 +4055,15 @@ async def admin_revoke_pass(code: str, _: dict = Depends(require_admin)):
 
 
 
+async def _find_owned_project(project_id: str, user: dict):
+    try:
+        return await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    except Exception:  # noqa: BLE001 - malformed id
+        return None
+
+
+api_router.include_router(book_pass.build_router(db=db, get_current_user=get_current_user, stripe=stripe,
+                                                 find_project=_find_owned_project))
 app.include_router(api_router)
 
 app.add_middleware(RequestTimeoutMiddleware)

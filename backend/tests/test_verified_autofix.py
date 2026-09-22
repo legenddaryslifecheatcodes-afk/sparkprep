@@ -516,3 +516,145 @@ def test_audit_workflow_never_repairs():
                     "clamp_total_ink_coverage", "build_print_ready_pdf", "build_interior_pdf_x1a", "upscale_to_size", "autofix_agents", "autofix("]
     hit = [r for r in repair_calls if re.search(re.escape(r), src)]
     assert not hit, f"audit code references repair functions: {hit}"
+
+
+# ------------------------------------------------------------------ spine text autofix
+def test_spine_margin_autofix_is_local_to_the_spine_band_only(tmp_path):
+    """autofix_spine_text_margin must pull a spine-edge violation back inside the required
+    clearance while leaving every pixel outside the spine band bit-for-bit unchanged (front/
+    back panels, and an outer-margin fix already applied to them, must survive untouched)."""
+    import numpy as np
+    import file_processor as fp
+
+    W, H = 3000, 1800
+    spine_x_in, spine_w_in = 5.0, 0.5          # a full wrap where the spine sits at x=5.0..5.5in
+    total_w_in = 12.0
+    px_per_in = W / total_w_in
+    arr = np.zeros((H, W, 3), dtype=np.uint8)
+    arr[:, :, 0] = 40                          # a distinct "front/back panel" background colour
+    band_x0, band_x1 = round(spine_x_in * px_per_in), round((spine_x_in + spine_w_in) * px_per_in)
+    arr[:, band_x0:band_x1] = (0, 200, 0)      # a different "spine panel" background colour
+    marker_x = band_x0 + 4                     # a "word" hugging the LEFT fold line of the spine
+    arr[H // 2 - 20:H // 2 + 20, marker_x:marker_x + 10] = (255, 255, 255)
+    src = tmp_path / "cover.tif"
+    fp.Image.fromarray(arr, mode="RGB").save(src, "TIFF")
+
+    worst_margin_in = (marker_x - band_x0) / px_per_in   # ~0.013in: well inside the required 0.0625in
+    out = tmp_path / "fixed.tif"
+    result = fp.autofix_spine_text_margin(str(src), str(out), worst_margin_in, total_w_in, H / px_per_in,
+                                          spine_x_in, spine_w_in, target_margin_in=0.0625)
+    assert result["scale_factor"] < 1.0
+
+    with fp.Image.open(out) as im:
+        assert im.size == (W, H)
+        fixed = np.array(im)
+
+    # Outside the spine band, every single pixel must be identical to the source -- proof the
+    # fix never touched the front/back panels.
+    assert (fixed[:, :band_x0] == arr[:, :band_x0]).all()
+    assert (fixed[:, band_x1:] == arr[:, band_x1:]).all()
+
+    # Inside the band, the white marker must have moved right, off the fold line, by at least
+    # the required clearance (measured the same way the OCR check itself measures it).
+    white_cols = np.where((fixed[H // 2] == (255, 255, 255)).all(axis=-1))[0]
+    assert white_cols.size > 0, "the marker must not have been erased, only moved"
+    new_clearance_in = (white_cols.min() - band_x0) / px_per_in
+    assert new_clearance_in >= 0.0625 - 1e-6, f"clearance only {new_clearance_in:.4f}in"
+    # ...and it must still be a real, recognisable white block (LANCZOS softens hard edges by a
+    # few units, same as elsewhere in this codebase -- not smeared away into the green background).
+    block = fixed[H // 2, white_cols.min():white_cols.max() + 1]
+    assert (block.astype(int).mean(axis=-1) > 200).all(), block.tolist()
+
+
+def test_spine_margin_autofix_never_grows_a_violation(tmp_path):
+    """A pathological (near-zero-width) spine must clamp to a safe scale rather than collapsing
+    the band or blowing up -- clip range in the implementation covers this, this proves it holds."""
+    import numpy as np
+    import file_processor as fp
+    W, H = 400, 300
+    arr = np.full((H, W, 3), 40, dtype=np.uint8)
+    src = tmp_path / "c.tif"; fp.Image.fromarray(arr, mode="RGB").save(src, "TIFF")
+    out = tmp_path / "o.tif"
+    # Deliberately pathological: clearance already negative and larger in magnitude than the
+    # whole spine half-width -- must not crash, and must still return a usable image.
+    r = fp.autofix_spine_text_margin(str(src), str(out), -5.0, 12.0, 9.0, 5.0, 0.1, target_margin_in=0.0625)
+    assert 0.5 <= r["scale_factor"] <= 1.0
+    with fp.Image.open(out) as im:
+        assert im.size == (W, H)
+
+
+def test_ingramspark_spine_text_threshold_matches_across_the_app(client):
+    """print_specs.PLATFORMS (informational, surfaced to the UI and the AI assistant) must never
+    drift from pdfx_validator's own enforced threshold (the actual compliance-check gate) --
+    that drift is exactly the bug that told customers/the assistant 80 pages while the real
+    check enforced 48, straight from IngramSpark's own published guidelines."""
+    import pdfx_validator as pv
+    assert server.PLATFORMS["ingramspark"]["spine_text_min_pages"] == pv.SPINE_TEXT_MIN_PAGES_PERFECT_BOUND == 48
+    assert server.PLATFORMS["ingramspark"]["barcode_zone"] == {"w": 1.75, "h": 1.0}
+    r = client.post("/api/specs/spine", json={"page_count": 47, "paper_type": "white_50lb", "trim_size": "6x9",
+                                              "binding": "paperback", "platform": "ingramspark"})
+    assert r.json()["spine_text_allowed"] is False
+    r = client.post("/api/specs/spine", json={"page_count": 48, "paper_type": "white_50lb", "trim_size": "6x9",
+                                              "binding": "paperback", "platform": "ingramspark"})
+    assert r.json()["spine_text_allowed"] is True
+
+
+# ------------------------------------------------------------------ interior bleed alignment
+def test_interior_bleed_is_asymmetric_and_content_lands_exactly_on_the_trimbox(tmp_path):
+    """The bug this catches: build_interior_pdf_x1a used to re-declare every page's boxes as
+    symmetric (trim + bleed on all 4 sides) WITHOUT shifting the page's actual content, so the
+    declared TrimBox never corresponded to where the real content sat (off by exactly `bleed` in
+    both axes) -- a distributor trimming to that TrimBox would cut into real content on the
+    bottom/left of every single page. Per IngramSpark's and KDP's own file guides, interior bleed
+    is asymmetric anyway: top/bottom/outer edge only, none on the gutter side, alternating by
+    page parity (page 1 = recto/right-hand = gutter on the left).
+
+    Proven the same way the bug itself was found: draw markers at known positions on a real page,
+    export, then measure exactly where they land relative to the declared TrimBox.
+    """
+    import numpy as np
+    import pymupdf
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    import file_processor as fp
+
+    trim_w, trim_h, bleed = 6.0, 9.0, 0.125
+    src = tmp_path / "src.pdf"
+    c = canvas.Canvas(str(src), pagesize=(trim_w * inch, trim_h * inch))
+    for _ in range(2):                                          # page 1 (odd/recto) and page 2 (even/verso)
+        c.setFillColorRGB(1, 0, 0)
+        c.rect(0, 0, 0.3 * inch, 0.3 * inch, fill=1, stroke=0)                        # at the page's own left edge
+        c.setFillColorRGB(0, 0.6, 0)
+        c.rect((trim_w - 0.3) * inch, 0, 0.3 * inch, 0.3 * inch, fill=1, stroke=0)    # at the page's own right edge
+        c.showPage()
+    c.save()
+
+    out = tmp_path / "out.pdf"
+    result = fp.build_interior_pdf_x1a(str(src), str(out), trim_w, trim_h, bleed, title="T")
+    assert result["page_size_inches"] == [round(trim_w + bleed, 4), round(trim_h + bleed * 2, 4)]
+    assert not (tmp_path / ("src.pdf.bleedshift.pdf")).exists(), "the intermediate shifted file must be cleaned up"
+
+    doc = pymupdf.open(str(out))
+    for i in range(2):
+        page = doc[i]
+        gutter_left = (i % 2 == 0)                                # odd page number = recto = gutter on the left
+        tb = page.trimbox
+        assert round(tb.width / 72, 4) == trim_w and round(tb.height / 72, 4) == trim_h
+        # The side WITHOUT bleed must be flush with the page edge; the other side gets exactly `bleed`.
+        if gutter_left:
+            assert tb.x0 == 0 and round((page.mediabox.x1 - tb.x1) / 72, 4) == bleed
+        else:
+            assert round(tb.x0 / 72, 4) == bleed and tb.x1 == page.mediabox.x1
+        assert round(tb.y0 / 72, 4) == bleed and round((page.mediabox.y1 - tb.y1) / 72, 4) == bleed
+
+        pix = page.get_pixmap(dpi=150, colorspace=pymupdf.csRGB)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        red = (arr[:, :, 0] > 200) & (arr[:, :, 1] < 60) & (arr[:, :, 2] < 60)
+        green = (arr[:, :, 1] > 140) & (arr[:, :, 0] < 60) & (arr[:, :, 2] < 60)
+        tb_left_px, tb_right_px = tb.x0 / 72 * 150, tb.x1 / 72 * 150
+        tb_bottom_px = pix.height - tb.y0 / 72 * 150               # PDF y grows up, image y grows down
+        ys, xs = np.where(red)
+        assert xs.size and abs(xs.min() - tb_left_px) <= 3, f"page {i+1}: red marker not flush with TrimBox's left edge"
+        assert abs(ys.max() - tb_bottom_px) <= 3, f"page {i+1}: red marker not flush with TrimBox's bottom edge"
+        ys, xs = np.where(green)
+        assert xs.size and abs(xs.max() - tb_right_px) <= 3, f"page {i+1}: green marker not flush with TrimBox's right edge"

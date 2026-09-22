@@ -239,10 +239,18 @@ PLATFORMS = {
         "name": "IngramSpark",
         "bleed": 0.125,
         "safe_margin_interior": 0.5,
-        "barcode_zone": {"w": 2.0, "h": 1.2},
+        # Confirmed from IngramSpark's own "Print Book File Guidelines" PDF: "leave 1.75 inches
+        # width x 1 inch height area free of text and graphic elements" for the barcode.
+        "barcode_zone": {"w": 1.75, "h": 1.0},
         "min_page_count": 18,
         "max_page_count": 1200,
-        "spine_text_min_pages": 80,
+        # Confirmed from the same doc: "For page counts below 48, spine text is not available on
+        # paperback covers" -- this was 80 (KDP's own number, apparently copy-pasted), which
+        # disagreed with pdfx_validator.SPINE_TEXT_MIN_PAGES_PERFECT_BOUND (already correctly 48,
+        # and what the real compliance check actually enforces) -- this field is informational
+        # only (surfaced via /api/specs to the UI and the AI assistant), but it was telling
+        # customers and the assistant a threshold 32 pages higher than what the app itself uses.
+        "spine_text_min_pages": 48,
         "pdf_standard": "PDF/X-1a:2001",
     },
     "barnes_noble": {
