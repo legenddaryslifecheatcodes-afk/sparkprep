@@ -33,9 +33,13 @@ def _load_backend_url():
         for ln in envp.read_text().splitlines():
             if ln.startswith("REACT_APP_BACKEND_URL="):
                 return ln.split("=", 1)[1].strip().rstrip("/")
-    raise RuntimeError("REACT_APP_BACKEND_URL not configured")
+    return None
 
 BASE_URL = _load_backend_url()
+if not BASE_URL:
+    pytest.skip("REACT_APP_BACKEND_URL not configured -- this is a live-server "
+                "integration test, meant to run against a deployed backend, not "
+                "as part of the local unit-test suite.", allow_module_level=True)
 API = f"{BASE_URL}/api"
 
 MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")

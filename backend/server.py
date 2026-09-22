@@ -2569,7 +2569,18 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
 async def health_check():
     # "status" stays "ok" for the host's health probe; "ocr" makes a silently
     # disabled cover text-margin check visible (see pdfx_validator.ocr_status).
-    return {"status": "ok", "ocr": ocr_status()}
+    # "disk" closes a real blind spot: the persistent disk at DATA_DIR (every uploaded/exported
+    # file lives there) has no visibility anywhere else -- Render's own metrics don't expose disk
+    # usage, so a slowly-filling disk could go unnoticed until it's suddenly full and every upload
+    # starts failing. Cheap (a single statvfs-style syscall), safe to compute on every health check.
+    disk = None
+    try:
+        total, used, free = shutil.disk_usage(DATA_DIR)
+        disk = {"total_gb": round(total / 1e9, 2), "used_gb": round(used / 1e9, 2), "free_gb": round(free / 1e9, 2),
+                "used_pct": round(used / total * 100, 1)}
+    except OSError:
+        pass
+    return {"status": "ok", "ocr": ocr_status(), "disk": disk}
 
 
 @api_router.get("/season")

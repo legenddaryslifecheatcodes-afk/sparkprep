@@ -7,7 +7,12 @@ import requests
 from reportlab.pdfgen import canvas
 from PIL import Image
 
-BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/") if os.environ.get("REACT_APP_BACKEND_URL") else "https://sparkprep-print.preview.emergentagent.com"
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL")
+if not BASE_URL:
+    pytest.skip("REACT_APP_BACKEND_URL not configured -- this is a live-server "
+                "integration test, meant to run against a deployed backend, not "
+                "as part of the local unit-test suite.", allow_module_level=True)
+BASE_URL = BASE_URL.rstrip("/")
 API = f"{BASE_URL}/api"
 
 TS = int(time.time())

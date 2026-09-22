@@ -2,7 +2,12 @@
 import os, time, io, pytest, requests
 from PIL import Image
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://sparkprep-print.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL")
+if not BASE_URL:
+    pytest.skip("REACT_APP_BACKEND_URL not configured -- this is a live-server "
+                "integration test, meant to run against a deployed backend, not "
+                "as part of the local unit-test suite.", allow_module_level=True)
+BASE_URL = BASE_URL.rstrip("/")
 API = f"{BASE_URL}/api"
 TS = int(time.time())
 EMAIL = f"qa+it7_{TS}@example.com"

@@ -27,13 +27,18 @@ def _base_url():
     if os.environ.get("REACT_APP_BACKEND_URL"):
         return os.environ["REACT_APP_BACKEND_URL"].rstrip("/")
     envp = Path("/app/frontend/.env")
-    for ln in envp.read_text().splitlines():
-        if ln.startswith("REACT_APP_BACKEND_URL="):
-            return ln.split("=", 1)[1].strip().rstrip("/")
-    raise RuntimeError("REACT_APP_BACKEND_URL not configured")
+    if envp.exists():
+        for ln in envp.read_text().splitlines():
+            if ln.startswith("REACT_APP_BACKEND_URL="):
+                return ln.split("=", 1)[1].strip().rstrip("/")
+    return None
 
 
 BASE_URL = _base_url()
+if not BASE_URL:
+    pytest.skip("REACT_APP_BACKEND_URL not configured -- this is a live-server "
+                "integration test, meant to run against a deployed backend, not "
+                "as part of the local unit-test suite.", allow_module_level=True)
 API = f"{BASE_URL}/api"
 def _load_env():
     envp = Path("/app/backend/.env")
@@ -43,6 +48,10 @@ def _load_env():
                 k, v = ln.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 _load_env()
+if not os.environ.get("MONGO_URL") or not os.environ.get("DB_NAME"):
+    pytest.skip("MONGO_URL/DB_NAME not configured -- this is a live-server "
+                "integration test, meant to run against a deployed backend, not "
+                "as part of the local unit-test suite.", allow_module_level=True)
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
 TS = str(int(time.time()))

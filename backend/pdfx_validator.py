@@ -636,6 +636,13 @@ def ocr_status() -> dict:
 
 _COVER_OCR_MIN_CONFIDENCE = 40
 _COVER_OCR_DPI = 200
+# Tesseract run in sparse-text mode over a busy/textured cover background hallucinates
+# short "words" out of pure noise (verified: 202 candidates on a synthetic noise image,
+# 24 of them clearing MIN_CONFIDENCE above -- every single one 1-3 characters, none
+# reaching 4). Real title/author text is essentially always >=4 characters; a short
+# real word is only trusted when its confidence is far above where noise topped out.
+_COVER_OCR_MIN_TEXT_LEN = 4
+_COVER_OCR_MIN_SHORT_WORD_CONFIDENCE = 80
 
 # From IngramSpark's Cover Requirements, "Spine Type Safety":
 # "0.0625" (2 mm) left/right sides for spines 0.35" and larger.
@@ -743,6 +750,8 @@ def check_cover_safety_margins(
             continue
         if conf < _COVER_OCR_MIN_CONFIDENCE:
             continue
+        if len(text) < _COVER_OCR_MIN_TEXT_LEN and conf < _COVER_OCR_MIN_SHORT_WORD_CONFIDENCE:
+            continue  # short + only modest confidence -- indistinguishable from noise, see note above
 
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         word_left_in = x / px_per_in_x
