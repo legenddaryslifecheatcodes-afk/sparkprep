@@ -13,7 +13,8 @@ import os
 
 PASS_WINDOW_DAYS = 7                    # unlimited exports for this long once a book is started
 BOOK_PASS_PRICE_CENTS = 7499            # one book, no subscription
-AUDIT_PRICE_CENTS_BOOK_PASS = 199       # the audit under the new model (legacy stays 99)
+AUDIT_PRICE_CENTS_BOOK_PASS = 199       # the audit under the new model
+AUDIT_PRICE_CENTS_LEGACY = 199          # must equal server.AUDIT_PRICE_CENTS -- /api/pricing shows this in legacy mode
 AUDIT_CREDIT_MAX_CENTS = 199            # what an audit is credited toward a purchase (never more than was paid)
 MAX_ADVANCED_RUNS_PER_WINDOW = 10       # cap on the heavy interior deep-check per started book
 
@@ -50,7 +51,7 @@ def book_pass_on() -> bool:
     return pricing_mode() == "book_pass"
 
 
-def audit_price_cents(legacy_cents: int = 99) -> int:
+def audit_price_cents(legacy_cents: int = AUDIT_PRICE_CENTS_LEGACY) -> int:
     return AUDIT_PRICE_CENTS_BOOK_PASS if book_pass_on() else legacy_cents
 
 

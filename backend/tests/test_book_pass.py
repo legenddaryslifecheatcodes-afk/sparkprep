@@ -369,3 +369,10 @@ def test_checkout_only_ever_returns_to_our_own_sites(client, stripe_fake):
     r = client.post("/api/payments/book-pass", json={"origin_url": "https://evil.example/phish"})
     assert r.status_code == 200
     assert stripe_fake["sessions"][-1]["success_url"].startswith("https://sparkprep.legenddary.com/payment/success")
+
+
+def test_displayed_audit_price_matches_the_charged_price_in_legacy_mode(client, monkeypatch):
+    # /api/pricing is what every page displays; it must equal what the audit checkout actually charges.
+    monkeypatch.delenv("SPARKPREP_PRICING_MODEL", raising=False)
+    assert client.get("/api/pricing").json()["model"] == "legacy"
+    assert client.get("/api/pricing").json()["audit"]["price_cents"] == server.AUDIT_PRICE_CENTS
