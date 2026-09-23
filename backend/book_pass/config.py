@@ -56,12 +56,25 @@ def audit_price_cents(legacy_cents: int = AUDIT_PRICE_CENTS_LEGACY) -> int:
 
 
 def public_pricing() -> dict:
-    """What the pricing page (and anything else that shows a price) reads."""
+    """What the pricing page (and anything else that shows a price) reads. Plans that can't be bought yet are
+    listed as "coming soon" with NO price -- their pricing isn't decided, so nothing may show or quote one."""
     return {
         "model": "book_pass" if book_pass_on() else "legacy",
         "currency": "usd",
         "audit": {"price_cents": audit_price_cents(), "credit_cents": AUDIT_CREDIT_MAX_CENTS,
                   "note": "Credited in full toward your book if you fix it with SparkPrep."},
         "book": {"price_cents": BOOK_PASS_PRICE_CENTS, "window_days": PASS_WINDOW_DAYS, "includes": BOOK_INCLUDES},
-        "plans": [{"id": pid, **p} for pid, p in PLANS.items()],
+        "plans": [{"id": pid, **p} if p["available"] else
+                  {"id": pid, "name": p["name"], "books_per_period": p["books_per_period"], "available": False,
+                   "audience": p["audience"], "price_cents": None, "note": "Coming soon"}
+                  for pid, p in PLANS.items()],
     }
+
+
+def _usd(cents: int) -> str:
+    return f"${cents / 100:.2f}"
+
+
+def book_offer_text() -> str:
+    """The one sentence every "you need to pay for this" message uses, built from the real prices above."""
+    return f"{_usd(BOOK_PASS_PRICE_CENTS)} for one book (cover, interior, or both), or {_usd(PLANS['book_1']['price_cents'])}/month"

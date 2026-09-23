@@ -143,8 +143,10 @@ def test_pricing_is_served_from_one_place_and_bigger_plans_are_coming_soon(clien
     assert p["audit"]["price_cents"] == 199 and p["book"]["price_cents"] == 7499 and p["book"]["window_days"] == 7
     plans = {x["id"]: x for x in p["plans"]}
     assert plans["book_1"]["price_cents"] == 4999 and plans["book_1"]["available"] is True
-    assert plans["book_3"]["price_cents"] == 11999 and plans["book_3"]["available"] is False
-    assert plans["book_10"]["price_cents"] == 29999 and plans["book_10"]["available"] is False
+    # bigger plans are "coming soon" and show NO price (their pricing isn't decided)
+    for pid in ("book_3", "book_10"):
+        assert plans[pid]["available"] is False and plans[pid]["price_cents"] is None and plans[pid]["note"] == "Coming soon"
+    assert [p["id"] for p in p["plans"] if p["price_cents"] is not None] == ["book_1"]
 
 
 def test_legacy_mode_is_untouched_by_default(client, monkeypatch):
@@ -580,3 +582,27 @@ def test_adding_the_other_half_keeps_it_one_book_at_one_price(client):
     assert client.get(f"/api/projects/{pid}/book").json()["active"] is True        # same window, same book
     assert after["available_books"] == before["available_books"]                    # nothing extra spent
     assert len(after["active_windows"]) == len(before["active_windows"])
+
+
+
+def test_the_assistants_price_source_shows_the_book_prices_not_the_retired_plans(client):
+    specs = client.get("/api/specs").json()
+    assert "tiers" not in specs                                    # no Author/Creator Pro/Publisher/Studio prices
+    pr = specs["pricing"]
+    assert pr["audit"]["price_cents"] == 199 and pr["book"]["price_cents"] == 7499
+    assert [p["price_cents"] for p in pr["plans"]] == [4999, None, None]
+
+
+def test_upgrade_messages_quote_the_book_prices_not_old_plan_names(client):
+    r = client.post("/api/ai/blurb", json={"title": "x", "genre": "x", "synopsis": "x"})
+    assert r.status_code in (402, 503), r.text
+    if r.status_code == 402:
+        msg = r.json()["detail"]
+        assert "$74.99" in msg and "$49.99/month" in msg and "Author" not in msg
+    r = client.patch("/api/team/branding", json={"brand_name": "x"})
+    assert r.status_code == 402 and "coming soon" in r.json()["detail"] and "Studio" not in r.json()["detail"]
+
+
+def test_paid_feature_message_wording():
+    msg = server._paid_msg("AI Cover Generation requires the Author plan or higher.", "AI Cover Generation")
+    assert msg == "AI Cover Generation is included with a book — $74.99 for one book (cover, interior, or both), or $49.99/month."

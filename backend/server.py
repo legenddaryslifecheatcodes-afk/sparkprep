@@ -742,7 +742,7 @@ async def create_team_invite(user: dict = Depends(get_current_user)):
     tier = user.get("tier", "free")
     seats = TIERS.get(tier, TIERS["free"])["team_seats"]
     if seats <= 1:
-        raise HTTPException(402, f"Team seats aren't included on the {TIERS.get(tier, {}).get('name', tier)} plan. Upgrade to Publisher (3 seats) or Studio (10 seats).")
+        raise HTTPException(402, _soon_msg(f"Team seats aren't included on the {TIERS.get(tier, {}).get('name', tier)} plan. Upgrade to Publisher (3 seats) or Studio (10 seats).", "Team seats"))
     member_count = await db.users.count_documents({"team_owner_id": user["id"]})
     pending_count = await db.team_invites.count_documents({"owner_id": user["id"], "status": "pending"})
     if 1 + member_count + pending_count >= seats:
@@ -817,7 +817,7 @@ async def set_team_branding(payload: TeamBrandingIn, user: dict = Depends(get_cu
         raise HTTPException(403, "Only the team/billing owner can change branding.")
     tier = user.get("tier", "free")
     if not TIERS.get(tier, TIERS["free"]).get("white_label"):
-        raise HTTPException(402, "White-label branding is a Studio plan feature.")
+        raise HTTPException(402, _soon_msg("White-label branding is a Studio plan feature.", "White-label branding"))
     name = (payload.brand_name or "").strip()[:60]
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"white_label_brand_name": name or None}})
     return {"ok": True, "white_label_brand_name": name or None}
@@ -826,13 +826,29 @@ async def set_team_branding(payload: TeamBrandingIn, user: dict = Depends(get_cu
 # ---- Specs ----
 @api_router.get("/specs")
 async def get_specs():
-    return {
+    out = {
         "platforms": PLATFORMS,
         "trim_sizes": TRIM_SIZES,
         "paper_types": PAPER_TYPES,
         "binding_types": BINDING_TYPES,
-        "tiers": TIERS,
     }
+    # The SparkPrep Assistant reads prices from here -- under the book model it must see the real prices,
+    # never the retired monthly plans.
+    if book_pass.book_pass_on():
+        out["pricing"] = book_pass.public_pricing()
+    else:
+        out["tiers"] = TIERS
+    return out
+
+
+def _paid_msg(legacy: str, feature: str) -> str:
+    """Upgrade message for a paid feature, in whichever pricing model is live."""
+    return f"{feature} is included with a book — {book_pass.book_offer_text()}." if book_pass.book_pass_on() else legacy
+
+
+def _soon_msg(legacy: str, feature: str) -> str:
+    """Team / white-label / bulk tools aren't sold under the book model yet."""
+    return f"{feature} — coming soon." if book_pass.book_pass_on() else legacy
 
 
 @api_router.post("/specs/spine")
@@ -1742,7 +1758,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
         except book_pass.BookRequired as e:
             raise HTTPException(402, {"code": "book_required", "has_credit": e.has_credit, "msg": (
                 "Start this book to export (you have a book ready to use)." if e.has_credit
-                else "Buy a book ($74.99) or subscribe ($49.99/month) to export. Cover, interior, or both — same price.")})
+                else f"To export, get a book — {book_pass.book_offer_text()}.")})
         await _enforce_same_book(window, p, billing_user["id"])
     if book_model:
         pass                                            # the legacy monthly/per-book/plan limits below do not apply
@@ -1975,7 +1991,7 @@ async def _require_batch_enabled(user: dict) -> dict:
     billing_user = await get_billing_user(user)
     tier = billing_user.get("tier", "free")
     if not TIERS.get(tier, TIERS["free"]).get("batch_enabled"):
-        raise HTTPException(402, "Bulk audit + batch export is a Publisher/Studio plan feature.")
+        raise HTTPException(402, _soon_msg("Bulk audit + batch export is a Publisher/Studio plan feature.", "Bulk audit and batch export"))
     return billing_user
 
 
@@ -2874,7 +2890,7 @@ async def manuscript_compose(payload: ComposeIn, user: dict = Depends(get_curren
     # production deliverable, so it must not be free (matches the same rule
     # already enforced on /export).
     if user.get("tier", "free") == "free" and not user.get("beta_active"):
-        raise HTTPException(402, "Interior composition isn't included in the Free plan. Upgrade to Author or higher.")
+        raise HTTPException(402, _paid_msg("Interior composition isn't included in the Free plan. Upgrade to Author or higher.", "Interior composition"))
     if payload.template not in MANUSCRIPT_TEMPLATES:
         raise HTTPException(400, "Unknown template")
     if payload.trim_size not in TRIM_SIZES:
@@ -2933,7 +2949,7 @@ async def generate_blurb(payload: BlurbIn, user: dict = Depends(get_current_user
     # feature (not included in Free) -- same gate shape as /projects/{id}/ai-cover below.
     billing_user = await get_billing_user(user)
     if billing_user.get("tier", "free") == "free":
-        raise HTTPException(402, "AI Blurb Writer requires the Author plan or higher.")
+        raise HTTPException(402, _paid_msg("AI Blurb Writer requires the Author plan or higher.", "AI Blurb Writer"))
     if not ANTHROPIC_API_KEY:
         raise HTTPException(503, "AI Blurb Writer isn't configured yet — add ANTHROPIC_API_KEY to backend/.env")
 
@@ -3107,7 +3123,7 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
     if slot == "interior" and ext in convertible_manuscript_exts:
         promo_bypass = p.get("promo_access") in ("full_access", "interior_only_access")
         if tier == "free" and not (user.get("beta_active") or billing_user.get("beta_active") or promo_bypass):
-            raise HTTPException(402, "Converting a Word/text manuscript into a print-ready interior isn't included in the Free plan. Upgrade to Author or higher, or upload a PDF directly.")
+            raise HTTPException(402, _paid_msg("Converting a Word/text manuscript into a print-ready interior isn't included in the Free plan. Upgrade to Author or higher, or upload a PDF directly.", "Converting a Word/text manuscript into a print-ready interior"))
 
     file_id = f"{project_id}_{slot}_{uuid.uuid4().hex[:6]}{ext}"
     file_path = UPLOAD_DIR / file_id
@@ -3303,7 +3319,7 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
 
     billing_user = await get_billing_user(user)
     if billing_user.get("tier", "free") == "free" and p.get("promo_access") != "full_access":
-        raise HTTPException(402, "AI Cover Generation requires the Author plan or higher.")
+        raise HTTPException(402, _paid_msg("AI Cover Generation requires the Author plan or higher.", "AI Cover Generation"))
     if not OPENAI_API_KEY:
         raise HTTPException(503, "AI Cover Generation isn't configured yet — add OPENAI_API_KEY to backend/.env")
 
@@ -3413,7 +3429,7 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
 
     billing_user = await get_billing_user(user)
     if billing_user.get("tier", "free") == "free" and p.get("promo_access") != "full_access":
-        raise HTTPException(402, "AI Upscale requires the Author plan or higher.")
+        raise HTTPException(402, _paid_msg("AI Upscale requires the Author plan or higher.", "AI Upscale"))
 
     source_path = UPLOAD_DIR / slot_data["stored_filename"]
     if not source_path.exists():
