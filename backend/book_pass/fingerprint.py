@@ -26,7 +26,6 @@ MIN_INTERIOR_WORDS = 60
 MAX_INTERIOR_PAGES = 150
 MIN_COVER_WORDS = 3
 MAX_COVER_WORDS = 400
-COVER_OCR_MAX_PX = 2400
 COVER_OCR_MIN_CONFIDENCE = 65
 
 INTERIOR_SAME = 0.20         # revisions of one manuscript stay far above this
@@ -85,24 +84,15 @@ def interior_signature(pdf_path: str) -> Optional[dict]:
 
 def cover_signature(path: str, is_pdf: bool) -> Optional[dict]:
     try:
-        import pytesseract
-        from PIL import Image
+        import pytesseract  # noqa: F401
+        from pdfx_validator import cover_ocr, _UnreadableCover
     except Exception:
         return None
-    if is_pdf:
-        import fitz
-        doc = fitz.open(path)
-        try:
-            pix = doc[0].get_pixmap(dpi=150, colorspace=fitz.csRGB, alpha=False)
-            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        finally:
-            doc.close()
-    else:
-        image = Image.open(path).convert("RGB")
-    if max(image.size) > COVER_OCR_MAX_PX:
-        scale = COVER_OCR_MAX_PX / max(image.size)
-        image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
-    data = pytesseract.image_to_data(image, config="--psm 11", output_type=pytesseract.Output.DICT)
+    try:
+        # Same cached OCR the compliance checks already ran on this exact file -- usually free by export time.
+        data = cover_ocr(path, is_pdf)["data"]
+    except _UnreadableCover:
+        return None
     found = set()
     for text, conf in zip(data.get("text", []), data.get("conf", [])):
         try:

@@ -468,6 +468,10 @@ def test_banded_cmyk_conversion_is_pixel_identical_to_whole_image(tmp_path, monk
         "grayscale L": Image.fromarray(rng.integers(0, 256, (101, 77), dtype=np.uint8), "L"),
         "palette P": Image.fromarray(rng.integers(0, 256, (101, 77), dtype=np.uint8), "L").convert("P"),
         "already CMYK": Image.fromarray(rng.integers(0, 256, (145, 133, 4), dtype=np.uint8), "CMYK"),
+        # smooth colour fields + grain: lots of repeated colours, so the distinct-colour fast path is taken
+        "photo-like RGB": Image.fromarray(np.clip(np.repeat(np.repeat(rng.integers(0, 256, (12, 16, 3)), 20, 0), 20, 1)
+                                                  + rng.integers(-6, 7, (240, 320, 1)), 0, 255).astype(np.uint8), "RGB"),
+        "photo-like CMYK": Image.fromarray(np.repeat(np.repeat(rng.integers(0, 256, (12, 16, 4), dtype=np.uint8), 20, 0), 20, 1), "CMYK"),
     }
     for n, (name, im) in enumerate(cases.items()):
         src = tmp_path / f"in{n}.tif"
@@ -658,3 +662,38 @@ def test_interior_bleed_is_asymmetric_and_content_lands_exactly_on_the_trimbox(t
         assert abs(ys.max() - tb_bottom_px) <= 3, f"page {i+1}: red marker not flush with TrimBox's bottom edge"
         ys, xs = np.where(green)
         assert xs.size and abs(xs.max() - tb_right_px) <= 3, f"page {i+1}: green marker not flush with TrimBox's right edge"
+
+
+
+def test_cover_ocr_runs_once_per_file_and_rereads_a_changed_file(tmp_path, monkeypatch):
+    """The same stored cover is checked many times per customer flow; OCR must run once per file version."""
+    import os
+    import pytesseract
+    import pdfx_validator as pv
+    real = pytesseract.image_to_data
+    calls = []
+
+    def counting(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+    monkeypatch.setattr(pytesseract, "image_to_data", counting)
+    img = tmp_path / "cover.png"
+    Image.new("RGB", (1900, 1400), (255, 255, 255)).save(img)
+    for _ in range(5):
+        pv.check_cover_safety_margins(str(img), False, 12.63, 9.25, "IngramSpark")
+    assert len(calls) == 1
+    Image.new("RGB", (1900, 1400), (250, 250, 250)).save(img)            # same path, new content
+    os.utime(img, ns=(os.stat(img).st_atime_ns, os.stat(img).st_mtime_ns + 10_000_000))
+    pv.check_cover_safety_margins(str(img), False, 12.63, 9.25, "IngramSpark")
+    assert len(calls) == 2
+
+
+def test_big_image_covers_are_read_at_200_dpi_not_full_resolution(tmp_path, monkeypatch):
+    import pytesseract
+    import pdfx_validator as pv
+    seen = []
+    monkeypatch.setattr(pytesseract, "image_to_data", lambda image, **k: seen.append(image.size) or {"text": [], "conf": []})
+    img = tmp_path / "big.png"
+    Image.new("RGB", (5400, 3960), (255, 255, 255)).save(img)             # ~430 dpi across a 12.63" wrap
+    pv.check_cover_safety_margins(str(img), False, 12.63, 9.25, "IngramSpark")
+    assert abs(seen[0][0] / 12.63 - 200) < 2

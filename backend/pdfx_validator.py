@@ -16,6 +16,9 @@ these can be merged directly into the existing deep_audit() output.
 """
 import logging
 import io
+import os
+import threading
+from collections import OrderedDict
 from typing import List, Optional
 import pikepdf
 
@@ -654,6 +657,69 @@ SPINE_WIDTH_TIER_THRESHOLD_IN = 0.35
 SPINE_TEXT_MIN_PAGES_PERFECT_BOUND = 48
 
 
+class _UnreadableCover(Exception):
+    """The cover file itself couldn't be opened/rendered (other checks already report that)."""
+
+
+# The same stored file gets OCR'd many times in one customer flow (upload scan, Repair Bay triage, the engine's
+# own re-check, independent verification, the Enter rescan, Final Review, the export fingerprint) -- and stored
+# files never change in place (every repair writes a new file), so one OCR per file is enough. Keyed by path +
+# size + modification time, so a file that did change is always read fresh.
+_COVER_OCR_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_COVER_OCR_CACHE_MAX = 24
+_COVER_OCR_LOCK = threading.Lock()
+_COVER_OCR_MAX_PX = 2600  # used only when the caller doesn't know the cover's physical width
+
+
+def cover_ocr(file_path: str, is_pdf: bool, total_w_in: Optional[float] = None) -> dict:
+    """OCR a cover once per file: {"data": tesseract words, "width"/"height": px OCR'd, "pdf_w_in"/"pdf_h_in"}.
+    Images are read at no more than _COVER_OCR_DPI (the resolution PDF covers are already rendered at): more
+    pixels only make tesseract slower, not more accurate, for cover-sized text. Raises _UnreadableCover if the
+    file can't be opened; tesseract errors propagate."""
+    import pytesseract
+    from PIL import Image
+    try:
+        st = os.stat(file_path)
+    except OSError:
+        raise _UnreadableCover()
+    key = (os.path.abspath(file_path), st.st_size, st.st_mtime_ns, bool(is_pdf))
+    with _COVER_OCR_LOCK:
+        hit = _COVER_OCR_CACHE.get(key)
+        if hit is not None:
+            _COVER_OCR_CACHE.move_to_end(key)
+            return hit
+    pdf_w_in = pdf_h_in = None
+    try:
+        if is_pdf:
+            import fitz
+            doc = fitz.open(file_path)
+            try:
+                page = doc[0]
+                pdf_w_in, pdf_h_in = page.rect.width / 72.0, page.rect.height / 72.0
+                pix = page.get_pixmap(dpi=_COVER_OCR_DPI, colorspace=fitz.csRGB, alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            finally:
+                doc.close()
+        else:
+            image = Image.open(file_path).convert("RGB")
+            if total_w_in and total_w_in > 0:
+                dpi_now = image.width / total_w_in
+                scale = _COVER_OCR_DPI / dpi_now if dpi_now > _COVER_OCR_DPI * 1.05 else None
+            else:
+                scale = _COVER_OCR_MAX_PX / max(image.size) if max(image.size) > _COVER_OCR_MAX_PX else None
+            if scale:
+                image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.LANCZOS)
+    except Exception:
+        raise _UnreadableCover()
+    data = pytesseract.image_to_data(image, config="--psm 11", output_type=pytesseract.Output.DICT)
+    result = {"data": data, "width": image.width, "height": image.height, "pdf_w_in": pdf_w_in, "pdf_h_in": pdf_h_in}
+    with _COVER_OCR_LOCK:
+        _COVER_OCR_CACHE[key] = result
+        while len(_COVER_OCR_CACHE) > _COVER_OCR_CACHE_MAX:
+            _COVER_OCR_CACHE.popitem(last=False)
+    return result
+
+
 def check_cover_safety_margins(
     file_path: str, is_pdf: bool, total_w_in: float, total_h_in: float, platform_name: str,
     spine_x_in: Optional[float] = None, spine_w_in: Optional[float] = None,
@@ -681,8 +747,8 @@ def check_cover_safety_margins(
     close to that physical size, same assumption the DPI check already makes.
     """
     try:
-        import pytesseract
-        from PIL import Image
+        import pytesseract  # noqa: F401
+        from PIL import Image  # noqa: F401
     except Exception as e:
         # Still doesn't block the rest of compliance, but no longer silent: a cover
         # that "passes" only because the text check never ran is a false all-clear.
@@ -690,34 +756,23 @@ def check_cover_safety_margins(
         return []
 
     try:
-        if is_pdf:
-            import fitz
-            doc = fitz.open(file_path)
-            try:
-                page = doc[0]
-                img_w_in = page.rect.width / 72.0
-                img_h_in = page.rect.height / 72.0
-                pix = page.get_pixmap(dpi=_COVER_OCR_DPI, colorspace=fitz.csRGB, alpha=False)
-                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            finally:
-                doc.close()
-        else:
-            image = Image.open(file_path).convert("RGB")
-            img_w_in, img_h_in = total_w_in, total_h_in
-    except Exception:
+        ocr = cover_ocr(file_path, is_pdf, total_w_in)
+    except _UnreadableCover:
         return []  # unreadable file -- other checks already cover that
-
-    if img_w_in <= 0 or img_h_in <= 0:
-        return []
-    px_per_in_x = image.width / img_w_in
-    px_per_in_y = image.height / img_h_in
-
-    try:
-        data = pytesseract.image_to_data(image, config="--psm 11", output_type=pytesseract.Output.DICT)
     except Exception as e:
         _OCR_LOG.error("Cover text-margin check SKIPPED: Tesseract failed at runtime (%r). "
                        "Covers are passing this check WITHOUT being checked.", e)
         return []  # still doesn't block the rest of compliance
+
+    if is_pdf:
+        img_w_in, img_h_in = ocr["pdf_w_in"], ocr["pdf_h_in"]
+    else:
+        img_w_in, img_h_in = total_w_in, total_h_in
+    if not img_w_in or not img_h_in or img_w_in <= 0 or img_h_in <= 0:
+        return []
+    px_per_in_x = ocr["width"] / img_w_in
+    px_per_in_y = ocr["height"] / img_h_in
+    data = ocr["data"]
 
     has_spine_geometry = spine_x_in is not None and spine_w_in is not None and spine_w_in > 0
     spine_left_in = spine_x_in if has_spine_geometry else None

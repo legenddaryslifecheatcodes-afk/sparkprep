@@ -6,9 +6,15 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 from PIL import Image, ImageCms
+from reportlab import rl_config
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 from pypdf import PdfReader, PdfWriter, Transformation
+
+# Embed images as raw binary streams, not ASCII85 text. ReportLab's ASCII85 encoder runs in pure Python when its
+# optional C accelerator isn't installed (it isn't, locally or on Render): measured 115 of 123 seconds to export a
+# 21 MP cover. Binary streams are standard PDF (PDF/X-1a included), 25% smaller, and the image data is identical.
+rl_config.useA85 = 0
 import pikepdf
 
 from print_specs import COLOR_PROFILES, DEFAULT_COLOR_PROFILE, calculate_full_cover_dimensions
@@ -114,15 +120,19 @@ def rgb_array_to_cmyk_array(rgb: np.ndarray) -> np.ndarray:
     absent a real profile, and it's what actually matches "black prints as
     100% K" instead of a stacked-ink fake.
     """
-    rgb_f = rgb.astype(np.float64) / 255.0
-    r, g, b = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
-    k = 1.0 - np.maximum(np.maximum(r, g), b)
-    safe_denom = np.where(k < 1.0, 1.0 - k, 1.0)  # avoid divide-by-zero on pure black (k=1)
-    c = np.where(k < 1.0, (1.0 - r - k) / safe_denom, 0.0)
-    m = np.where(k < 1.0, (1.0 - g - k) / safe_denom, 0.0)
-    y = np.where(k < 1.0, (1.0 - b - k) / safe_denom, 0.0)
-    cmyk = np.stack([c, m, y, k], axis=-1)
-    return np.clip(cmyk * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    # With M = max(R, G, B): K = 255 - M, and C = (M - R) / M * 255 (likewise M', Y) -- the same formula as
+    # K = 1 - max(r,g,b), C = (1 - r - K) / (1 - K), restated. Computed in exact integers with round-half-up:
+    # floor(((M - R) * 510 + M) / (2M)). Exhaustively checked over all 16.7M RGB colours: identical to the old
+    # float64 version except 0.84% of colours that sit exactly on a .5 rounding tie, where float64 error
+    # sometimes rounded down -- those now round correctly, 1/255 apart. 2-3x faster, no float temporaries.
+    rgb32 = rgb.astype(np.int32)
+    mx = rgb32.max(axis=-1, keepdims=True)
+    safe = np.maximum(mx, 1)  # pure black (M = 0) -> C = M' = Y = 0, K = 255
+    cmy = np.where(mx > 0, ((mx - rgb32) * 510 + safe) // (2 * safe), 0)
+    out = np.empty(rgb.shape[:-1] + (4,), dtype=np.uint8)
+    out[..., :3] = cmy
+    out[..., 3] = 255 - mx[..., 0]
+    return out
 
 
 # Total (ink) Area Coverage -- the sum of all four CMYK channel percentages
@@ -156,15 +166,18 @@ def clamp_total_ink_coverage(cmyk: np.ndarray, limit_percent: float = TAC_THRESH
     a uint8 (H, W, 4) array (255 = 100% ink), matching
     rgb_array_to_cmyk_array's output.
     """
-    cmyk_f = cmyk.astype(np.float64)
+    # float32 is plenty for 8-bit ink values and ~3-10x faster than float64 here. Checked against the float64
+    # version on all 16.7M RGB-derived colours (0 differences at 240% and 270%) and 16.7M random CMYK values
+    # (<=0.001% differ, by 1/255); in every case no pixel is left over the limit with C/M/Y still present.
+    cmyk_f = cmyk.astype(np.float32)
     c, m, y, k = cmyk_f[..., 0], cmyk_f[..., 1], cmyk_f[..., 2], cmyk_f[..., 3]
-    limit_255 = limit_percent / 100.0 * 255.0
-    total = c + m + y + k
+    limit_255 = np.float32(limit_percent / 100.0 * 255.0)
+    cmy_sum = c + m + y
+    total = cmy_sum + k
     over = total > limit_255
     if not np.any(over):
         return cmyk
 
-    cmy_sum = c + m + y
     # Target a hair under the limit (not exactly at it) and floor rather
     # than round when converting back to uint8 -- rounding to nearest was
     # landing most clamped pixels a fraction of a percent OVER the limit
@@ -482,12 +495,41 @@ def _cmyk_in_bands(arr: np.ndarray, tac_limit: float, from_rgb: bool) -> np.ndar
     h, w = arr.shape[:2]
     out = np.empty((h, w, 4), dtype=np.uint8)
     rows = max(1, _CMYK_BAND_PIXELS // max(w, 1))
+    if from_rgb:
+        def convert(a):
+            return clamp_total_ink_coverage(rgb_array_to_cmyk_array(a), tac_limit)
+    else:
+        def convert(a):
+            return clamp_total_ink_coverage(a, tac_limit)
     for y0 in range(0, h, rows):
-        band = arr[y0:y0 + rows]
-        if from_rgb:
-            band = rgb_array_to_cmyk_array(band)
-        out[y0:y0 + rows] = clamp_total_ink_coverage(band, tac_limit)
+        out[y0:y0 + rows] = _convert_distinct_colours(arr[y0:y0 + rows], convert)
     return out
+
+
+def _convert_distinct_colours(band: np.ndarray, convert) -> np.ndarray:
+    """Run a per-pixel conversion once per DISTINCT colour instead of once per pixel, then scatter the results
+    back. Because `convert` is strictly per-pixel, the output is bit-for-bit what convert(band) gives -- a cover
+    has millions of pixels but far fewer distinct colours, so this skips most of the float work. Falls back to
+    the direct path when colours barely repeat (the sort would cost more than it saves)."""
+    bh, bw, ch = band.shape
+    flat = band.reshape(-1, ch).astype(np.uint32)
+    packed = flat[:, 0] << 16 | flat[:, 1] << 8 | flat[:, 2]
+    if ch == 4:
+        packed = packed << 8 | flat[:, 3]
+    # Cheap early exit for photographic art (measured ~94% distinct colours per band): a small sample already
+    # shows colours barely repeat, so skip the full sort rather than pay for it and fall back anyway.
+    sample = packed[:: max(1, packed.size // 20000)]
+    if np.unique(sample).size > 0.6 * sample.size:
+        return convert(band)
+    uniq, inverse = np.unique(packed, return_inverse=True)
+    if uniq.size > 0.6 * packed.size:
+        return convert(band)
+    if ch == 4:
+        colours = np.stack([uniq >> 24, (uniq >> 16) & 255, (uniq >> 8) & 255, uniq & 255], axis=-1)
+    else:
+        colours = np.stack([uniq >> 16, (uniq >> 8) & 255, uniq & 255], axis=-1)
+    converted = convert(colours.astype(np.uint8)[:, None, :])[:, 0, :]
+    return converted[inverse.reshape(-1)].reshape(bh, bw, 4)
 
 
 def convert_to_cmyk(input_path: str, output_path: str, target_dpi: int = 300,

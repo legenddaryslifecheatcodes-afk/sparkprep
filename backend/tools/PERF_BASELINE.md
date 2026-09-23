@@ -113,3 +113,27 @@ Worst wait for another customer's plain request while heavy jobs run (2 GB / 1 c
 | 2 x 10.6 MP | 9.22 s | 1.19 s |
 Peak memory unchanged (482 / 672 / 747 MB); outputs still correct (ink 240.0%, DeviceCMYK); wall time 44 s / 136 s / 74 s.
 Production check after deploying 04f5590: /api/health -> ocr.available=true (Tesseract 5.5.0).
+
+---
+
+# 2026-09-23 — customer-size files (~11 MB and ~24.5 MB covers, ~10 MB and ~25 MB 300-page interiors)
+
+Measured with `tools/profile_steps.py` (per step, printed live) on photo-like files (smooth colour + grain), owner's
+PC under heavy background load. Three fixes, each checked for correctness before shipping:
+
+| Cover step (11 MB photo cover) | Before | After |
+|---|---|---|
+| Cover text check (OCR), per read | 195 s | 5.7–8 s first read, 0.0 s repeats |
+| OCR reads per customer flow | 6–7 | 2 (original file, repaired file) — cached per file (path+size+mtime) |
+| CMYK conversion + ink clamp | 13.5–18 s | 10 s (24.5 MB cover: 29–36 s -> 18 s) |
+| Export cover PDF/X-1a | 18–26 s | 3.8 s (24.5 MB cover: 43 s -> 7.6 s) |
+| Same-book fingerprint | 6.2 s | 0 s (reuses the cached OCR) |
+
+Causes: (1) OCR re-run on the identical file 6-7x per flow, and image covers OCR'd at full resolution (photo grain
+makes tesseract's sparse-text mode crawl) -- now once per file, at 200 DPI like PDF covers. (2) ReportLab ASCII85-
+encoding every image in pure Python (its C accelerator isn't installed here or on Render) -- now binary streams
+(`rl_config.useA85 = 0`), identical image data, 25% smaller PDFs. (3) CMYK math in float64 -- RGB->CMYK now exact
+integer maths (differs from the old float64 only on 0.84% of colours sitting on a .5 tie, by 1/255, where float64
+rounded wrongly), ink clamp in float32 (0 differences over all 16.7M RGB colours at 240%/270%).
+
+Interiors (10–25 MB, 300 pp): every step under ~10 s (load-dependent); nothing needed.

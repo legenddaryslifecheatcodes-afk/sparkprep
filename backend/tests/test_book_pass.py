@@ -467,7 +467,8 @@ def test_revisions_of_the_same_book_export_freely_but_a_different_book_is_blocke
     assert client.post(f"/api/projects/{pid}/export").status_code == 200
 
 
-def test_support_can_confirm_it_really_is_the_same_book(client):
+def test_support_can_confirm_it_really_is_the_same_book(client, monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_EMAIL", "root-admin@example.com")   # independent of which test file imported server first
     pid = _started_interior_book(client, _manuscript(11))
     assert client.post(f"/api/projects/{pid}/export").status_code == 200
     _upload_interior(client, pid, _manuscript(12))
