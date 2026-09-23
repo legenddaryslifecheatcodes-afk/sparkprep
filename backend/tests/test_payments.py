@@ -144,7 +144,7 @@ def test_audit_099_is_priced_by_the_server_and_unlocks_on_confirmation(client, s
     asyncio.run(server.db.audits.insert_one({"audit_id": "aud_pay_1", "paid": False}))
     r = client.post("/api/audit/aud_pay_1/checkout", json={"origin_url": "https://x.test", "amount": 1})
     assert r.status_code == 200
-    assert stripe_calls[-1]["line_items"][0]["price_data"]["unit_amount"] == server.AUDIT_PRICE_CENTS == 99
+    assert stripe_calls[-1]["line_items"][0]["price_data"]["unit_amount"] == server.AUDIT_PRICE_CENTS == 199
     assert stripe_calls[-1]["mode"] == "payment"
     send(client, completed(stripe_calls[-1]["id"]))
     assert asyncio.run(server.db.audits.find_one({"audit_id": "aud_pay_1"}))["paid"] is True

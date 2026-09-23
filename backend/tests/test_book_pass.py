@@ -152,7 +152,7 @@ def test_legacy_mode_is_untouched_by_default(client, monkeypatch):
     assert client.get("/api/pricing").json()["model"] == "legacy"
     assert client.post("/api/payments/book-pass", json={"origin_url": "https://x"}).status_code == 404
     assert client.get("/api/me/books").status_code == 404
-    assert server.book_pass.audit_price_cents(server.AUDIT_PRICE_CENTS) == 99
+    assert server.book_pass.audit_price_cents(server.AUDIT_PRICE_CENTS) == 199
 
 
 def test_old_plans_and_separate_interior_purchase_are_closed_in_book_mode(client, stripe_fake):

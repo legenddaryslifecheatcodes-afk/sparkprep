@@ -3550,8 +3550,8 @@ async def update_adjustments(project_id: str, payload: ManualAdjustments, user: 
     return {"adjustments": adj}
 
 
-# ---- $0.99 Print Failure Audit (anonymous, one-time payment) ----
-AUDIT_PRICE_CENTS = 99
+# ---- $1.99 Print Failure Audit (anonymous, one-time payment) ----
+AUDIT_PRICE_CENTS = 199
 
 
 class AuditStart(BaseModel):
@@ -3752,7 +3752,7 @@ async def audit_download_report(audit_id: str):
     if not a or not a.get("full_findings"):
         raise HTTPException(404, "Audit not found or not yet run")
     if not a.get("paid"):
-        raise HTTPException(402, "Unlock the full report ($0.99) to download the PDF.")
+        raise HTTPException(402, "Unlock the full report ($1.99) to download the PDF.")
 
     report_path = UPLOAD_DIR.parent / "exports" / f"{audit_id}_report.pdf"
     generate_audit_brief_pdf(
