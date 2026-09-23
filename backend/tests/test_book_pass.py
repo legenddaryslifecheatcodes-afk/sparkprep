@@ -376,3 +376,206 @@ def test_displayed_audit_price_matches_the_charged_price_in_legacy_mode(client, 
     monkeypatch.delenv("SPARKPREP_PRICING_MODEL", raising=False)
     assert client.get("/api/pricing").json()["model"] == "legacy"
     assert client.get("/api/pricing").json()["audit"]["price_cents"] == server.AUDIT_PRICE_CENTS
+
+
+# ---------------------------------------------------------------- same-book protection (one pass = one book)
+import random  # noqa: E402
+
+_VOCAB = ("river lantern quiet harbor sister winter letter garden stone mother silver morning thunder orchard "
+          "promise shadow ribbon captain village window whisper meadow engine candle forest daughter bridge "
+          "copper feather island kettle ladder marble needle pocket saddle timber violet wagon anchor basket "
+          "cellar dragon ember falcon glacier hollow ivory jasper kitten lemon mirror nectar oyster parlor "
+          "quarry raven spindle tulip umber velvet willow yarrow zephyr walked found carried remembered "
+          "opened waited laughed answered followed turned the a of and to in her his their under over across").split()
+
+
+def _manuscript(seed, sentences=260):
+    rnd = random.Random(seed)
+    return [" ".join(rnd.choice(_VOCAB) for _ in range(rnd.randint(8, 14))).capitalize() + "." for _ in range(sentences)]
+
+
+def _revise(sents, seed=7):
+    """What an author does between exports: fix some sentences, cut one, add a short new scene."""
+    rnd = random.Random(seed)
+    out = list(sents)
+    for i in rnd.sample(range(len(out)), len(out) // 8):
+        w = out[i].rstrip(".").split()
+        w[rnd.randrange(len(w))] = rnd.choice(_VOCAB)
+        out[i] = " ".join(w) + "."
+    del out[40]
+    return out + _manuscript(seed + 1000, 15)
+
+
+def _pdf(sentences):
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(6 * inch, 9 * inch))
+    lines, cur = [], ""
+    for word in " ".join(sentences).split():
+        if len(cur) + len(word) + 1 > 55:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}".strip()
+    lines.append(cur)
+    for start in range(0, len(lines), 22):
+        c.setFont("Times-Roman", 11)
+        for i, line in enumerate(lines[start:start + 22]):
+            c.drawString(1.1 * inch, (8.0 - i * 0.3) * inch, line)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _upload_interior(client, pid, sentences):
+    r = client.post(f"/api/projects/{pid}/slot-upload/interior", files={"file": ("b.pdf", _pdf(sentences), "application/pdf")})
+    assert r.status_code == 200, r.text
+
+
+def _started_interior_book(client, sentences):
+    pid = make_project(client)
+    _upload_interior(client, pid, sentences)
+    give_credit(1)
+    assert client.post(f"/api/projects/{pid}/activate-book").status_code == 200
+    return pid
+
+
+def _admin_client():
+    c = TestClient(server.app)
+    r = c.post("/api/auth/login", json={"email": "root-admin@example.com", "password": "TestPass123!"})
+    c.headers["Authorization"] = "Bearer " + r.json()["token"]
+    return c
+
+
+def test_revisions_of_the_same_book_export_freely_but_a_different_book_is_blocked(client):
+    book_a = _manuscript(1)
+    pid = _started_interior_book(client, book_a)
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200                 # first export = baseline
+
+    _upload_interior(client, pid, _revise(book_a))                                      # typo fixes, a cut, a new scene
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200
+
+    _upload_interior(client, pid, _manuscript(2))                                       # a whole different book
+    r = client.post(f"/api/projects/{pid}/export")
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "different_book", r.text
+    assert "start a new book" in r.json()["detail"]["msg"]
+    flags = [f for f in server.db.book_flags._docs if f["project_id"] == pid]
+    assert flags and flags[-1]["verdict"] == "different" and flags[-1]["blocked"] is True
+
+    _upload_interior(client, pid, book_a)                                               # putting the real book back works
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200
+
+
+def test_support_can_confirm_it_really_is_the_same_book(client):
+    pid = _started_interior_book(client, _manuscript(11))
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200
+    _upload_interior(client, pid, _manuscript(12))
+    assert client.post(f"/api/projects/{pid}/export").status_code == 409
+
+    assert client.post("/api/admin/book-flags/rebaseline", json={"project_id": pid}).status_code == 403   # customers can't
+    admin = _admin_client()
+    listed = admin.get("/api/admin/book-flags").json()["flags"]
+    assert any(f["project_id"] == pid and f["user_email"] == EMAIL for f in listed)
+    assert admin.post("/api/admin/book-flags/rebaseline", json={"project_id": pid}).status_code == 200
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200                 # new baseline
+    assert all(f["reviewed"] for f in server.db.book_flags._docs if f["project_id"] == pid)
+
+
+def test_unclear_cases_are_let_through_and_flagged_never_blocked(client):
+    pid = _started_interior_book(client, _manuscript(21))
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200
+    _upload_interior(client, pid, _manuscript(21, sentences=4))                         # too little text to judge
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200
+    assert any(f["project_id"] == pid and f["verdict"] == "unclear" and not f["blocked"] for f in server.db.book_flags._docs)
+
+
+def test_a_fingerprinting_failure_never_blocks_an_export(client, monkeypatch):
+    pid = _started_interior_book(client, _manuscript(31))
+
+    def boom(*a, **k):
+        raise RuntimeError("OCR fell over")
+    monkeypatch.setattr(book_pass.fingerprint, "project_fingerprint", boom)
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200
+
+
+def test_decision_rules():
+    fpm = book_pass.fingerprint
+    a, b = _manuscript(41), _manuscript(42)
+
+    def sk(s):
+        return {"sketch": fpm.text_sketch(fpm.words_of(" ".join(s))), "words": 1}
+
+    def cover(words):
+        return {"words": sorted(set(words.split()))}
+
+    same_cover = cover("the lantern keeper maria cole a novel she carried the light across the winter harbor")
+    new_art = cover("the lantern keeper maria cole a novel she carried light across winter harbor bestselling")
+    other = cover("iron orchard james reed thriller nobody leaves the valley alive until the last engine stops")
+
+    assert fpm.compare({"interior": sk(a)}, {"interior": sk(_revise(a))})[0] == "same"
+    assert fpm.compare({"interior": sk(a)}, {"interior": sk(b)})[0] == "different"
+    # same interior, redesigned cover -> fine; same cover wording, swapped-in different interior -> blocked
+    assert fpm.compare({"interior": sk(a), "cover": same_cover}, {"interior": sk(a), "cover": other})[0] == "same"
+    assert fpm.compare({"interior": sk(a), "cover": same_cover}, {"interior": sk(b), "cover": same_cover})[0] == "different"
+    # cover-only books: new art on the same cover is fine, a different book's cover is not
+    assert fpm.compare({"cover": same_cover}, {"cover": new_art})[0] == "same"
+    assert fpm.compare({"cover": same_cover}, {"cover": other})[0] == "different"
+    # adding the other half of the book later is not a different book, and becomes part of the baseline
+    assert fpm.compare({"cover": same_cover}, {"cover": same_cover, "interior": sk(a)})[0] == "same"
+    assert fpm.merge({"cover": same_cover, "interior": None}, {"cover": other, "interior": sk(a)}) == {"cover": same_cover, "interior": sk(a)}
+    # every stored number fits MongoDB's signed 64-bit integers
+    assert max(sk(a)["sketch"]) < 2 ** 63
+
+
+def test_cover_words_are_read_from_a_real_cover_image(tmp_path):
+    pytest.importorskip("pytesseract")
+    from PIL import Image, ImageDraw, ImageFont
+    fpm = book_pass.fingerprint
+
+    def draw(bg, lines, name):
+        img = Image.new("RGB", (1500, 2250), bg)
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arial.ttf", 90)
+        except OSError:
+            font = ImageFont.load_default()
+        ink = (0, 0, 0) if sum(bg) > 380 else (255, 255, 255)
+        for i, line in enumerate(lines):
+            d.text((120, 200 + i * 170), line, fill=ink, font=font)
+        p = tmp_path / name
+        img.save(p)
+        return str(p)
+
+    text = ["THE LANTERN KEEPER", "Maria Cole", "She carried the light", "across the winter harbor"]
+    first = fpm.cover_signature(draw((240, 230, 200), text, "a.png"), False)
+    redesign = fpm.cover_signature(draw((30, 40, 90), text, "b.png"), False)
+    other = fpm.cover_signature(draw((240, 230, 200), ["IRON ORCHARD", "James Reed", "Nobody leaves the valley", "until the engine stops"], "c.png"), False)
+    assert first and redesign and other
+    assert fpm.compare({"cover": first}, {"cover": redesign})[0] == "same"
+    assert fpm.compare({"cover": first}, {"cover": other})[0] == "different"
+
+
+def test_a_book_can_gain_its_other_half_but_not_trade_it_for_another_books():
+    fpm = book_pass.fingerprint
+    a, b = _manuscript(51), _manuscript(52)
+    cover_a = {"words": sorted(set("the lantern keeper maria cole she carried the light across the winter harbor".split()))}
+    sk = lambda s: {"sketch": fpm.text_sketch(fpm.words_of(" ".join(s))), "words": 1}  # noqa: E731
+    started_as_cover = {"parts": ["cover"], "cover": cover_a, "interior": None}
+    # cover-only book -> add its interior (the "Add the interior" button): same book
+    assert fpm.compare(started_as_cover, {"parts": ["cover", "interior"], "cover": cover_a, "interior": sk(a)})[0] == "same"
+    # cover-only book switched to interior-only with some other book's pages: blocked
+    assert fpm.compare(started_as_cover, {"parts": ["interior"], "cover": None, "interior": sk(b)})[0] == "different"
+    merged = fpm.merge(started_as_cover, {"parts": ["cover", "interior"], "cover": cover_a, "interior": sk(a)})
+    assert merged["parts"] == ["cover", "interior"] and merged["interior"] == sk(a)
+
+
+def test_adding_the_other_half_keeps_it_one_book_at_one_price(client):
+    pid = _started_interior_book(client, _manuscript(61))
+    before = client.get("/api/me/books").json()
+    assert client.patch(f"/api/projects/{pid}", json={"project_type": "combined"}).status_code == 200
+    after = client.get("/api/me/books").json()
+    assert client.get(f"/api/projects/{pid}/book").json()["active"] is True        # same window, same book
+    assert after["available_books"] == before["available_books"]                    # nothing extra spent
+    assert len(after["active_windows"]) == len(before["active_windows"])

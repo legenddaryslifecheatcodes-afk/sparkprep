@@ -142,6 +142,9 @@ class MemoryCollection:
                 modified += 1
         return type("UpdateResult", (), {"matched_count": matched, "modified_count": modified})()
 
+    async def update_many(self, filter=None, update=None):
+        return await self.update_one(filter, update)  # this shim's update_one already applies to every match
+
     async def delete_one(self, filter=None):
         before = len(self._docs)
         self._docs = [doc for doc in self._docs if not all(doc.get(key) == value for key, value in (filter or {}).items())]
@@ -1633,6 +1636,41 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
 
 
 # ---- Export ----
+SUPPORT_EMAIL = "legenddaryslifecheatcodes@gmail.com"
+
+
+async def _enforce_same_book(window: dict, p: dict, user_id: str) -> None:
+    """One book pass = one book (and its revisions). The first export records what the book says; later
+    exports in the same window must be that book. See book_pass/fingerprint.py. Never blocks on a failure of
+    its own -- an honest customer must not be stopped because fingerprinting hiccuped."""
+    try:
+        current = await run_with_timeout(book_pass.fingerprint.project_fingerprint, p, UPLOAD_DIR)
+    except Exception as e:  # noqa: BLE001
+        await log_failure(db, "book_fingerprint", e, project_id=str(p["_id"]), user_id=user_id)
+        return
+    stored = window.get("fingerprint")
+    if not stored:
+        await db.book_credits.update_one({"credit_id": window["credit_id"]}, {"$set": {"fingerprint": current}})
+        return
+    verdict, details = book_pass.fingerprint.compare(stored, current)
+    if verdict != "same":
+        await db.book_flags.insert_one({
+            "credit_id": window["credit_id"], "user_id": user_id, "project_id": str(p["_id"]),
+            "project_name": p.get("name"), "verdict": verdict, "details": details,
+            "blocked": verdict == "different", "reviewed": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    if verdict == "different":
+        started = (window.get("activated_at") or "")[:10]
+        raise HTTPException(409, {"code": "different_book", "msg": (
+            f"These files look like a different book from the one you started{' on ' + started if started else ''}. "
+            "Each book pass covers one book, including all its revisions — start a new book to export this one. "
+            f"If this really is the same book, email {SUPPORT_EMAIL} and we'll sort it out right away.")})
+    merged = book_pass.fingerprint.merge(stored, current)
+    if merged != stored:
+        await db.book_credits.update_one({"credit_id": window["credit_id"]}, {"$set": {"fingerprint": merged}})
+
+
 async def _export_project_core(project_id: str, user: dict) -> dict:
     """Core export logic, shared by the single-project export endpoint and
     batch_export(). acting `user` owns the project; billing (tier, usage
@@ -1700,11 +1738,12 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     if book_model and not beta_bypass:
         # Book model: exports are unlimited while THIS book's 7-day window is open, and only then.
         try:
-            await book_pass.entitlements.require_active_book(db, billing_user["id"], project_id)
+            window = await book_pass.entitlements.require_active_book(db, billing_user["id"], project_id)
         except book_pass.BookRequired as e:
             raise HTTPException(402, {"code": "book_required", "has_credit": e.has_credit, "msg": (
                 "Start this book to export (you have a book ready to use)." if e.has_credit
                 else "Buy a book ($74.99) or subscribe ($49.99/month) to export. Cover, interior, or both — same price.")})
+        await _enforce_same_book(window, p, billing_user["id"])
     if book_model:
         pass                                            # the legacy monthly/per-book/plan limits below do not apply
     elif not beta_bypass and used >= export_limit:
@@ -4031,6 +4070,39 @@ async def admin_list_failures(stage: str = None, limit: int = 100, _: dict = Dep
         f["id"] = str(f.pop("_id"))
         items.append(f)
     return {"failures": items, "count": len(items)}
+
+
+@api_router.get("/admin/book-flags")
+async def admin_book_flags(limit: int = 100, _: dict = Depends(require_admin)):
+    """Exports the same-book check blocked ("different") or let through while unsure ("unclear"), newest first."""
+    limit = max(1, min(500, limit))
+    items = []
+    async for f in db.book_flags.find({}).sort("created_at", -1).limit(limit):
+        f["id"] = str(f.pop("_id"))
+        u = await db.users.find_one({"_id": ObjectId(f["user_id"])}) if ObjectId.is_valid(f.get("user_id", "")) else None
+        f["user_email"] = u.get("email") if u else None
+        items.append(f)
+    return {"flags": items, "count": len(items)}
+
+
+class RebaselineIn(BaseModel):
+    project_id: str
+
+
+@api_router.post("/admin/book-flags/rebaseline")
+async def admin_rebaseline_book(payload: RebaselineIn, _: dict = Depends(require_admin)):
+    """Support override: "yes, it's the same book". Clears the recorded fingerprint on that project's book so its
+    next export becomes the new baseline, and marks its flags reviewed."""
+    now = datetime.now(timezone.utc)
+    active = None
+    async for c in db.book_credits.find({"project_id": payload.project_id}):
+        if book_pass.entitlements.credit_state(c, now) == "active":
+            active = c
+    if not active:
+        raise HTTPException(404, "No active book on that project")
+    await db.book_credits.update_one({"credit_id": active["credit_id"]}, {"$set": {"fingerprint": None}})
+    await db.book_flags.update_many({"project_id": payload.project_id}, {"$set": {"reviewed": True}})
+    return {"ok": True}
 
 
 @api_router.get("/admin/beta/passes")
