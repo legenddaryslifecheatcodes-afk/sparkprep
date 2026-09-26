@@ -118,6 +118,28 @@ async def _current_state(deps: Deps) -> tuple[dict, list]:
     return project.get("file_metadata") or {}, project.get("compliance") or []
 
 
+async def _sync_stale_compliance(deps: Deps, project: dict, diagnosis: dict) -> None:
+    """Writes Agent 1's fresh compliance findings back to the project so the
+    UI reflects what Repair Bay just proved is actually true right now,
+    instead of leaving whatever was stored before this run in place
+    indefinitely (see the call site's comment for why that matters)."""
+    fresh = diagnosis.get("issues") or []
+    if deps.slot:
+        slots = copy.deepcopy(project.get("slots") or {})
+        slot_data = dict(slots.get(deps.slot) or {})
+        slot_data["compliance"] = fresh
+        slots[deps.slot] = slot_data
+        fields = {"slots": slots}
+        if deps.slot == "full_wrap":
+            # Mirrors _replace_slot()'s own legacy mirroring in server.py --
+            # some older UI paths still read project-level compliance instead
+            # of slots.full_wrap for a full_wrap cover.
+            fields["compliance"] = fresh
+    else:
+        fields = {"compliance": fresh}
+    await deps.save_fields(fields, [])
+
+
 async def _run(deps: Deps, sink) -> dict:
     budget, trail = Budget(deps.budget_s), Trail(sink)
     trail.emit("pipeline_start", 0, "Verified auto-fix started", slot=deps.slot)
@@ -139,6 +161,17 @@ async def _run(deps: Deps, sink) -> dict:
                 "manual_only": "The remaining issues can't be fixed automatically — see the fix steps on each check.",
                 "scan_failed": "The scan didn't finish in time, so nothing was changed. Please try again.",
             }.get(diagnosis["outcome"], "Nothing to repair.")
+            # Agent 1's scan just ran fresh against the file as it is right now --
+            # more current than whatever compliance is sitting in the project
+            # record (which could be stale from before an earlier repair, a
+            # scanner fix that changed a verdict, or simply time passing). If
+            # nothing gets written here, a customer can see Repair Bay say
+            # "nothing to fix" while the project page still shows the old
+            # failure forever, since nothing else ever re-triggers a save for
+            # this outcome -- exactly the "app says one thing, Auto-Fix says
+            # another" disconnect this pipeline exists to prevent.
+            if diagnosis["outcome"] != "scan_failed":
+                await _sync_stale_compliance(deps, project, diagnosis)
         else:
             snap = await _take_snapshot(deps, project, diagnosis["file"])
             repair_out = await repair(repair_fn=deps.repair_fn, diagnosis=diagnosis, trail=trail,
