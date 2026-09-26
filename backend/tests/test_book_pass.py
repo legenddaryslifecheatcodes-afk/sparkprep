@@ -606,3 +606,35 @@ def test_upgrade_messages_quote_the_book_prices_not_old_plan_names(client):
 def test_paid_feature_message_wording():
     msg = server._paid_msg("AI Cover Generation requires the Author plan or higher.", "AI Cover Generation")
     assert msg == "AI Cover Generation is included with a book — $74.99 for one book (cover, interior, or both), or $49.99/month."
+
+
+# ---------------------------------------------------------------- disk housekeeping (the server disk is 1 GB)
+def _project_files(pid):
+    return sorted(p.name for folder in (server.UPLOAD_DIR, server.EXPORT_DIR) for p in folder.glob(f"{pid}_*"))
+
+
+def test_deleting_a_project_removes_its_files_and_only_its_files(client):
+    keep_pid = _started_interior_book(client, _manuscript(71))
+    assert client.post(f"/api/projects/{keep_pid}/export").status_code == 200
+    gone_pid = _started_interior_book(client, _manuscript(72))
+    assert client.post(f"/api/projects/{gone_pid}/export").status_code == 200
+    keep_before = _project_files(keep_pid)
+    assert _project_files(gone_pid) and keep_before                               # uploads + exports exist on disk
+
+    assert client.delete(f"/api/projects/{gone_pid}").status_code == 200
+    assert _project_files(gone_pid) == []                                         # nothing left behind
+    assert _project_files(keep_pid) == keep_before                                # the other book is untouched
+
+
+def test_only_the_three_newest_exports_are_kept_and_the_newest_still_downloads(client):
+    pid = _started_interior_book(client, _manuscript(81))
+    names = []
+    for _ in range(5):
+        r = client.post(f"/api/projects/{pid}/export")
+        assert r.status_code == 200
+        names.append(r.json()["download_url"].rsplit("/", 1)[-1])
+        time.sleep(0.02)                                                          # distinct modification times
+    on_disk = {p.name for p in server.EXPORT_DIR.glob(f"{pid}_*")}
+    assert on_disk == set(names[-3:])
+    token = client.headers["Authorization"].split(" ", 1)[1]                      # download links carry the token, as the app sends them
+    assert client.get(f"/api/projects/{pid}/download/{names[-1]}", params={"token": token}).status_code == 200

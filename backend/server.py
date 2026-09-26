@@ -5,6 +5,7 @@ load_dotenv(ROOT_DIR / ".env")
 
 import os
 import io
+import re
 import uuid
 import asyncio
 import logging
@@ -948,11 +949,7 @@ async def delete_project(project_id: str, user: dict = Depends(get_current_user)
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
-    if p.get("uploaded_file"):
-        try:
-            os.remove(UPLOAD_DIR / p["uploaded_file"])
-        except OSError:
-            pass
+    await run_with_timeout(_delete_project_files, project_id, p)
     await db.projects.delete_one({"_id": ObjectId(project_id)})
     return {"ok": True}
 
@@ -1653,6 +1650,57 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
 
 # ---- Export ----
 SUPPORT_EMAIL = "legenddaryslifecheatcodes@gmail.com"
+# The server's disk is 1 GB and a book's exports run 10-40 MB each; with unlimited exports per book, keeping
+# every one would fill it. Downloads are opened the moment an export finishes and nothing lists old ones.
+KEEP_EXPORTS_PER_PROJECT = 3
+_EXPORT_FILE_RE = re.compile(r"^[0-9a-f]{24}_(?:cover|interior|export)_([0-9a-z]+)\.(?:pdf|zip)$")
+
+
+def _prune_old_exports(project_id: str, keep: int) -> int:
+    """Keep this project's `keep` most recent exports (each export = its cover/interior PDFs and/or zip)."""
+    groups: dict = {}
+    for f in EXPORT_DIR.glob(f"{project_id}_*"):
+        m = _EXPORT_FILE_RE.match(f.name)
+        if m:
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            g = groups.setdefault(m.group(1), {"files": [], "newest": 0.0})
+            g["files"].append(f)
+            g["newest"] = max(g["newest"], mtime)
+    removed = 0
+    for g in sorted(groups.values(), key=lambda g: g["newest"], reverse=True)[keep:]:
+        for f in g["files"]:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def _delete_project_files(project_id: str, p: dict) -> int:
+    """Every file on disk that belongs to this project: slot files (current, original, raw manuscript), the legacy
+    single upload, and anything else named with the project's id (repairs, intermediates, exports)."""
+    names = set()
+    for meta in list((p.get("slots") or {}).values()) + [p.get("file_metadata") or {}]:
+        for key in ("stored_filename", "original_stored_filename", "raw_manuscript_stored_filename"):
+            if meta.get(key):
+                names.add(Path(meta[key]).name)                   # .name: never follow a path out of the folder
+    if p.get("uploaded_file"):
+        names.add(Path(p["uploaded_file"]).name)
+    paths = {UPLOAD_DIR / n for n in names}
+    for folder in (UPLOAD_DIR, EXPORT_DIR):
+        paths.update(folder.glob(f"{project_id}_*"))
+    removed = 0
+    for path in paths:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 async def _enforce_same_book(window: dict, p: dict, user_id: str) -> None:
@@ -1906,6 +1954,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
         export_name = f"{project_id}_interior_{export_id}.pdf"
         export_path = EXPORT_DIR / export_name
         result = interior_result
+    _prune_old_exports(project_id, keep=KEEP_EXPORTS_PER_PROJECT)
 
     # Increment usage -- always against the billing account, not necessarily
     # the acting user, so a team's shared pool is debited correctly.
