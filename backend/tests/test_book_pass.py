@@ -638,3 +638,21 @@ def test_only_the_three_newest_exports_are_kept_and_the_newest_still_downloads(c
     assert on_disk == set(names[-3:])
     token = client.headers["Authorization"].split(" ", 1)[1]                      # download links carry the token, as the app sends them
     assert client.get(f"/api/projects/{pid}/download/{names[-1]}", params={"token": token}).status_code == 200
+
+
+def test_audit_files_are_deleted_as_soon_as_the_customer_downloads_the_report(client):
+    aid = client.post("/api/audit/start", json={"platform": "kdp", "trim_size": "6x9", "file_type": "interior"}).json()["audit_id"]
+    r = client.post(f"/api/audit/{aid}/upload", files={"file": ("book.pdf", _pdf(_manuscript(91)), "application/pdf")})
+    assert r.status_code == 200, r.text
+    assert list(server.UPLOAD_DIR.glob(f"audit_{aid}_*"))                         # the upload is on disk after scanning
+    asyncio.run(server.db.audits.update_one({"audit_id": aid}, {"$set": {"paid": True}}))
+
+    r = client.get(f"/api/audit/{aid}/report")
+    assert r.status_code == 200 and r.content[:5] == b"%PDF-"
+    assert list(server.UPLOAD_DIR.glob(f"audit_{aid}_*")) == []                   # gone right after the download
+    assert not (server.EXPORT_DIR / f"{aid}_report.pdf").exists()
+
+    again = client.get(f"/api/audit/{aid}/report")                                 # re-download still works (built from findings)
+    assert again.status_code == 200 and again.content[:5] == b"%PDF-"
+    page = client.get(f"/api/audit/{aid}").json()                                  # and the on-screen report is intact
+    assert page["paid"] is True and page["full_report"]

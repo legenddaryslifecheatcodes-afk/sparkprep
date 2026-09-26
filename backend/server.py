@@ -19,6 +19,7 @@ import jwt
 import stripe
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 try:
@@ -3869,11 +3870,32 @@ async def audit_download_report(audit_id: str):
         },
         output_path=str(report_path),
     )
+    # Owner's rule: a customer's audit files are deleted as soon as they download their report. The report is
+    # built from the stored findings, never from the upload, so re-downloading and the on-screen report keep
+    # working; the delete runs only after the PDF has finished sending.
+    if not a.get("files_deleted_at"):
+        await db.audits.update_one({"audit_id": audit_id}, {"$set": {"files_deleted_at": datetime.now(timezone.utc).isoformat()}})
     return FileResponse(
         str(report_path),
         media_type="application/pdf",
         filename=f"sparkprep-audit-report-{audit_id}.pdf",
+        background=BackgroundTask(_delete_audit_files, audit_id, report_path),
     )
+
+
+def _delete_audit_files(audit_id: str, report_path: Path) -> int:
+    """The audit's upload, any distributor template sent with it, and the generated report PDF."""
+    if not re.fullmatch(r"[0-9a-f]{32}", audit_id or ""):
+        return 0
+    paths = [*UPLOAD_DIR.glob(f"audit_{audit_id}_*"), *UPLOAD_DIR.glob(f"{audit_id}_tmpl_*"), Path(report_path)]
+    removed = 0
+    for p in paths:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 @api_router.get("/audit/{audit_id}")
