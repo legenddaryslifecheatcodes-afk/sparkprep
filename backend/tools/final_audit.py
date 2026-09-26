@@ -199,6 +199,11 @@ def main():
                 ok_geom = (left_gap == 0 and right_gap == 0.125) if gutter_left else (left_gap == 0.125 and right_gap == 0)
                 mismatches += not ok_geom
             check("interior", "INDEPENDENT: every page's TrimBox matches its real gutter side", mismatches == 0, f"{mismatches}/{doc.page_count} mismatched")
+            # Read with PyMuPDF, not SparkPrep's own checker: ext "n/a" = font program not embedded.
+            unembedded = {f[3] for i in range(doc.page_count) for f in doc.get_page_fonts(i) if f[1] == "n/a"}
+            check("interior", "INDEPENDENT: every font embedded", not unembedded, sorted(unembedded))
+            image_spaces = {im[5] for i in range(doc.page_count) for im in doc.get_page_images(i)}
+            check("interior", "INDEPENDENT: every image CMYK or gray", image_spaces <= {"DeviceCMYK", "DeviceGray", ""}, sorted(image_spaces))
         r = cl.post(f"/api/projects/{pid3}/interior-check/checkout", json={"origin_url": "https://sparkprep.legenddary.com"})
         check("interior", "Advanced Interior Check checkout blocked without Stripe (expected)", r.status_code == 503)
 

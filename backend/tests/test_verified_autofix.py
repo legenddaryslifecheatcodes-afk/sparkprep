@@ -653,8 +653,11 @@ def test_interior_bleed_is_asymmetric_and_content_lands_exactly_on_the_trimbox(t
 
         pix = page.get_pixmap(dpi=150, colorspace=pymupdf.csRGB)
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        red = (arr[:, :, 0] > 200) & (arr[:, :, 1] < 60) & (arr[:, :, 2] < 60)
-        green = (arr[:, :, 1] > 140) & (arr[:, :, 0] < 60) & (arr[:, :, 2] < 60)
+        # The markers are drawn in RGB, so export converts them to CMYK ink (e.g. green renders back as roughly
+        # (23,154,72)): match "clearly red"/"clearly green", not the exact RGB values that went in.
+        r, g, b = (arr[:, :, k].astype(int) for k in range(3))
+        red = (r > 200) & (g < 80) & (b < 80)
+        green = (g > 120) & (g - r > 60) & (g - b > 40)
         tb_left_px, tb_right_px = tb.x0 / 72 * 150, tb.x1 / 72 * 150
         tb_bottom_px = pix.height - tb.y0 / 72 * 150               # PDF y grows up, image y grows down
         ys, xs = np.where(red)
@@ -662,6 +665,60 @@ def test_interior_bleed_is_asymmetric_and_content_lands_exactly_on_the_trimbox(t
         assert abs(ys.max() - tb_bottom_px) <= 3, f"page {i+1}: red marker not flush with TrimBox's bottom edge"
         ys, xs = np.where(green)
         assert xs.size and abs(xs.max() - tb_right_px) <= 3, f"page {i+1}: green marker not flush with TrimBox's right edge"
+
+
+def test_interior_export_embeds_fonts_and_converts_colour_to_cmyk(tmp_path):
+    """The bug this catches: interior exports were stamped "PDF/X-1a" while still carrying unembedded base
+    fonts (Helvetica/Times) and RGB images/text colour -- both automatic rejections under PDF/X-1a and in
+    KDP/IngramSpark preflight. Export must now embed every font and leave no non-CMYK colour, while an
+    already-clean interior is passed through without conversion."""
+    import numpy as np
+    import pikepdf
+    from PIL import Image
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    import file_processor as fp
+    from ghostscript_engine import find_ghostscript
+    if not find_ghostscript():
+        pytest.skip("Ghostscript not installed here (it is in the Render image)")
+
+    photo = tmp_path / "photo.png"
+    Image.fromarray(np.random.default_rng(1).integers(0, 255, (200, 300, 3), dtype=np.uint8), "RGB").save(photo)
+    src = tmp_path / "book_manuscript.pdf"
+    c = canvas.Canvas(str(src), pagesize=(6 * inch, 9 * inch))
+    for n in range(3):
+        c.setFont("Times-Roman", 12)
+        c.drawString(72, 600, f"Chapter {n + 1}. It was a dark and stormy night.")
+        c.setFillColorRGB(0.1, 0.3, 0.8)
+        c.setFont("Helvetica", 10)
+        c.drawString(72, 560, "Blue RGB caption text")
+        c.drawImage(str(photo), 72, 200, width=3 * inch, height=2 * inch)
+        c.showPage()
+    c.save()
+    assert set(fp.print_conversion_reasons(str(src))) >= {"fonts_not_embedded", "non_cmyk_colour"}
+
+    out = tmp_path / "out.pdf"
+    result = fp.build_interior_pdf_x1a(str(src), str(out), 6.0, 9.0, 0.125, title="T")
+    assert result["print_conversion"]["converted"] is True
+    assert fp.print_conversion_reasons(str(out)) == [], "export must leave no unembedded font or non-CMYK colour"
+    with pikepdf.open(str(out)) as pdf:
+        assert len(pdf.pages) == 3 and str(pdf.Root.GTS_PDFXVersion) == "PDF/X-1a:2001"
+        for page in pdf.pages:
+            for font in page.Resources.Font.values():
+                d = font.get("/FontDescriptor") or font.DescendantFonts[0].FontDescriptor
+                assert any(k in d for k in ("/FontFile", "/FontFile2", "/FontFile3")), f"{font.BaseFont} not embedded"
+            for img in page.Resources.XObject.values():
+                if img.get("/Subtype") == pikepdf.Name.Image:
+                    assert img.ColorSpace == pikepdf.Name.DeviceCMYK
+
+    # Cached: an unchanged manuscript re-exported reuses the conversion instead of paying for it again.
+    again = fp.build_interior_pdf_x1a(str(src), str(tmp_path / "out2.pdf"), 6.0, 9.0, 0.125, title="T")
+    assert again["print_conversion"].get("cached") is True
+    assert (tmp_path / "book_manuscript_printready.pdf").exists()
+
+    # Already print-clean (our own output): passed through, not re-converted.
+    clean = fp.build_interior_pdf_x1a(str(out), str(tmp_path / "out3.pdf"), 6.25, 9.25, 0.0, title="T")
+    assert clean["print_conversion"] == {"converted": False, "reasons": []}
 
 
 
@@ -697,3 +754,32 @@ def test_big_image_covers_are_read_at_200_dpi_not_full_resolution(tmp_path, monk
     Image.new("RGB", (5400, 3960), (255, 255, 255)).save(img)             # ~430 dpi across a 12.63" wrap
     pv.check_cover_safety_margins(str(img), False, 12.63, 9.25, "IngramSpark")
     assert abs(seen[0][0] / 12.63 - 200) < 2
+
+
+def test_cover_export_is_all_cmyk_with_no_unembedded_fonts_even_if_repair_was_skipped(tmp_path):
+    """The bug this catches: RGB is only a warning (doesn't block export), and the cover builder embedded
+    whatever mode it was given -- so an author who skipped Repair Bay got an RGB image inside a file labelled
+    PDF/X-1a. The ISBN barcode was drawn in RGB too, and ReportLab's never-used, never-embedded default
+    Helvetica was listed on the page. A cover that couldn't be read was exported as a blank error page."""
+    import numpy as np
+    import pymupdf
+    import file_processor as fp
+    src = tmp_path / "cover.jpg"
+    Image.new("RGB", (3900, 2850), (90, 40, 140)).save(src, dpi=(300, 300))
+    out = tmp_path / "cover.pdf"
+    fp.build_print_ready_pdf(str(src), str(out), trim_w=6, trim_h=9, bleed=0.125, spine_w=0.5, is_cover=True,
+                             title="T", barcode_png_bytes=server.generate_barcode_png_bytes("9780306406157"))
+    doc = pymupdf.open(str(out))
+    assert [im[5] for im in doc.get_page_images(0, full=True)] == ["DeviceCMYK", "DeviceCMYK"]  # art + barcode
+    assert doc.get_page_fonts(0, full=True) == []
+    assert fp.print_conversion_reasons(str(out)) == []
+    # The barcode really is black bars on a white box (not inverted by the CMYK embedding).
+    page = doc[0]
+    zone = pymupdf.Rect(0.625 * 72, page.rect.height - 1.825 * 72, 2.625 * 72, page.rect.height - 0.625 * 72)
+    arr = np.frombuffer(page.get_pixmap(dpi=100, clip=zone, colorspace=pymupdf.csGRAY).samples, dtype=np.uint8)
+    assert (arr > 230).mean() > 0.4 and (arr < 80).mean() > 0.1
+
+    bad = tmp_path / "broken.jpg"
+    bad.write_bytes(b"not an image")
+    with pytest.raises(Exception):
+        fp.build_print_ready_pdf(str(bad), str(tmp_path / "x.pdf"), trim_w=6, trim_h=9, bleed=0.125)

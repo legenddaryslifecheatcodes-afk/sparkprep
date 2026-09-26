@@ -624,6 +624,161 @@ def _shift_interior_pages_for_asymmetric_bleed(source_pdf_path: str, intermediat
         writer.write(f)
 
 
+# PDF/X-1a allows only these colour spaces (plus Indexed/Pattern built on them). Anything else -- DeviceRGB,
+# ICC-based, CalRGB/CalGray, Lab -- is a "colour must be CMYK" rejection at the distributor.
+_X1A_COLOUR_SPACES = {"/DeviceCMYK", "/DeviceGray", "/Separation", "/DeviceN", "/Indexed", "/Pattern"}
+_RGB_OPERATORS = {pikepdf.Operator("rg"), pikepdf.Operator("RG")}
+_COLOUR_SPACE_OPERATORS = {pikepdf.Operator("cs"), pikepdf.Operator("CS")}
+
+
+def _colour_space_ok(cs, resources) -> bool:
+    if isinstance(cs, pikepdf.Name):
+        name = str(cs)
+        if name in _X1A_COLOUR_SPACES:
+            return True
+        named = (resources.get("/ColorSpace") or {}).get(name) if resources is not None else None
+        return named is not None and _colour_space_ok(named, None)
+    if isinstance(cs, pikepdf.Array) and len(cs) > 0:
+        family = str(cs[0])
+        if family == "/Indexed" and len(cs) > 1:
+            return _colour_space_ok(cs[1], resources)
+        if family == "/Pattern":
+            return len(cs) < 2 or _colour_space_ok(cs[1], resources)
+        return family in _X1A_COLOUR_SPACES
+    return False
+
+
+def _has_non_cmyk_colour(container, seen: set, depth: int = 0) -> bool:
+    """True the moment anything on this page (or a Form XObject it draws) paints in a colour space PDF/X-1a
+    forbids: an RGB/ICC image, an `rg`/`RG` fill or stroke, or a `cs`/`CS` selecting a non-CMYK space."""
+    resources = container.get("/Resources") or pikepdf.Dictionary()
+    for xobj in (resources.get("/XObject") or {}).values():
+        try:
+            key = xobj.objgen
+            if key != (0, 0) and key in seen:
+                continue
+            seen.add(key)
+            subtype = xobj.get("/Subtype")
+            if subtype == pikepdf.Name.Image:
+                if xobj.get("/ImageMask", False):
+                    continue
+                cs = xobj.get("/ColorSpace")
+                if cs is not None and not _colour_space_ok(cs, resources):
+                    return True
+            elif subtype == pikepdf.Name.Form and depth < 6:
+                if _has_non_cmyk_colour(xobj, seen, depth + 1):
+                    return True
+        except Exception:
+            return True                                      # unreadable object: let Ghostscript normalise it
+    try:
+        for op in pikepdf.parse_content_stream(container):
+            if op.operator in _RGB_OPERATORS:
+                return True
+            if op.operator in _COLOUR_SPACE_OPERATORS and op.operands and not _colour_space_ok(op.operands[0], resources):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def _font_is_embedded(font) -> bool:
+    if font.get("/Subtype") == pikepdf.Name("/Type3"):
+        return True                                          # Type3 glyphs are drawn by the PDF itself
+    descriptor = font.get("/FontDescriptor")
+    if descriptor is None and font.get("/DescendantFonts"):
+        descriptor = font.DescendantFonts[0].get("/FontDescriptor")
+    return descriptor is not None and any(k in descriptor for k in ("/FontFile", "/FontFile2", "/FontFile3"))
+
+
+def _declares_unembedded_font(pdf) -> bool:
+    """A font listed in a page's resources but never embedded -- even if no text is drawn with it (PDF
+    libraries such as ReportLab list a default Helvetica on every page). PDF/X-1a strictly requires only USED
+    fonts be embedded, but some distributor preflights flag any listed one, so it's normalised away too."""
+    def listed(container, depth=0):
+        resources = container.get("/Resources") or {}
+        yield from ((resources.get("/Font") or {}).values())
+        for xobj in (resources.get("/XObject") or {}).values():
+            if xobj.get("/Subtype") == pikepdf.Name.Form and depth < 6:
+                yield from listed(xobj, depth + 1)
+    for page in pdf.pages:
+        for font in listed(page.obj):
+            try:
+                if not _font_is_embedded(font):
+                    return True
+            except Exception:
+                return True
+    return False
+
+
+def print_conversion_reasons(pdf_path: str) -> list:
+    """Why this interior can't honestly be called PDF/X-1a as-is. Empty list = already print-clean (fonts
+    embedded, no live transparency, CMYK/gray colour only), so it's passed through untouched."""
+    from pdfx_validator import check_fonts_embedded, check_transparency
+    reasons = []
+    with pikepdf.open(pdf_path) as pdf:
+        if check_fonts_embedded(pdf, max_pages=None):
+            reasons.append("fonts_not_embedded")
+        elif _declares_unembedded_font(pdf):
+            reasons.append("unembedded_font_listed")
+        if check_transparency(pdf, max_pages=None):
+            reasons.append("live_transparency")
+        seen: set = set()
+        if any(_has_non_cmyk_colour(page.obj, seen) for page in pdf.pages):
+            reasons.append("non_cmyk_colour")
+    return reasons
+
+
+GS_INTERIOR_TIMEOUT_S = 1500    # measured ~103 s locally for a 300-page, image-heavy 24.7 MB interior
+
+
+def _print_ready_interior_source(source_pdf_path: str) -> tuple:
+    """Returns (path_to_build_from, conversion_info). When the interior has unembedded fonts, live
+    transparency or non-CMYK colour, Ghostscript's PDF/X pipeline embeds every font, flattens transparency and
+    converts every colour to CMYK -- the parts pikepdf can't do. The result is cached beside the source
+    (same project-id prefix, so deleting the project deletes it) and reused while it's newer than the source,
+    so re-exports of an unchanged manuscript don't pay the conversion twice.
+
+    Never makes an export fail that would have worked before: if Ghostscript is missing or errors, the
+    original file is used exactly as it was, and the reason is reported in conversion_info."""
+    try:
+        reasons = print_conversion_reasons(source_pdf_path)
+    except Exception as e:
+        reasons = [f"unreadable_for_check: {e.__class__.__name__}"]
+    if not reasons:
+        return source_pdf_path, {"converted": False, "reasons": []}
+
+    src = Path(source_pdf_path)
+    cached = src.with_name(f"{src.stem}_printready.pdf")
+    if cached.exists() and cached.stat().st_size > 0 and cached.stat().st_mtime >= src.stat().st_mtime:
+        return str(cached), {"converted": True, "reasons": reasons, "cached": True}
+
+    from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
+    if not find_ghostscript():
+        return source_pdf_path, {"converted": False, "reasons": reasons, "error": "ghostscript_not_installed"}
+    tmp = cached.with_name(cached.name + ".part")
+    try:
+        convert_to_pdfx1a(str(src), str(tmp), title=src.stem, timeout_s=GS_INTERIOR_TIMEOUT_S)
+        os.replace(tmp, cached)
+    except Exception as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        print(f"interior print conversion failed, exporting unconverted: {e}")
+        return source_pdf_path, {"converted": False, "reasons": reasons, "error": str(e)[:300]}
+    # One converted copy per project: a re-uploaded/re-fixed manuscript gets a new stored name, so the previous
+    # version's copy (often 2-3x the source size) would otherwise sit on the 1 GB disk until the project is deleted.
+    prefix = src.name[:25]
+    if len(prefix) == 25 and prefix[24] == "_" and all(ch in "0123456789abcdef" for ch in prefix[:24]):
+        for old in src.parent.glob(f"{prefix}*_printready.pdf"):
+            if old != cached:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+    return str(cached), {"converted": True, "reasons": reasons, "cached": False}
+
+
 def build_interior_pdf_x1a(
     source_pdf_path: str,
     output_pdf_path: str,
@@ -654,8 +809,10 @@ def build_interior_pdf_x1a(
     trim_h_pt = trim_h * 72
     profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
 
+    # Fonts / transparency / colour first (Ghostscript, only when needed), THEN the lossless bleed shift + boxes.
+    build_source, print_conversion = _print_ready_interior_source(source_pdf_path)
     shifted_path = source_pdf_path + ".bleedshift.pdf"
-    _shift_interior_pages_for_asymmetric_bleed(source_pdf_path, shifted_path, trim_w, trim_h, bleed)
+    _shift_interior_pages_for_asymmetric_bleed(build_source, shifted_path, trim_w, trim_h, bleed)
     try:
         with pikepdf.open(shifted_path, allow_overwriting_input=False) as src:
             page_count = len(src.pages)
@@ -729,9 +886,58 @@ def build_interior_pdf_x1a(
         "pdf_standard": "PDF/X-1a:2001",
         "vector_preserved": True,
         "fonts_preserved": True,
+        # converted=True: fonts embedded, transparency flattened, colour converted to CMYK by Ghostscript.
+        # converted=False with reasons: the file needed it but conversion wasn't possible (see "error").
+        "print_conversion": print_conversion,
         "output_intent": f"{profile['condition_identifier']} — {profile['info']}",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+_SHOW_TEXT_OPS = {pikepdf.Operator("Tj"), pikepdf.Operator("TJ"), pikepdf.Operator("'"), pikepdf.Operator('"')}
+
+
+def _drop_unused_fonts(pdf, container, depth: int = 0) -> None:
+    """ReportLab lists (and selects, with no text after it) a default Helvetica on every page it writes. It's
+    never embedded, and some distributor preflights flag any listed unembedded font -- so for OUR OWN generated
+    covers, remove font selections that never draw a glyph and the resources they point at. Form XObjects
+    (the barcode overlay) are cleaned the same way. Pages whose forms borrow the page's fonts are left alone."""
+    resources = container.get("/Resources")
+    if resources is None:
+        return
+    for xobj in (resources.get("/XObject") or {}).values():
+        if xobj.get("/Subtype") == pikepdf.Name.Form and depth < 6:
+            if "/Resources" not in xobj:
+                return
+            _drop_unused_fonts(pdf, xobj, depth + 1)
+    fonts = resources.get("/Font")
+    if not fonts:
+        return
+    try:
+        ops = list(pikepdf.parse_content_stream(container))
+    except Exception:
+        return
+    used, current = set(), None
+    for op in ops:
+        if op.operator == pikepdf.Operator("Tf") and op.operands:
+            current = str(op.operands[0])
+        elif op.operator in _SHOW_TEXT_OPS and current is not None:
+            used.add(current)
+    unused = {str(k) for k in fonts.keys()} - used
+    if not unused:
+        return
+    kept_ops = [op for op in ops if not (op.operator == pikepdf.Operator("Tf") and op.operands
+                                          and str(op.operands[0]) in unused)]
+    data = pikepdf.unparse_content_stream(kept_ops)
+    if isinstance(container, pikepdf.Stream):
+        container.write(data)
+    else:
+        container.Contents = pdf.make_stream(data)
+    new_resources = pikepdf.Dictionary({k: v for k, v in resources.items() if k != "/Font"})
+    kept_fonts = {k: v for k, v in fonts.items() if str(k) not in unused}
+    if kept_fonts:
+        new_resources.Font = pikepdf.Dictionary(kept_fonts)
+    container.Resources = new_resources                       # a fresh dict: never edit one shared with other pages
 
 
 def _declare_pdfx1a(pdf_path: str, title: str, author: str, bleed_pts: float, total_w_pts: float, total_h_pts: float,
@@ -751,6 +957,7 @@ def _declare_pdfx1a(pdf_path: str, title: str, author: str, bleed_pts: float, to
     profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
     with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
         for page in pdf.pages:
+            _drop_unused_fonts(pdf, page.obj)
             page.mediabox = [0, 0, total_w_pts, total_h_pts]
             page.trimbox = [bleed_pts, bleed_pts, total_w_pts - bleed_pts, total_h_pts - bleed_pts]
             page.bleedbox = [0, 0, total_w_pts, total_h_pts]
@@ -836,40 +1043,31 @@ def build_print_ready_pdf(
     c.setSubject("Print-Ready PDF/X-1a")
     c.setCreator(f"{producer_name} Book Production Engine")
 
-    # Draw image scaled to full canvas
+    # Draw image scaled to full canvas. A cover that can't be read fails the export (the server reports it)
+    # rather than shipping a blank page with an error string printed on it.
+    with Image.open(image_path) as img:
+        if img.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+            img = bg
+        # Always embed CMYK: the file declares a CMYK OutputIntent and PDF/X-1a allows no RGB. A still-RGB
+        # cover (customer skipped Repair Bay -- RGB is only a warning, so it doesn't block export) is converted
+        # here with the same exact conversion + platform ink limit Repair Bay uses. An already-CMYK file keeps
+        # its exact channel values (reportlab embeds a CMYK JPEG as DeviceCMYK, no Adobe-marker inversion).
+        if img.mode != "CMYK":
+            tac = TAC_THRESHOLD_BY_PLATFORM.get(platform, TAC_THRESHOLD_DEFAULT)
+            img = Image.fromarray(_cmyk_in_bands(np.array(img.convert("RGB")), tac, from_rgb=True), mode="CMYK")
+        tmp_path = image_path + ".cmyk.jpg"
+        img.save(tmp_path, "JPEG", quality=95, dpi=(300, 300))
     try:
-        with Image.open(image_path) as img:
-            if img.mode in ("RGBA", "LA", "P"):
-                bg = Image.new("RGB", img.size, (255, 255, 255))
-                if img.mode == "P":
-                    img = img.convert("RGBA")
-                bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
-                img = bg
-            # Save as a temp JPEG in whatever color mode the source actually
-            # is -- this used to force RGB unconditionally regardless of
-            # mode (both branches of what looked like a CMYK/else split did
-            # the identical .convert("RGB")), so a file Auto-Fix had
-            # genuinely converted to CMYK still landed back in the exported
-            # "PDF/X-1a" PDF as an RGB image, contradicting the file's own
-            # declared CMYK OutputIntent. Verified directly: reportlab
-            # embeds a CMYK JPEG as real DeviceCMYK with exact channel
-            # values preserved, no Adobe-marker inversion, so there's no
-            # reason to flatten to RGB when the source is already CMYK.
-            tmp_path = image_path + ".rgb.jpg"
-            if img.mode == "CMYK":
-                img.save(tmp_path, "JPEG", quality=95, dpi=(300, 300))
-            else:
-                img.convert("RGB").save(tmp_path, "JPEG", quality=95, dpi=(300, 300))
-            c.drawImage(tmp_path, 0, 0, width=page_w, height=page_h)
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    except Exception as e:
-        c.setFillColorRGB(1, 1, 1)
-        c.rect(0, 0, page_w, page_h, fill=1, stroke=0)
-        c.setFillColorRGB(0.7, 0.7, 0.7)
-        c.drawString(20, 20, f"[Image load error: {e}]")
+        c.drawImage(tmp_path, 0, 0, width=page_w, height=page_h)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     c.showPage()
     c.save()
@@ -892,8 +1090,14 @@ def build_print_ready_pdf(
             oc = canvas.Canvas(overlay_path, pagesize=(page_w, page_h))
             # ReportLab drawImage needs an ImageReader for in-memory bytes
             from reportlab.lib.utils import ImageReader
-            img_reader = ImageReader(io.BytesIO(barcode_png_bytes))
-            oc.setFillColorRGB(1, 1, 1)
+            # Barcodes print in black ink only (K) -- rich black or RGB black smears the bars on press.
+            with Image.open(io.BytesIO(barcode_png_bytes)) as bc:
+                bc_gray = bc.convert("L")
+            k = 255 - np.array(bc_gray)
+            bc_cmyk = np.zeros(k.shape + (4,), dtype=np.uint8)
+            bc_cmyk[..., 3] = k
+            img_reader = ImageReader(Image.fromarray(bc_cmyk, mode="CMYK"))
+            oc.setFillColorCMYK(0, 0, 0, 0)
             oc.rect(zone_x_in * inch, zone_y_in * inch, zone_w_in * inch, zone_h_in * inch, fill=1, stroke=0)
             oc.drawImage(img_reader, zone_x_in * inch, zone_y_in * inch, width=zone_w_in * inch, height=zone_h_in * inch)
             oc.showPage()

@@ -83,6 +83,7 @@ def convert_to_pdfx1a(
     output_path: str,
     icc_profile_path: Optional[str] = None,
     title: str = "SparkPrep Export",
+    timeout_s: int = 300,
 ) -> dict:
     """Authoritative PDF/X-1a:2001 conversion via Ghostscript's built-in
     PDF/X pipeline (-dPDFX). This is the industry-standard way to produce
@@ -112,7 +113,7 @@ def convert_to_pdfx1a(
         cmd.insert(-1, f"-sOutputICCProfile={icc_profile_path}")
     cmd.append(input_path)
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     if result.returncode != 0:
         raise RuntimeError(f"Ghostscript PDF/X-1a conversion failed: {result.stderr[-2000:]}")
 
