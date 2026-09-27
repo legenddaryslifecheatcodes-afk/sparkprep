@@ -200,3 +200,90 @@ def generate_audit_brief_pdf(
 
     doc.build(story)
     return output_path
+
+
+def generate_repair_report_pdf(
+    repair_log: list,
+    final_compliance: list,
+    project_meta: dict,
+    output_path: str,
+    brand_name: str = "SparkPrep",
+) -> str:
+    """Writes the "found & fixed" companion report bundled with every export --
+    the owner's own words: customers should see the depth of what the app
+    actually did, not just a pass/fail badge.
+
+    repair_log: the project's full repair_log field (see
+        autofix_agents.pipeline._append_repair_log) -- one entry per Repair Bay
+        run that found something, in the order they happened.
+    final_compliance: the CURRENT compliance list for whatever's being
+        exported right now (export already guarantees no "fail" is present).
+    """
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("RepairTitle", parent=styles["Title"], fontSize=18, spaceAfter=4)
+    h2_style = ParagraphStyle("H2", parent=styles["Heading2"], spaceBefore=14, spaceAfter=6)
+    body_style = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=14)
+    small_style = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, textColor=colors.grey)
+    run_title_style = ParagraphStyle("RunTitle", parent=styles["Heading3"], fontSize=11, spaceAfter=2)
+    item_style = ParagraphStyle("Item", parent=styles["BodyText"], fontSize=10, leading=14, leftIndent=14)
+
+    doc = SimpleDocTemplate(
+        output_path, pagesize=letter,
+        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
+        leftMargin=0.75 * inch, rightMargin=0.75 * inch,
+    )
+    story = []
+
+    story.append(Paragraph(f"{brand_name} — What We Found &amp; Fixed", title_style))
+    story.append(Paragraph(
+        f"{project_meta.get('title', 'Untitled project')} — "
+        f"{project_meta.get('platform', 'Unknown platform')} — "
+        f"{project_meta.get('trim_size', 'Unknown trim size')}",
+        body_style,
+    ))
+    story.append(Paragraph(f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", small_style))
+    story.append(Spacer(1, 0.2 * inch))
+
+    if not repair_log:
+        story.append(Paragraph(
+            "Nothing needed fixing. Every check we run passed the first time your file was scanned.",
+            body_style,
+        ))
+    else:
+        story.append(Paragraph(
+            "SparkPrep found and fixed real print-compliance issues on this file. Here's a plain-language "
+            "record of each pass, in order, so you can see exactly what changed and why.",
+            body_style,
+        ))
+        story.append(Spacer(1, 0.15 * inch))
+        for i, entry in enumerate(repair_log, start=1):
+            by_id = {f["id"]: f for f in entry.get("found", [])}
+            when = (entry.get("at") or "")[:16].replace("T", " ")
+            slot_label = {"full_wrap": "cover", "front_cover": "cover", "back_cover": "cover",
+                          "spine": "cover spine", "interior": "interior"}.get(entry.get("slot"), entry.get("slot") or "file")
+            story.append(Paragraph(f"Pass {i} — {slot_label} — {when} UTC", run_title_style))
+            for f in entry.get("found", []):
+                story.append(Paragraph(f"• Found: {f['label']} — {f['message']}", item_style))
+            resolved = entry.get("resolved") or []
+            if resolved:
+                names = ", ".join(by_id.get(rid, {}).get("label", rid) for rid in resolved)
+                story.append(Paragraph(f'<font color="{_SEVERITY_COLOR["pass"].hexval()}">✓ Fixed: {names}</font>', item_style))
+            remaining = entry.get("remaining") or []
+            if remaining:
+                names = ", ".join(by_id.get(rid, {}).get("label", rid) for rid in remaining)
+                story.append(Paragraph(f'<font color="{_SEVERITY_COLOR["warning"].hexval()}">Still open at this pass: {names}</font>', item_style))
+            story.append(Spacer(1, 0.15 * inch))
+
+    story.append(Spacer(1, 0.1 * inch))
+    story.append(Paragraph("Final status at export", h2_style))
+    real_checks = [c for c in (final_compliance or []) if c.get("id") not in ("bleed", "pdfx1a", "pdf_dpi")]
+    if not real_checks:
+        story.append(Paragraph("All checks passed.", body_style))
+    else:
+        for c in real_checks:
+            ok = c.get("status") == "pass"
+            mark = f'<font color="{_SEVERITY_COLOR["pass"].hexval()}">✓</font>' if ok else f'<font color="{_SEVERITY_COLOR["warning"].hexval()}">!</font>'
+            story.append(Paragraph(f"{mark} {c.get('label', c.get('id'))}", item_style))
+
+    doc.build(story)
+    return output_path

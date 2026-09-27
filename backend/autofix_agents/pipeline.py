@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -140,6 +141,40 @@ async def _sync_stale_compliance(deps: Deps, project: dict, diagnosis: dict) -> 
     await deps.save_fields(fields, [])
 
 
+REPAIR_LOG_MAX_ENTRIES = 200  # generous ceiling; a real project runs Repair Bay a handful of times, not hundreds
+
+
+async def _append_repair_log(deps: Deps, diagnosis: dict, pipeline: dict) -> None:
+    """Keeps a running, plain-language history of what Repair Bay actually found
+    and fixed on this project over its whole lifetime -- the raw material for the
+    "found & fixed" report bundled with every export (see report_export.py). Without
+    this, that detail only ever existed for the length of one HTTP response: the
+    project record kept the current pass/fail state (_sync_stale_compliance above)
+    but never a record of what was WRONG and what was DONE about it.
+
+    Only logs a run that actually found something to report -- a scan that came
+    back clean isn't part of the story of what got fixed."""
+    found = [i for i in (diagnosis.get("issues") or []) if i.get("status") != "pass" and not i.get("informational")]
+    if not found:
+        return
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "slot": deps.slot,
+        "status": pipeline["status"],
+        "found": [{"id": i["id"], "label": i["label"], "message": i["message"]} for i in found],
+        "resolved": pipeline["resolved"],
+        "remaining": pipeline["remaining"],
+        "health_before": pipeline["health_before"],
+        "health_after": pipeline["health_after"],
+    }
+    project = await deps.get_project()
+    log = list(project.get("repair_log") or [])
+    log.append(entry)
+    if len(log) > REPAIR_LOG_MAX_ENTRIES:
+        log = log[-REPAIR_LOG_MAX_ENTRIES:]
+    await deps.save_fields({"repair_log": log}, [])
+
+
 async def _run(deps: Deps, sink) -> dict:
     budget, trail = Budget(deps.budget_s), Trail(sink)
     trail.emit("pipeline_start", 0, "Verified auto-fix started", slot=deps.slot)
@@ -236,6 +271,7 @@ async def _run(deps: Deps, sink) -> dict:
         "seconds": round(budget.elapsed(), 1),
         "timings": timings,
     }
+    await _append_repair_log(deps, diagnosis, pipeline)
     payload = {
         "slot": deps.slot, "file_metadata": metadata, "compliance": compliance,
         "ghostscript_fix": (repair_out or {}).get("ghostscript_fix") if status in ("confirmed", "partial") else None,

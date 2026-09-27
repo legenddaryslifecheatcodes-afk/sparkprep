@@ -12,7 +12,7 @@ import logging
 import shutil
 import secrets
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 import bcrypt
 import jwt
@@ -48,7 +48,7 @@ from pdfx_validator import (
     SPINE_SAFETY_WIDE_IN, SPINE_SAFETY_NARROW_IN, SPINE_WIDTH_TIER_THRESHOLD_IN,
 )
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
-from report_export import generate_audit_report_pdf, generate_audit_brief_pdf
+from report_export import generate_audit_report_pdf, generate_audit_brief_pdf, generate_repair_report_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
 from failure_log import log_failure
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
@@ -620,6 +620,12 @@ class ProjectUpdate(BaseModel):
     # in (common for a professionally designed jacket), skip SparkPrep's
     # auto-overlay at export instead of stamping a second barcode on top.
     cover_has_barcode: Optional[bool] = None
+    # "full": one combined file (a plain wrap for paperback/hardcover_case, or a
+    # 5-panel wrap-with-flaps for hardcover_jacket -- whichever the Binding field
+    # already says). "separate": front/spine/back uploaded as three individual
+    # files. Independent of Binding -- this only decides which upload screen the
+    # customer sees, never the cover's actual shape. None/unset = not chosen yet.
+    cover_upload_mode: Optional[Literal["full", "separate"]] = None
 
 class CheckoutIn(BaseModel):
     tier: str  # pro | studio
@@ -1955,6 +1961,35 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
         export_name = f"{project_id}_interior_{export_id}.pdf"
         export_path = EXPORT_DIR / export_name
         result = interior_result
+
+    # Owner's rule: a customer should see the depth of what SparkPrep actually
+    # did, not just a pass/fail badge -- so whenever Repair Bay found and fixed
+    # something real over this project's lifetime, bundle a plain-language
+    # "found & fixed" report alongside the print file(s). A project that never
+    # needed a fix skips this entirely -- nothing to report, no reason to
+    # force a zip on the common clean-upload case.
+    if p.get("repair_log"):
+        import zipfile
+        report_path = EXPORT_DIR / f"{project_id}_report_{export_id}.pdf"
+        generate_repair_report_pdf(
+            repair_log=p["repair_log"], final_compliance=all_compliance,
+            project_meta={"title": title, "platform": plat.get("name", platform_key), "trim_size": p["trim_size"]},
+            output_path=str(report_path),
+        )
+        if export_path.suffix.lower() == ".zip":
+            with zipfile.ZipFile(export_path, "a", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(report_path, arcname=f"{title}_found_and_fixed.pdf")
+            report_path.unlink()
+        else:
+            bundled_name = f"{project_id}_export_{export_id}.zip"
+            bundled_path = EXPORT_DIR / bundled_name
+            with zipfile.ZipFile(bundled_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(export_path, arcname=f"{title}{export_path.suffix}")
+                zf.write(report_path, arcname=f"{title}_found_and_fixed.pdf")
+            report_path.unlink()
+            export_path.unlink()
+            export_name, export_path = bundled_name, bundled_path
+            result = {"bundled": True, "found_and_fixed_report": True, **result}
     _prune_old_exports(project_id, keep=KEEP_EXPORTS_PER_PROJECT)
 
     # Increment usage -- always against the billing account, not necessarily

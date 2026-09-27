@@ -783,3 +783,71 @@ def test_cover_export_is_all_cmyk_with_no_unembedded_fonts_even_if_repair_was_sk
     bad.write_bytes(b"not an image")
     with pytest.raises(Exception):
         fp.build_print_ready_pdf(str(bad), str(tmp_path / "x.pdf"), trim_w=6, trim_h=9, bleed=0.125)
+
+
+# ---------------------------------------------------------------- found & fixed report
+def test_repair_log_records_what_repair_bay_actually_found_and_fixed(client):
+    """Owner's requirement: a real history of what was found and fixed, not just the
+    current pass/fail state -- that history used to only ever exist for the length of
+    one HTTP response (see pipeline._append_repair_log)."""
+    pid = _upload_cover(client)  # RGB cover -- a real, fixable finding
+    _, result = _run(client, pid)
+    assert result["pipeline"]["status"] == "confirmed"
+
+    p, _ = _slot(pid)
+    log = p.get("repair_log")
+    assert log and len(log) == 1
+    entry = log[0]
+    assert entry["slot"] == "full_wrap"
+    assert entry["status"] == "confirmed"
+    assert any(f["id"] == "colorspace" for f in entry["found"])
+    assert "colorspace" in entry["resolved"]
+    assert entry["remaining"] == []
+    assert entry["health_before"] < entry["health_after"]
+
+
+def test_repair_log_not_written_when_nothing_was_wrong(client):
+    """A scan that comes back clean isn't part of the story of what got fixed."""
+    import numpy as np
+    from file_processor import rgb_array_to_cmyk_array
+    buf = io.BytesIO()
+    cmyk = rgb_array_to_cmyk_array(np.full((2775, 3810, 3), 245, dtype=np.uint8))
+    Image.fromarray(cmyk, mode="CMYK").save(buf, "TIFF", dpi=(300, 300), compression="tiff_lzw")
+    pid = _project(client)
+    r = client.post(f"/api/projects/{pid}/slot-upload/full_wrap", files={"file": ("c.tif", buf.getvalue(), "image/tiff")})
+    assert r.status_code == 200, r.text
+    _, result = _run(client, pid)
+    assert result["pipeline"]["status"] == "no_action"
+    p, _ = _slot(pid)
+    assert not p.get("repair_log")
+
+
+def test_export_bundles_a_found_and_fixed_report_when_repairs_happened(client):
+    pid = _upload_cover(client)
+    _run(client, pid)
+    r = client.post(f"/api/projects/{pid}/export")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["export_name"].endswith(".zip")
+    assert data.get("found_and_fixed_report") is True
+
+    dl = client.get(data["download_url"], params={"token": client.headers["Authorization"].split(" ", 1)[1]})
+    assert dl.status_code == 200
+    import zipfile
+    zf = zipfile.ZipFile(io.BytesIO(dl.content))
+    report_names = [n for n in zf.namelist() if "found_and_fixed" in n]
+    assert len(report_names) == 1
+    assert zf.read(report_names[0])[:4] == b"%PDF"
+
+
+def test_export_stays_a_single_file_when_nothing_needed_fixing(client):
+    import numpy as np
+    from file_processor import rgb_array_to_cmyk_array
+    cmyk = rgb_array_to_cmyk_array(np.full((2775, 3810, 3), 245, dtype=np.uint8))
+    buf = io.BytesIO()
+    Image.fromarray(cmyk, mode="CMYK").save(buf, "TIFF", dpi=(300, 300), compression="tiff_lzw")
+    pid = _project(client)
+    client.post(f"/api/projects/{pid}/slot-upload/full_wrap", files={"file": ("c.tif", buf.getvalue(), "image/tiff")})
+    r = client.post(f"/api/projects/{pid}/export")
+    assert r.status_code == 200, r.text
+    assert not r.json()["export_name"].endswith(".zip")
