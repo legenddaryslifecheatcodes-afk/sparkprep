@@ -626,6 +626,11 @@ class ProjectUpdate(BaseModel):
     # files. Independent of Binding -- this only decides which upload screen the
     # customer sees, never the cover's actual shape. None/unset = not chosen yet.
     cover_upload_mode: Optional[Literal["full", "separate"]] = None
+    # Set once by the frontend the first time the whole project (every part it
+    # needs -- cover, interior, or both) has passed every check. Marks that the
+    # "your book is ready" celebration has already played, so it's a one-time
+    # milestone moment, not something that replays on every later visit.
+    book_ready_celebrated_at: Optional[str] = None
 
 class CheckoutIn(BaseModel):
     tier: str  # pro | studio
