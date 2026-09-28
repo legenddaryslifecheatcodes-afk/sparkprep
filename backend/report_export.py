@@ -264,13 +264,19 @@ def generate_repair_report_pdf(
             story.append(Paragraph(f"Pass {i} — {slot_label} — {when} UTC", run_title_style))
             for f in entry.get("found", []):
                 story.append(Paragraph(f"• Found: {f['label']} — {f['message']}", item_style))
+            # Older log entries stored remaining issues as whole objects rather than ids; a
+            # dict can't be a lookup key, which crashed every export of such a project.
+            def _name(r):
+                if isinstance(r, dict):
+                    return r.get("label") or r.get("id") or "issue"
+                return by_id.get(r, {}).get("label", r)
             resolved = entry.get("resolved") or []
             if resolved:
-                names = ", ".join(by_id.get(rid, {}).get("label", rid) for rid in resolved)
+                names = ", ".join(_name(r) for r in resolved)
                 story.append(Paragraph(f'<font color="{_SEVERITY_COLOR["pass"].hexval()}">✓ Fixed: {names}</font>', item_style))
             remaining = entry.get("remaining") or []
             if remaining:
-                names = ", ".join(by_id.get(rid, {}).get("label", rid) for rid in remaining)
+                names = ", ".join(_name(r) for r in remaining)
                 story.append(Paragraph(f'<font color="{_SEVERITY_COLOR["warning"].hexval()}">Still open at this pass: {names}</font>', item_style))
             story.append(Spacer(1, 0.15 * inch))
 

@@ -1770,6 +1770,13 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     interior_data = _interior_file_meta(p) if needs_interior else None
     if needs_interior and not interior_data:
         raise HTTPException(404, "No interior file uploaded to export")
+    # Dust-jacket books need a third file: the plain case underneath the
+    # jacket. Real IngramSpark submission for one of these literally will
+    # not process until all three files (case, jacket, interior) are filled.
+    needs_case = needs_cover and p.get("binding") == "hardcover_jacket"
+    case_data = (p.get("slots") or {}).get("case_wrap") if needs_case else None
+    if needs_case and not case_data:
+        raise HTTPException(404, "No case cover uploaded -- a Hardcover with Dust Jacket book needs a separate plain case file too, in addition to the jacket.")
 
     # Mandatory book title -- required before any export so exports are
     # traceable to a real book, not left on a never-renamed placeholder.
@@ -1873,6 +1880,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
 
     cover_result = None
     interior_result = None
+    case_result = None
 
     if needs_cover:
         cover_path = UPLOAD_DIR / cover_data["stored_filename"]
@@ -1943,29 +1951,60 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
                                context={"project_type": project_type, "part": "interior", "platform": p["platform"], "file_ext": interior_ext})
             raise HTTPException(500, f"Export failed while building the interior PDF: {e}")
 
-    # Distributors require the cover and interior as separate file uploads,
-    # never merged into one PDF -- so a combined project's two outputs are
-    # zipped together into a single download instead of only ever building
-    # the cover and silently dropping the interior, which is what this
-    # function did for every "combined" project before (is_interior only
-    # matched project_type == "interior" exactly, so combined always fell
-    # into the cover-only branch and only ever produced one file).
-    if cover_result is not None and interior_result is not None:
+    if needs_case:
+        case_path = UPLOAD_DIR / case_data["stored_filename"]
+        case_export_path = EXPORT_DIR / f"{project_id}_case_{export_id}.pdf"
+        case_bleed = resolve_binding_spec("hardcover_case", platform_key)["bleed"]
+        case_spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, "hardcover_case")[0]
+        if p.get("spine_width_override"):
+            case_spine_w = float(p["spine_width_override"])
+        try:
+            case_result = await run_with_timeout(
+                build_print_ready_pdf,
+                str(case_path), str(case_export_path),
+                trim_w=trim["w"], trim_h=trim["h"],
+                bleed=case_bleed, spine_w=case_spine_w,
+                is_cover=True, title=p["name"],
+                author=(user.get("name") or ""),
+                barcode_png_bytes=barcode_png,  # IngramSpark's Case Laminate template carries a barcode block on the case back too
+                color_profile=color_profile,
+                producer_name=producer_name,
+                binding="hardcover_case",
+                platform=platform_key,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
+                               context={"project_type": project_type, "part": "case_wrap", "platform": p["platform"]})
+            raise HTTPException(500, f"Export failed while building the case PDF: {e}")
+
+    # Distributors require the cover, interior, and (for a dust-jacket book)
+    # the plain case as separate file uploads, never merged into one PDF --
+    # so whenever more than one of these was actually built, they're zipped
+    # together into a single download rather than only ever returning one
+    # file. A cover-only or interior-only project (the common case) still
+    # produces one plain PDF, not a zip -- no reason to force that on the
+    # simple path.
+    parts = [
+        (EXPORT_DIR / f"{project_id}_cover_{export_id}.pdf", f"{title}_cover.pdf", "cover", cover_result),
+        (EXPORT_DIR / f"{project_id}_case_{export_id}.pdf", f"{title}_case.pdf", "case", case_result),
+        (EXPORT_DIR / f"{project_id}_interior_{export_id}.pdf", f"{title}_interior.pdf", "interior", interior_result),
+    ]
+    parts = [part for part in parts if part[3] is not None]
+    if len(parts) > 1:
         import zipfile
         export_name = f"{project_id}_export_{export_id}.zip"
         export_path = EXPORT_DIR / export_name
         with zipfile.ZipFile(export_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(EXPORT_DIR / f"{project_id}_cover_{export_id}.pdf", arcname=f"{title}_cover.pdf")
-            zf.write(EXPORT_DIR / f"{project_id}_interior_{export_id}.pdf", arcname=f"{title}_interior.pdf")
-        result = {"bundled": True, "cover": cover_result, "interior": interior_result}
-    elif cover_result is not None:
-        export_name = f"{project_id}_cover_{export_id}.pdf"
-        export_path = EXPORT_DIR / export_name
-        result = cover_result
+            for src_path, arcname, _key, _res in parts:
+                zf.write(src_path, arcname=arcname)
+        result = {"bundled": True, **{key: res for _src, _arc, key, res in parts}}
     else:
-        export_name = f"{project_id}_interior_{export_id}.pdf"
-        export_path = EXPORT_DIR / export_name
-        result = interior_result
+        src_path, _arcname, _key, res = parts[0]
+        export_name = src_path.name
+        export_path = src_path
+        result = res
 
     # Owner's rule: a customer should see the depth of what SparkPrep actually
     # did, not just a pass/fail badge -- so whenever Repair Bay found and fixed
@@ -3176,8 +3215,12 @@ async def upload_publisher_template(project_id: str, file: UploadFile = File(...
     return {"template_id": file_id, "metadata": metadata, "detected_trim": detected_trim, "detected_spec": detected_spec}
 
 
-# ---- Slot Upload (front_cover / back_cover / spine / interior / full_wrap) ----
-ALLOWED_SLOTS = {"front_cover", "back_cover", "spine", "interior", "full_wrap"}
+# ---- Slot Upload (front_cover / back_cover / spine / interior / full_wrap / case_wrap) ----
+# case_wrap: the plain hardcover case under a dust jacket. IngramSpark won't
+# process a hardcover_jacket book until three files are uploaded (case,
+# jacket, interior); it sends both a Case Laminate and a Dust Jacket template
+# for the book, and both are needed. Only valid for hardcover_jacket binding.
+ALLOWED_SLOTS = {"front_cover", "back_cover", "spine", "interior", "full_wrap", "case_wrap"}
 
 
 @api_router.post("/projects/{project_id}/slot-upload/{slot}")
@@ -3187,6 +3230,8 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
+    if slot == "case_wrap" and p.get("binding") != "hardcover_jacket":
+        raise HTTPException(400, "The case file is only needed for Hardcover — Dust Jacket binding. Change Binding first if that's what this book is.")
 
     billing_user = await get_billing_user(user)
     tier = billing_user.get("tier", "free")
@@ -3287,6 +3332,10 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
             geom = _full_wrap_geometry(p)
             spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
                              "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
+        elif slot == "case_wrap":
+            geom = _case_wrap_geometry(p)
+            spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                             "page_count": p.get("page_count"), "binding": "hardcover_case"}
         compliance = await run_with_timeout(
             run_compliance_checks,
             metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
@@ -3444,6 +3493,12 @@ def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
         bleed = PLATFORMS.get(platform_key, PLATFORMS["kdp"])["bleed"]
         return round((trim["w"] + bleed * 2) * 300), round((trim["h"] + bleed * 2) * 300)
 
+    if slot == "case_wrap":
+        # Always a plain hardcover_case wrap, regardless of the project's
+        # real binding (hardcover_jacket) -- see _case_wrap_geometry.
+        dims = _case_wrap_geometry(p)
+        return round(dims["total_width"] * 300), round(dims["total_height"] * 300)
+
     # Cover bleed is a property of the (platform, binding) pair -- see the
     # export path's cover_bleed for the same fix and why it matters.
     bleed = resolve_binding_spec(binding, platform_key)["bleed"]
@@ -3474,7 +3529,12 @@ def _target_inches_for_slot(p: dict, slot: str) -> tuple[float, float]:
     physical dimension rather than a pixel count. Keeping this as a thin
     wrapper instead of duplicating the per-slot logic guarantees the DPI/
     margin checks and the AI-upscale target always agree on what "correct
-    size" means for a given slot."""
+    size" means for a given slot. Full wraps return the exact geometry
+    instead: rounding to whole pixels first (20.4375" -> 6131px -> 20.437")
+    made the cover-size message disagree with the distributor's own number."""
+    if slot in ("full_wrap", "case_wrap"):
+        g = _case_wrap_geometry(p) if slot == "case_wrap" else _full_wrap_geometry(p)
+        return g["total_width"], g["total_height"]
     w_px, h_px = _target_pixels_for_slot(p, slot)
     return w_px / 300.0, h_px / 300.0
 
@@ -3493,6 +3553,23 @@ def _full_wrap_geometry(p: dict) -> dict:
         spine_w = float(p["spine_width_override"])
     bleed = resolve_binding_spec(binding, platform_key)["bleed"]
     return calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, platform_key)
+
+
+def _case_wrap_geometry(p: dict) -> dict:
+    """Same breakdown as _full_wrap_geometry, but always computed as a plain
+    hardcover_case wrap, regardless of the project's real binding. Used only
+    for the case_wrap slot -- the plain case that sits underneath a dust
+    jacket on a hardcover_jacket book. Physically, that case is a
+    case-laminate wrap either way; it doesn't follow jacket flap/hinge
+    geometry just because the book it's inside of has one."""
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+    platform_key = p.get("platform", "kdp")
+    paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, "hardcover_case")[0]
+    if p.get("spine_width_override"):
+        spine_w = float(p["spine_width_override"])
+    bleed = resolve_binding_spec("hardcover_case", platform_key)["bleed"]
+    return calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, "hardcover_case", platform_key)
 
 
 @api_router.post("/projects/{project_id}/ai-enhance/{slot}")

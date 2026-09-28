@@ -132,8 +132,15 @@ class TestExportBookRules:
                 "paper_type": "white_50lb", "binding": "paperback", "page_count": 150, "project_type": "cover",
             })
             pid = r.json()["id"]
+            # A correctly sized full wrap, so the only thing that can stop this export is the plan.
+            from print_specs import calculate_full_cover_dimensions, calculate_spine_width_for_platform
+            spine = calculate_spine_width_for_platform(150, 444, "kdp", "paperback")[0]
+            d = calculate_full_cover_dimensions(6, 9, spine, 0.125, "paperback", "kdp")
+            buf = io.BytesIO()
+            wrap = canvas.Canvas(buf, pagesize=(d["total_width"] * 72, d["total_height"] * 72))
+            wrap.showPage(); wrap.save()
             r = await c.post(f"/projects/{pid}/slot-upload/full_wrap", headers=headers,
-                              files={"file": ("c.pdf", _sample_pdf_bytes(), "application/pdf")})
+                              files={"file": ("c.pdf", buf.getvalue(), "application/pdf")})
             assert r.status_code == 200
             r = await c.post(f"/projects/{pid}/export", headers=headers)
             assert r.status_code == 402

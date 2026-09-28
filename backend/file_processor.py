@@ -81,7 +81,10 @@ def compute_effective_dpi(width_px: int, height_px: int, target_w_inches: float,
         return {"dpi_x": 0, "dpi_y": 0, "status": "error"}
     dpi_x = width_px / target_w_inches
     dpi_y = height_px / target_h_inches
-    effective = min(dpi_x, dpi_y)
+    # Judged on the same 1-decimal value the customer is shown: a file built at
+    # exactly 300 DPI can land a hair under (20.4375" x 300 = 6131.25 -> 6131px
+    # = 299.99 DPI) and must not read "300.0 DPI" next to a "too soft" warning.
+    effective = round(min(dpi_x, dpi_y), 1)
     if effective >= 300:
         status = "pass"
     elif effective >= 200:
@@ -1291,6 +1294,31 @@ def run_compliance_checks(
                 "fix_action": "fit_recenter_interior" if f["id"] in ("interior_page_size_mismatch", "interior_safety_margin") else None,
             })
 
+    # Full-wrap cover size/shape. Export draws the image stretched to exactly
+    # fill the required canvas, so a file built to the wrong size would come
+    # out distorted with nothing warning about it. A PDF's page size is real
+    # inches; a raster image only reliably gives its shape.
+    if slot in ("full_wrap", "case_wrap") and final_w and final_h:
+        w, h = file_metadata.get("width_px") or 0, file_metadata.get("height_px") or 0
+        if w and h:
+            need = f'{final_w:.3f}" x {final_h:.3f}"'
+            if file_metadata.get("is_pdf"):
+                got_w, got_h = w / 72.0, h / 72.0
+                ok = abs(got_w - final_w) <= 0.02 and abs(got_h - final_h) <= 0.02
+                got = f'{got_w:.3f}" x {got_h:.3f}"'
+            else:
+                ok = abs((w / h) / (final_w / final_h) - 1) <= 0.01
+                got = f"{w} x {h} px (shape {w / h:.3f}, needs {final_w / final_h:.3f})"
+            checks.append({
+                "id": "cover_size",
+                "label": "Cover size",
+                "status": "pass" if ok else "fail",
+                "message": (f"Matches the required {need} including spine and bleed" if ok else
+                            f"Your file is {got}, but this book's cover must be exactly {need} including spine and bleed. "
+                            f"Stretching it to fit would distort the art, so rebuild it at that size — your distributor's cover template shows the layout."),
+                "auto_fix": False,
+            })
+
     # Cover text/art safety margin -- the cover-file counterpart to the
     # interior check above. Runs OCR (see pdfx_validator.check_cover_safety_margins
     # for why a cover needs OCR rather than reading text-block positions
@@ -1298,7 +1326,7 @@ def run_compliance_checks(
     # bleed-inclusive canvas size for this slot) to convert pixel positions
     # to inches correctly -- without it, this can't reliably tell where the
     # trim edge even is, so it's skipped rather than guessing.
-    if slot in ("full_wrap", "front_cover", "back_cover") and file_path and final_w and final_h:
+    if slot in ("full_wrap", "case_wrap", "front_cover", "back_cover") and file_path and final_w and final_h:
         from pdfx_validator import check_cover_safety_margins
         cover_margin_findings = check_cover_safety_margins(
             file_path, file_metadata.get("is_pdf", False), final_w, final_h, platform_name or platform,

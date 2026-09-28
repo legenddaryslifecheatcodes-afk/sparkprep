@@ -163,7 +163,8 @@ async def _append_repair_log(deps: Deps, diagnosis: dict, pipeline: dict) -> Non
         "status": pipeline["status"],
         "found": [{"id": i["id"], "label": i["label"], "message": i["message"]} for i in found],
         "resolved": pipeline["resolved"],
-        "remaining": pipeline["remaining"],
+        # Agent 3 reports remaining issues as objects, resolved ones as ids -- store ids for both.
+        "remaining": [r["id"] if isinstance(r, dict) else r for r in pipeline["remaining"]],
         "health_before": pipeline["health_before"],
         "health_after": pipeline["health_after"],
     }
