@@ -69,6 +69,12 @@ BINDING_TYPES = {
         "safe_margin": 0.5,
         "flap": 3.25,  # guide: "Dust jackets have an additional 3.25\" area that wraps around the hardcover book"
         "wrap_fold": 0.25,  # guide: "0.25\" (6mm) strip that connects the front and back covers to the dust jacket flaps"
+        # A jacket panel is bigger than the trim: it covers the case board plus
+        # its overhang. Measured from IngramSpark's own generated Dust Jacket
+        # Cover Template (6x9, spine 0.313"): panel 6.438 x 9.250, bleed artwork
+        # 20.438 x 9.50. One data point (6x9), like hardcover_case's above.
+        "board_width_adjust": 0.4375,
+        "board_height_adjust": 0.25,
     },
 }
 
@@ -299,8 +305,9 @@ def calculate_full_cover_dimensions(
       Case laminate: board_w = trim_w - 0.185, board_h = trim_h + 0.25
                       bleed_w = 2*bleed + 2*gutter_hinge + 2*board_w + spine_w
                       bleed_h = 2*bleed + board_h
-      Dust jacket:    bleed_w = 2*bleed + 2*wrap_fold + 2*flap + 2*trim_w + spine_w
-                      bleed_h = 2*bleed + trim_h
+      Dust jacket:    panel_w = trim_w + 0.4375, panel_h = trim_h + 0.25
+                      bleed_w = 2*bleed + 2*wrap_fold + 2*flap + 2*panel_w + spine_w
+                      bleed_h = 2*bleed + panel_h
 
     `platform` selects a PLATFORM_BINDING_OVERRIDES entry when one exists
     (currently KDP's hardcover_case, reverse-engineered from KDP's own Print
@@ -319,11 +326,8 @@ def calculate_full_cover_dimensions(
     board adjustment (board is narrower and taller than the trim -- boards
     overhang the page block top/bottom, and sit slightly inside it side to
     side) is confirmed exactly against that same rejection's numbers, not
-    guessed. Jacket panel width is left at the plain trim size: IngramSpark's
-    guide hints at a similar small adjustment there too but the source PDF's
-    number for it didn't survive extraction cleanly, so it's left unapplied
-    rather than guessed -- verify the exact jacket panel size against
-    IngramSpark's Cover Template Generator before a final submission.
+    guessed. Jacket panels get their own board adjustment, measured from a
+    real IngramSpark Cover Template Generator output (see BINDING_TYPES).
     """
     spec = resolve_binding_spec(binding, platform)
     bleed = spec.get("bleed", bleed)
@@ -338,6 +342,8 @@ def calculate_full_cover_dimensions(
     elif binding == "hardcover_jacket":
         flap_w = spec.get("flap", 0.0)
         wrap_fold = spec.get("wrap_fold", 0.0)
+        panel_w = trim_w + spec.get("board_width_adjust", 0.0)
+        panel_h = trim_h + spec.get("board_height_adjust", 0.0)
 
     total_w = (bleed * 2) + (gutter_hinge * 2) + (wrap_fold * 2) + (flap_w * 2) + (panel_w * 2) + spine_w
     total_h = panel_h + (bleed * 2)
