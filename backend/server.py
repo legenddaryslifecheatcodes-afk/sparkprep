@@ -49,7 +49,7 @@ from pdfx_validator import (
     SPINE_SAFETY_WIDE_IN, SPINE_SAFETY_NARROW_IN, SPINE_WIDTH_TIER_THRESHOLD_IN,
 )
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
-from report_export import generate_audit_report_pdf, generate_audit_brief_pdf, generate_repair_report_pdf
+from report_export import generate_audit_brief_pdf, generate_repair_report_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
 from failure_log import log_failure
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
@@ -4105,7 +4105,7 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
             "summary": summary,
         }},
     )
-    return {"audit_id": audit_id, "summary": summary, "preview": preview, "check_type": "basic"}
+    return {"audit_id": audit_id, "summary": _audit_public_summary(summary), "preview": preview, "check_type": "basic"}
 
 
 @api_router.get("/audit/{audit_id}/report")
@@ -4162,6 +4162,22 @@ def _delete_audit_files(audit_id: str, report_path: Path) -> int:
     return removed
 
 
+# Owner's rule: the audit detects -- what failed, where, why, and the publisher requirement. It never
+# hands out a repair tutorial (step lists, tool lists, fix times); doing the work is SparkPrep's main
+# service. Stripped here so it can't be read out of the network response either.
+_AUDIT_REPAIR_KEYS = ("fix_steps", "fix_tools", "est_fix_minutes")
+
+
+def _audit_public_findings(findings: Optional[list]) -> Optional[list]:
+    if findings is None:
+        return None
+    return [{k: v for k, v in f.items() if k not in _AUDIT_REPAIR_KEYS} for f in findings]
+
+
+def _audit_public_summary(summary: Optional[dict]) -> Optional[dict]:
+    return {k: v for k, v in summary.items() if k != "estimated_fix_minutes"} if summary else summary
+
+
 @api_router.get("/audit/{audit_id}")
 async def audit_get(audit_id: str):
     a = await db.audits.find_one({"audit_id": audit_id})
@@ -4176,10 +4192,10 @@ async def audit_get(audit_id: str):
         "trim_size": a["trim_size"],
         "trim_label": trim["label"] if trim else a["trim_size"],
         "file_metadata": a.get("file_metadata"),
-        "summary": a.get("summary"),
+        "summary": _audit_public_summary(a.get("summary")),
         "preview": a.get("preview_findings"),
         "paid": a.get("paid", False),
-        "full_report": a.get("full_findings") if a.get("paid") else None,
+        "full_report": _audit_public_findings(a.get("full_findings")) if a.get("paid") else None,
     }
 
 
@@ -4201,7 +4217,7 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
                     "currency": "usd",
                     "product_data": {
                         "name": "SparkPrep Print Failure Audit",
-                        "description": "Full detailed report with pinpointed issues, publisher rules and step-by-step fixes.",
+                        "description": "Every issue pinpointed: what failed, where, and the publisher requirement it breaks.",
                     },
                     "unit_amount": book_pass.audit_price_cents(AUDIT_PRICE_CENTS),
                 },
