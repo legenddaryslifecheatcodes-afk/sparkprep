@@ -998,6 +998,42 @@ def _declare_pdfx1a(pdf_path: str, title: str, author: str, bleed_pts: float, to
         pdf.save(pdf_path, linearize=False, min_version="1.4")
 
 
+def _open_piece(path: str, dpi: int = 300) -> Image.Image:
+    """A cover piece as a PIL image; a PDF piece is rendered at print resolution first."""
+    if Path(path).suffix.lower() == ".pdf":
+        import fitz
+        with fitz.open(path) as doc:
+            pix = doc[0].get_pixmap(dpi=dpi, alpha=False, colorspace=fitz.csRGB)
+            return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    with Image.open(path) as img:
+        img.load()
+        return img.copy()
+
+
+def assemble_cover_pieces(back_path: str, spine_path: str, front_path: str, output_path: str,
+                          trim_w: float, trim_h: float, bleed: float, spine_w: float, dpi: int = 300) -> tuple:
+    """Builds one full-wrap image from a paperback's three separately uploaded pieces.
+
+    Each panel is expected at trim + bleed on every side and the spine at spine width x (trim height + bleed),
+    which is how designers deliver separate pieces. Each panel's inner (spine-side) bleed is trimmed off and the
+    spine goes exactly between them -- never overlapped, since a thin spine (under 0.125") is narrower than
+    that bleed and an overlap would cover real art on the other panel.
+    Paperback only: a hardcover wrap also needs hinge/wrap (and flap) areas that separate panels don't carry."""
+    W, H = round((trim_w * 2 + spine_w + bleed * 2) * dpi), round((trim_h + bleed * 2) * dpi)
+    panel = (round((trim_w + bleed * 2) * dpi), H)
+    keep = round((trim_w + bleed) * dpi)                      # a panel minus its spine-side bleed
+    spine_px = max(1, W - 2 * keep)
+    pieces = [_open_piece(p) for p in (back_path, spine_path, front_path)]
+    mode = "CMYK" if all(p.mode == "CMYK" for p in pieces) else "RGB"
+    back, spine, front = [p.convert(mode) for p in pieces]
+    wrap = Image.new(mode, (W, H), (0, 0, 0, 0) if mode == "CMYK" else (255, 255, 255))
+    wrap.paste(back.resize(panel, Image.LANCZOS).crop((0, 0, keep, H)), (0, 0))
+    wrap.paste(spine.resize((spine_px, H), Image.LANCZOS), (keep, 0))
+    wrap.paste(front.resize(panel, Image.LANCZOS).crop((panel[0] - keep, 0, panel[0], H)), (keep + spine_px, 0))
+    wrap.save(output_path, "TIFF" if mode == "CMYK" else "PNG", dpi=(dpi, dpi))
+    return W, H
+
+
 def build_print_ready_pdf(
     image_path: str,
     output_pdf_path: str,
@@ -1149,6 +1185,15 @@ def build_print_ready_pdf(
         "output_intent": f"{profile['condition_identifier']} — {profile['info']}",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+_SIZE_SUBJECT = {
+    "full_wrap": "this book's full cover (back, spine and front, with bleed)",
+    "case_wrap": "this book's case cover (with its wrap and hinges)",
+    "front_cover": "the front cover piece (with bleed on every side)",
+    "back_cover": "the back cover piece (with bleed on every side)",
+    "spine": "the spine piece (spine width by full height with bleed)",
+}
 
 
 def run_compliance_checks(
@@ -1318,7 +1363,7 @@ def run_compliance_checks(
     # fill the required canvas, so a file built to the wrong size would come
     # out distorted with nothing warning about it. A PDF's page size is real
     # inches; a raster image only reliably gives its shape.
-    if slot in ("full_wrap", "case_wrap") and final_w and final_h:
+    if slot in ("full_wrap", "case_wrap", "front_cover", "back_cover", "spine") and final_w and final_h:
         w, h = file_metadata.get("width_px") or 0, file_metadata.get("height_px") or 0
         if w and h:
             need = f'{final_w:.3f}" x {final_h:.3f}"'
@@ -1327,14 +1372,17 @@ def run_compliance_checks(
                 ok = abs(got_w - final_w) <= 0.02 and abs(got_h - final_h) <= 0.02
                 got = f'{got_w:.3f}" x {got_h:.3f}"'
             else:
-                ok = abs((w / h) / (final_w / final_h) - 1) <= 0.01
+                # Shape check in pixels, allowing 1% or 2px of rounding -- a thin spine can be only ~16px wide,
+                # where a single pixel of rounding is already several percent.
+                expected_w = h * final_w / final_h
+                ok = abs(w - expected_w) <= max(2, 0.01 * expected_w)
                 got = f"{w} x {h} px (shape {w / h:.3f}, needs {final_w / final_h:.3f})"
             checks.append({
                 "id": "cover_size",
                 "label": "Cover size",
                 "status": "pass" if ok else "fail",
-                "message": (f"Matches the required {need} including spine and bleed" if ok else
-                            f"Your file is {got}, but this book's cover must be exactly {need} including spine and bleed. "
+                "message": (f"Matches the required {need}" if ok else
+                            f"Your file is {got}, but {_SIZE_SUBJECT.get(slot, 'this cover')} must be exactly {need}. "
                             f"Stretching it to fit would distort the art, so rebuild it at that size — your distributor's cover template shows the layout."),
                 "auto_fix": False,
             })

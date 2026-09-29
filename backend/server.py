@@ -6,6 +6,7 @@ load_dotenv(ROOT_DIR / ".env")
 import os
 import io
 import re
+import copy
 import uuid
 import asyncio
 import logging
@@ -36,7 +37,7 @@ from print_specs import (
 )
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
-    build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks,
+    build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks, assemble_cover_pieces,
     check_total_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
     autofix_spine_text_margin,
     TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
@@ -903,10 +904,111 @@ def project_to_dict(p: dict) -> dict:
     return p
 
 
+# ---- The owner's funnel (book-pass model): free demo -> $1.99 results -> the product ----
+# 1. Free: the REAL scan runs, but only whether issues were found (and how many) leaves the server.
+# 2. $1.99 audit: the full results for this project. A problem detector only -- it never repairs.
+# 3. The product (a book on this project): Repair Bay, every fix, final review, export.
+# The lock is enforced here, on the server; hiding results in the browser alone would leave them
+# readable in the network responses.
+
+async def _owns_product(p: dict, user: dict) -> bool:
+    """May use Repair Bay / fixes / final review / export on this project (same rule as export)."""
+    if not book_pass.book_pass_on() or is_admin_user(user):
+        return True
+    billing_user = await get_billing_user(user)
+    if user.get("beta_active") or billing_user.get("beta_active"):
+        return True
+    if p.get("promo_access") in ("full_access", "interior_only_access"):
+        return True
+    return bool(await book_pass.entitlements.project_window(db, billing_user["id"], str(p["_id"])))
+
+
+async def _require_product(p: dict, user: dict, what: str = "Repair Bay"):
+    if await _owns_product(p, user):
+        return
+    billing_user = await get_billing_user(user)
+    has_credit = await book_pass.entitlements.has_paid_access(db, billing_user["id"])
+    raise HTTPException(402, {"code": "book_required", "has_credit": has_credit, "msg": (
+        f"Start this book to use {what} (you have a book ready to use)." if has_credit
+        else f"{what} is part of the SparkPrep book — {book_pass.book_offer_text()}.")})
+
+
+async def _results_unlocked(p: dict, user: dict) -> bool:
+    if await _owns_product(p, user):
+        return True
+    billing_user = await get_billing_user(user)
+    if await db.book_credits.find_one({"user_id": billing_user["id"], "project_id": str(p["_id"])}):
+        return True                                          # bought the book for it; its window has since ended
+    aid = p.get("results_audit_id")
+    return bool(aid and (await db.audits.find_one({"audit_id": aid}) or {}).get("paid"))
+
+
+def _check_kind(check_id: str) -> str:
+    """What kind of check ran, without revealing its result (labels like "Color Space (RGB)" would)."""
+    c = (check_id or "").lower()
+    for keys, name in ((("size",), "Page & cover size"), (("dpi",), "Resolution"), (("color",), "Color space"),
+                       (("transparen",), "Transparency"), (("ink", "tac"), "Ink coverage"), (("bleed",), "Bleed"),
+                       (("pdfx",), "PDF/X-1a print standard"), (("margin", "safety", "spine", "center"), "Safe margins")):
+        if any(k in c for k in keys):
+            return name
+    return "Print readiness"
+
+
+# File facts that ARE a check's answer (color_mode "RGB" is the color-space result, dpi the resolution one).
+_RESULT_REVEALING_FILE_FACTS = ("color_mode", "has_transparency", "dpi_x", "dpi_y")
+
+
+def _strip_file_facts(meta: Optional[dict]) -> Optional[dict]:
+    return {k: v for k, v in meta.items() if k not in _RESULT_REVEALING_FILE_FACTS} if meta else meta
+
+
+def _lock_results(pd: dict) -> dict:
+    """The free demo view of a project: every result detail removed, only the honest count kept.
+    Works on its own deep copy -- blanking results on a shared object would wipe the real stored scan."""
+    pd = copy.deepcopy(pd)
+    slots = pd.get("slots") or {}
+    checks = [c for s in slots.values() for c in (s.get("compliance") or [])] or list(pd.get("compliance") or [])
+    kinds = []
+    for c in checks:
+        k = _check_kind(c.get("id"))
+        if k not in kinds:
+            kinds.append(k)
+    for key, s in list(slots.items()):
+        slots[key] = {**_strip_file_facts(s), "compliance": []}
+    pd["compliance"] = []
+    pd["file_metadata"] = _strip_file_facts(pd.get("file_metadata"))
+    for key in ("repair_log", "final_review"):
+        pd.pop(key, None)
+    pd["results_locked"] = True
+    pd["results_summary"] = {"scanned": bool(checks), "issues": sum(1 for c in checks if c.get("status") != "pass"),
+                             "checks_run": kinds}
+    return pd
+
+
+async def _present_project(p: dict, user: dict) -> dict:
+    pd = project_to_dict(p)
+    if await _results_unlocked(p, user):
+        pd["results_locked"] = False
+        pd["owns_product"] = await _owns_product(p, user)
+        return pd
+    pd["owns_product"] = False
+    return _lock_results(pd)
+
+
+async def _present_upload(p: dict, user: dict, body: dict) -> dict:
+    """A {file_metadata, compliance, ...} response, locked for a free demo project."""
+    if await _results_unlocked(p, user):
+        return body
+    checks = body.get("compliance") or []
+    return {**body, "compliance": [], "file_metadata": _strip_file_facts(body.get("file_metadata")), "results_locked": True,
+            "results_summary": {"scanned": True, "issues": sum(1 for c in checks if c.get("status") != "pass"),
+                                "checks_run": list(dict.fromkeys(_check_kind(c.get("id")) for c in checks))}}
+
+
 @api_router.get("/projects")
 async def list_projects(user: dict = Depends(get_current_user)):
     cursor = db.projects.find({"user_id": user["id"]}).sort("updated_at", -1)
-    items = [project_to_dict(p) async for p in cursor]
+    items = [await _present_project(p, user) async for p in cursor]
     return {"projects": items}
 
 
@@ -932,7 +1034,7 @@ async def create_project(payload: ProjectCreate, user: dict = Depends(get_curren
     }
     result = await db.projects.insert_one(doc)
     doc["_id"] = result.inserted_id
-    return project_to_dict(doc)
+    return await _present_project(doc, user)
 
 
 @api_router.get("/projects/{project_id}")
@@ -940,7 +1042,7 @@ async def get_project(project_id: str, user: dict = Depends(get_current_user)):
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
-    return project_to_dict(p)
+    return await _present_project(p, user)
 
 
 @api_router.patch("/projects/{project_id}")
@@ -953,7 +1055,7 @@ async def update_project(project_id: str, payload: ProjectUpdate, user: dict = D
     if result.matched_count == 0:
         raise HTTPException(404, "Project not found")
     p = await db.projects.find_one({"_id": ObjectId(project_id)})
-    return project_to_dict(p)
+    return await _present_project(p, user)
 
 
 @api_router.delete("/projects/{project_id}")
@@ -1050,7 +1152,7 @@ async def upload_file(project_id: str, file: UploadFile = File(...), user: dict 
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }},
     )
-    return {"file_metadata": metadata, "compliance": compliance, "file_id": file_id}
+    return await _present_upload(p, user, {"file_metadata": metadata, "compliance": compliance, "file_id": file_id})
 
 
 _WEB_SAFE_PREVIEW_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -1139,6 +1241,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
+    await _require_product(p, user, "Auto-Fix")
 
     if slot:
         if slot not in ALLOWED_SLOTS:
@@ -1494,6 +1597,7 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
+    await _require_product(p, user)
     _resolve_slot_target(p, slot)  # fail fast (404/400) exactly like autofix()
     if not autofix_agents.try_claim(project_id, slot):
         raise HTTPException(409, "An auto-fix is already running for this file - hang tight.")
@@ -1565,6 +1669,7 @@ async def autofix_confirm(project_id: str, slot: str = None, user: dict = Depend
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
+    await _require_product(p, user)
     stored_filename, current = _resolve_slot_target(p, slot)
     scan = await run_with_timeout(_scan_slot_sync, p, slot, stored_filename)
     compliance = scan["compliance"]
@@ -1602,6 +1707,7 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
+    await _require_product(p, user, "Final Review")
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
@@ -1773,6 +1879,17 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     # Dust-jacket books need a third file: the plain case underneath the
     # jacket. Real IngramSpark submission for one of these literally will
     # not process until all three files (case, jacket, interior) are filled.
+    # A cover uploaded as separate front / spine / back pieces is assembled into one wrap at export.
+    piece_slots = p.get("slots") or {}
+    from_pieces = needs_cover and not piece_slots.get("full_wrap") and any(
+        piece_slots.get(k) for k in ("front_cover", "spine", "back_cover"))
+    if from_pieces:
+        if p.get("binding", "paperback") != "paperback":
+            raise HTTPException(400, "Hardcover covers need one combined file — the hinge and wrap areas (and a jacket's "
+                                     "flaps) aren't part of separate front and back pieces. Upload your cover as one combined file.")
+        missing = [name for k, name in (("front_cover", "front"), ("spine", "spine"), ("back_cover", "back")) if not piece_slots.get(k)]
+        if missing:
+            raise HTTPException(404, f"Upload your cover's {' and '.join(missing)} too — separate pieces need all three.")
     needs_case = needs_cover and p.get("binding") == "hardcover_jacket"
     case_data = (p.get("slots") or {}).get("case_wrap") if needs_case else None
     if needs_case and not case_data:
@@ -1894,7 +2011,16 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
                 barcode_png = generate_barcode_png_bytes(p["isbn"])
             except Exception:
                 barcode_png = None
+        assembled_path = None
         try:
+            if from_pieces:
+                assembled_path = EXPORT_DIR / f"{project_id}_assembled_{export_id}.img"
+                await run_with_timeout(
+                    assemble_cover_pieces,
+                    *(str(UPLOAD_DIR / piece_slots[k]["stored_filename"]) for k in ("back_cover", "spine", "front_cover")),
+                    str(assembled_path), trim_w=trim["w"], trim_h=trim["h"], bleed=cover_bleed, spine_w=spine_w,
+                )
+                cover_path = assembled_path
             cover_result = await run_with_timeout(
                 build_print_ready_pdf,
                 str(cover_path), str(cover_export_path),
@@ -1912,8 +2038,13 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
             raise
         except Exception as e:
             await log_failure(db, "export_build_pdf", e, project_id=project_id, user_id=user["id"],
-                               context={"project_type": project_type, "part": "cover", "platform": p["platform"]})
+                               context={"project_type": project_type, "part": "cover", "platform": p["platform"],
+                                        "from_pieces": from_pieces})
             raise HTTPException(500, f"Export failed while building the cover PDF: {e}")
+        finally:
+            if assembled_path:
+                try: os.remove(assembled_path)
+                except OSError: pass
 
     if needs_interior:
         interior_path = UPLOAD_DIR / interior_data["stored_filename"]
@@ -2186,10 +2317,11 @@ async def batch_audit(payload: BatchIn, user: dict = Depends(get_current_user)):
             continue
         fails = sum(1 for c in compliance if c.get("status") == "fail") + sum(1 for f in structure if f.get("severity") == "fail")
         warnings = sum(1 for c in compliance if c.get("status") == "warning") + sum(1 for f in structure if f.get("severity") == "warning")
+        unlocked = await _results_unlocked(p, user)
         results.append({
             "project_id": pid, "ok": True, "name": p.get("name"),
-            "critical_failures": fails, "warnings": warnings,
-            "compliance": compliance, "structure_findings": structure,
+            "critical_failures": fails, "warnings": warnings, "results_locked": not unlocked,
+            "compliance": compliance if unlocked else [], "structure_findings": structure if unlocked else [],
         })
     return {"results": results}
 
@@ -3374,7 +3506,7 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
         update["compliance"] = compliance
 
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
-    return {"slot": slot, "file_metadata": metadata, "compliance": compliance}
+    return await _present_upload(p, user, {"slot": slot, "file_metadata": metadata, "compliance": compliance})
 
 
 def _save_generated_slot_file(p: dict, project_id: str, slot: str, file_id: str, data: bytes,
@@ -3443,13 +3575,14 @@ async def _replace_slot(project_id: str, p: dict, slot: str, metadata: dict, com
 class AICoverIn(BaseModel):
     prompt: str
     genre: Optional[str] = None
-    slot: str = "front_cover"  # front_cover or full_wrap
+    slot: str = "full_wrap"  # full wrap only -- see ai_generate_cover
 
 
 @api_router.post("/projects/{project_id}/ai-cover")
 async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = Depends(get_current_user)):
-    if payload.slot not in ("front_cover", "full_wrap"):
-        raise HTTPException(400, "AI cover generation supports the front_cover or full_wrap slot only")
+    if payload.slot != "full_wrap":
+        # A front-only image can't be exported: nothing assembles separate pieces into a wrap yet.
+        raise HTTPException(400, "AI cover art is generated as a full cover wrap (back, spine and front).")
     if not payload.prompt.strip():
         raise HTTPException(400, "Describe the cover art you want first.")
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
@@ -3468,6 +3601,15 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
     except AICoverError as e:
         raise HTTPException(e.status_code, str(e))
 
+    # The generator returns a fixed shape (e.g. 1792x1024); a real wrap is whatever this book's trim, spine and
+    # binding make it. It's artwork with no text, so fill the exact wrap by centered crop -- never stretch it.
+    from PIL import Image, ImageOps
+    with Image.open(io.BytesIO(image_bytes)) as art:
+        fitted = ImageOps.fit(art.convert("RGB"), _target_pixels_for_slot(p, "full_wrap"), method=Image.LANCZOS)
+    buf = io.BytesIO()
+    fitted.save(buf, "PNG", dpi=(300, 300))
+    image_bytes = buf.getvalue()
+
     file_id = f"{project_id}_{payload.slot}_ai_{uuid.uuid4().hex[:6]}.png"
     metadata, compliance = _save_generated_slot_file(
         p, project_id, payload.slot, file_id, image_bytes,
@@ -3475,7 +3617,7 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
         extra_meta={"ai_generated": True, "ai_prompt": payload.prompt[:500]},
     )
     await _replace_slot(project_id, p, payload.slot, metadata, compliance)
-    return {"slot": payload.slot, "file_metadata": metadata, "compliance": compliance}
+    return await _present_upload(p, user, {"slot": payload.slot, "file_metadata": metadata, "compliance": compliance})
 
 
 def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
@@ -3535,6 +3677,10 @@ def _target_inches_for_slot(p: dict, slot: str) -> tuple[float, float]:
     if slot in ("full_wrap", "case_wrap"):
         g = _case_wrap_geometry(p) if slot == "case_wrap" else _full_wrap_geometry(p)
         return g["total_width"], g["total_height"]
+    if slot in ("front_cover", "back_cover", "spine"):
+        g = _full_wrap_geometry(p)
+        h = g["panel_height"] + 2 * g["bleed"]
+        return (g["spine_width"], h) if slot == "spine" else (g["panel_width"] + 2 * g["bleed"], h)
     w_px, h_px = _target_pixels_for_slot(p, slot)
     return w_px / 300.0, h_px / 300.0
 
@@ -3590,6 +3736,7 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
+    await _require_product(p, user, "AI Upscale")
     slot_data = (p.get("slots") or {}).get(slot)
     if not slot_data or not slot_data.get("stored_filename"):
         raise HTTPException(404, f"No uploaded file in slot '{slot}'")
@@ -3673,7 +3820,7 @@ async def apply_cover_template(project_id: str, payload: CoverTemplateApplyIn, u
         extra_meta={"cover_template": payload.template_key},
     )
     await _replace_slot(project_id, p, "full_wrap", metadata, compliance)
-    return {"slot": "full_wrap", "file_metadata": metadata, "compliance": compliance}
+    return await _present_upload(p, user, {"slot": "full_wrap", "file_metadata": metadata, "compliance": compliance})
 
 
 @api_router.delete("/projects/{project_id}/slot/{slot}")
@@ -4100,6 +4247,70 @@ async def audit_verify(audit_id: str, session_id: str):
         return {"paid": False, "status": s.payment_status}
     except stripe.error.StripeError as e:
         raise HTTPException(500, f"Stripe verify failed: {e}")
+
+
+class ResultsUnlockIn(BaseModel):
+    origin_url: str
+
+
+@api_router.post("/projects/{project_id}/results-unlock/checkout")
+async def results_unlock_checkout(project_id: str, payload: ResultsUnlockIn, user: dict = Depends(get_current_user)):
+    """"See My Results — $1.99" in the Editor. It's the same audit product as the no-account audit (one price
+    constant, the audit_099 payment record, the same webhook/verify), just linked to this project -- so paying
+    unlocks this project's full results, and the audit credit toward the book works exactly as it already does.
+    Results only: repairs stay with the book (see _require_product)."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    if await _results_unlocked(p, user):
+        return {"already_unlocked": True}
+    if not any((s.get("compliance") for s in (p.get("slots") or {}).values())) and not p.get("compliance"):
+        raise HTTPException(400, "Upload your file first — the audit shows what the scan found in it.")
+    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
+        raise HTTPException(503, "Payments not configured — Stripe key missing")
+
+    aid = p.get("results_audit_id")
+    if not aid or not await db.audits.find_one({"audit_id": aid}):
+        aid = uuid.uuid4().hex
+        await db.audits.insert_one({
+            "audit_id": aid, "source": "editor", "project_id": project_id, "user_id": user["id"],
+            "platform": p.get("platform"), "trim_size": p.get("trim_size"), "file_type": p.get("project_type"),
+            "file_id": None, "file_metadata": None, "preview_findings": None, "full_findings": None, "summary": None,
+            "paid": False, "session_id": None, "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        await db.projects.update_one({"_id": p["_id"]}, {"$set": {"results_audit_id": aid}})
+
+    origin = book_pass.purchases.safe_origin(payload.origin_url)
+    price = book_pass.audit_price_cents(AUDIT_PRICE_CENTS)
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": "SparkPrep Audit — See My Results",
+                        "description": "Exactly what's wrong with your file and where. Credited toward your SparkPrep book.",
+                    },
+                    "unit_amount": price,
+                },
+                "quantity": 1,
+            }],
+            customer_email=user.get("email"),
+            success_url=f"{origin}/editor/{project_id}?results_session={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{origin}/editor/{project_id}",
+            metadata={"audit_id": aid, "project_id": project_id, "purpose": "editor_results_audit"},
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(500, f"Stripe error: {e}")
+
+    await db.audits.update_one({"audit_id": aid}, {"$set": {"session_id": session.id}})
+    await db.payment_transactions.insert_one({
+        "session_id": session.id, "audit_id": aid, "project_id": project_id, "user_id": user["id"],
+        "amount": price, "currency": "usd", "status": "initiated", "payment_status": "pending",
+        "product": "audit_099", "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"checkout_url": session.url, "session_id": session.id, "audit_id": aid}
 
 
 # =====================================================================
