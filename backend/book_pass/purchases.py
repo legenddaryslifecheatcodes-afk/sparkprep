@@ -13,7 +13,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from .config import (AUDIT_CREDIT_MAX_CENTS, BOOK_PASS_PRICE_CENTS, PASS_WINDOW_DAYS, PLANS)
+from .config import (AUDIT_SPECIAL_CENTS, BOOK_PASS_PRICE_CENTS, PASS_WINDOW_DAYS, PLANS)
 from .entitlements import (_get, grant_credit, grant_for_invoice, register_subscription, iso, now_utc)
 
 DEFAULT_ORIGIN = "https://sparkprep.legenddary.com"
@@ -54,11 +54,17 @@ async def audit_credit_cents(db, stripe, audit_id: str) -> int:
             raise
         except Exception:  # noqa: BLE001 - a stale reservation we can't inspect must not block the customer
             pass
-    paid = None
+    # Credited: exactly what was paid for this audit -- a standard audit, an Advanced Audit, or a standard audit
+    # plus its upgrade (two payments). Never more than was paid, and never more than the book costs.
+    paid_total, last_amount = 0, None
     async for t in db.payment_transactions.find({"audit_id": audit_id}):
         if t.get("product") == "audit_099":
-            paid = t.get("amount")
-    return min(paid or AUDIT_CREDIT_MAX_CENTS, AUDIT_CREDIT_MAX_CENTS)
+            last_amount = t.get("amount")
+            if t.get("payment_status") == "paid":
+                paid_total += int(t.get("amount") or 0)
+    if not paid_total:                       # records marked paid another way (older data): the audit's own charge
+        paid_total = int(last_amount or AUDIT_SPECIAL_CENTS)
+    return min(paid_total, BOOK_PASS_PRICE_CENTS - 1)
 
 
 async def consume_audit_credit(db, record: dict):

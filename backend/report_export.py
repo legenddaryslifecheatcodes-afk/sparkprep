@@ -42,7 +42,7 @@ def generate_audit_brief_pdf(
     )
     story = []
 
-    story.append(Paragraph(f"{brand_name} Audit Brief", title_style))
+    story.append(Paragraph(project_meta.get("audit_label") or f"{brand_name} Audit", title_style))
     story.append(Paragraph(
         f"{project_meta.get('title', 'Untitled project')} — "
         f"{project_meta.get('platform', 'Unknown platform')} — "

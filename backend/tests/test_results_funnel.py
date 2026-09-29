@@ -97,7 +97,14 @@ def clean_interior_project(client):
             c.drawString(1.1 * inch, (8.0 - i * 0.3) * inch, "Centered body text well inside the safe margins of the page.")
         c.showPage()
     c.save()
-    r = client.post(f"/api/projects/{pid}/slot-upload/interior", files={"file": ("b.pdf", buf.getvalue(), "application/pdf")})
+    # Genuinely print-ready: SparkPrep's own PDF/X-1a export of that manuscript (the raw reportlab PDF
+    # really does have issues -- no PDF/X declaration, fonts not embedded).
+    from file_processor import build_interior_pdf_x1a
+    d = tempfile.mkdtemp()
+    src, out = os.path.join(d, "src.pdf"), os.path.join(d, "out.pdf")
+    Path(src).write_bytes(buf.getvalue())
+    build_interior_pdf_x1a(src, out, 6, 9, 0.125, title="Clean Book", author="A")
+    r = client.post(f"/api/projects/{pid}/slot-upload/interior", files={"file": ("b.pdf", Path(out).read_bytes(), "application/pdf")})
     assert r.status_code == 200, r.text
     return pid, r.json()
 
@@ -192,6 +199,67 @@ def test_no_free_preview_before_paying_for_the_no_account_audit(client):
     assert "color_mode" not in got["file_metadata"] and "dpi_x" not in got["file_metadata"]
     text = json.dumps(got)
     assert "RGB" not in text and "Resolution" not in text
+
+
+def three_page_interior_with_a_page_3_problem():
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(6 * inch, 9 * inch))
+    for page in range(3):
+        c.setFont("Times-Roman", 11)
+        for i in range(20):
+            x = 0.05 * inch if page == 2 else 1.1 * inch          # page 3's text runs into the trim edge
+            c.drawString(x, (8.0 - i * 0.3) * inch, "Body text line that should sit inside the safe margins of the page.")
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def test_prices_follow_the_99_day_special(client, monkeypatch):
+    from datetime import timedelta
+    p = client.get("/api/pricing").json()
+    assert (p["audit"]["price_cents"], p["audit"]["regular_cents"]) == (199, 999)
+    assert (p["advanced_audit"]["price_cents"], p["advanced_audit"]["regular_cents"]) == (999, 1999)
+    assert p["special"]["active"] is True
+    monkeypatch.setattr(book_pass.config, "SPECIAL_END", datetime.now(timezone.utc) - timedelta(seconds=1))
+    p = client.get("/api/pricing").json()
+    assert p["audit"]["price_cents"] == 999 and p["advanced_audit"]["price_cents"] == 1999 and not p["special"]["active"]
+
+
+def test_advanced_audit_checks_every_page_and_an_upgrade_costs_only_the_difference(client, stripe_fake):
+    aid = client.post("/api/audit/start", json={"platform": "kdp", "trim_size": "6x9", "file_type": "interior"}).json()["audit_id"]
+    assert client.post(f"/api/audit/{aid}/upload", files={"file": ("book.pdf", three_page_interior_with_a_page_3_problem(), "application/pdf")}).status_code == 200
+
+    std = client.post(f"/api/audit/{aid}/checkout", json={"origin_url": "https://sparkprep.legenddary.com"}).json()
+    assert std["amount_cents"] == 199
+    pay(client, std["session_id"])
+    standard = client.get(f"/api/audit/{aid}").json()
+    assert standard["level"] == "standard" and standard["can_upgrade"] is True
+    assert not any("margin" in f["id"] for f in standard["full_report"]), "page 1 is clean; the standard audit only checks page 1"
+
+    up = client.post(f"/api/audit/{aid}/checkout", json={"origin_url": "https://sparkprep.legenddary.com", "level": "advanced"}).json()
+    assert up["amount_cents"] == 999 - 199                                     # only the difference
+    pay(client, up["session_id"])
+    advanced = client.get(f"/api/audit/{aid}").json()
+    assert advanced["level"] == "advanced" and advanced["can_upgrade"] is False
+    assert any("margin" in f["id"] for f in advanced["full_report"]), "the page-3 problem must be caught by the Advanced Audit"
+
+    r = client.post("/api/payments/book-pass", json={"origin_url": "https://sparkprep.legenddary.com", "audit_id": aid})
+    assert r.status_code == 200 and r.json()["audit_credit_cents"] == 999      # everything paid is credited
+
+
+def test_advanced_audit_is_for_interiors(client, stripe_fake):
+    aid = client.post("/api/audit/start", json={"platform": "kdp", "trim_size": "6x9", "file_type": "cover", "binding": "paperback",
+                                                "page_count": 100, "paper_type": "white_50lb"}).json()["audit_id"]
+    r = client.post(f"/api/audit/{aid}/checkout", json={"origin_url": "https://sparkprep.legenddary.com", "level": "advanced"})
+    assert r.status_code == 400 and "interior" in r.json()["detail"]
+
+
+def test_editor_can_buy_the_advanced_audit_directly(client, stripe_fake):
+    pid, _ = clean_interior_project(client)
+    r = client.post(f"/api/projects/{pid}/results-unlock/checkout", json={"origin_url": "https://sparkprep.legenddary.com", "level": "advanced"})
+    assert r.status_code == 200 and r.json()["amount_cents"] == 999
 
 
 def test_the_book_unlocks_repairs_and_results(client):

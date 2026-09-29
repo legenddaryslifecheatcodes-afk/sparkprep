@@ -465,8 +465,46 @@ _MARGIN_TOLERANCE_IN = 0.02
 MIN_BODY_BLOCK_CHARS = 20
 
 
+def _interior_page_shapes(trim_w_in: float, trim_h_in: float, bleed_in: float) -> list:
+    """Every page size a distributor accepts for this trim: exactly trim (no bleed -- most novels),
+    trim + bleed on the top, bottom and OUTER edge only (KDP's and IngramSpark's published spec, and
+    SparkPrep's own export), or trim + bleed on all four sides (Lulu's)."""
+    shapes = [(trim_w_in, trim_h_in)]
+    if bleed_in > 0:
+        shapes += [(trim_w_in + bleed_in, trim_h_in + 2 * bleed_in),
+                   (trim_w_in + 2 * bleed_in, trim_h_in + 2 * bleed_in)]
+    return shapes
+
+
+def _trim_origin_in(page, page_index: int, page_w_in: float, page_h_in: float,
+                    trim_w_in: float, trim_h_in: float) -> tuple:
+    """Where the trim edge sits inside a (possibly bled) page, as (left, top) inches -- so margins are
+    measured from where the page is actually cut, not from the edge of the bleed. Uses the PDF's own
+    TrimBox when it declares one; otherwise infers it (outer-edge-only bleed sits on the right of a
+    right-hand page -- page 1, 3, 5... -- and on the left of a left-hand page)."""
+    tb = page.trimbox
+    if abs(tb.width / 72.0 - trim_w_in) <= _SIZE_TOLERANCE_IN and abs(tb.height / 72.0 - trim_h_in) <= _SIZE_TOLERANCE_IN:
+        return tb.x0 / 72.0, tb.y0 / 72.0
+    extra_w = page_w_in - trim_w_in
+    top = max(0.0, (page_h_in - trim_h_in) / 2)
+    if extra_w <= _SIZE_TOLERANCE_IN:
+        return 0.0, top
+    one_edge = abs(extra_w - (page_h_in - trim_h_in) / 2) <= _SIZE_TOLERANCE_IN
+    if one_edge:
+        return (0.0 if page_index % 2 == 0 else extra_w), top
+    return extra_w / 2, top
+
+
+def _shapes_text(trim_w_in: float, trim_h_in: float, bleed_in: float) -> str:
+    sizes = [f"{w:g}\"×{h:g}\"" for w, h in _interior_page_shapes(trim_w_in, trim_h_in, bleed_in)]
+    if len(sizes) == 1:
+        return sizes[0]
+    return f"{sizes[0]} (no bleed) or {sizes[1]} (with bleed; some printers use {sizes[2]})"
+
+
 def check_interior_safety_margins(
-    pdf_path: str, platform_name: str, trim_w_in: float, trim_h_in: float, max_pages: Optional[int] = None
+    pdf_path: str, platform_name: str, trim_w_in: float, trim_h_in: float, max_pages: Optional[int] = None,
+    bleed_in: float = 0.125,
 ) -> List[dict]:
     """Checks that interior page size matches the ordered trim, and that no
     text block comes closer than SAFETY_MARGIN_IN to any trim edge.
@@ -502,9 +540,11 @@ def check_interior_safety_margins(
             page_w_in = page.rect.width / 72.0
             page_h_in = page.rect.height / 72.0
 
-            if abs(page_w_in - trim_w_in) > _SIZE_TOLERANCE_IN or abs(page_h_in - trim_h_in) > _SIZE_TOLERANCE_IN:
+            if not any(abs(page_w_in - w) <= _SIZE_TOLERANCE_IN and abs(page_h_in - h) <= _SIZE_TOLERANCE_IN
+                       for w, h in _interior_page_shapes(trim_w_in, trim_h_in, bleed_in)):
                 bad_size_pages.append({"page": i + 1, "found_in": [round(page_w_in, 2), round(page_h_in, 2)]})
                 continue
+            trim_left_in, trim_top_in = _trim_origin_in(page, i, page_w_in, page_h_in, trim_w_in, trim_h_in)
 
             # Page numbers and running heads are deliberately placed inside
             # the margin, not the body-text safe area -- every real print
@@ -525,10 +565,10 @@ def check_interior_safety_margins(
             x1 = max(b[2] for b in body_blocks)
             y1 = max(b[3] for b in body_blocks)
 
-            left_in = x0 / 72.0
-            right_in = page_w_in - (x1 / 72.0)
-            top_in = y0 / 72.0
-            bottom_in = page_h_in - (y1 / 72.0)
+            left_in = x0 / 72.0 - trim_left_in
+            right_in = (trim_left_in + trim_w_in) - (x1 / 72.0)
+            top_in = y0 / 72.0 - trim_top_in
+            bottom_in = (trim_top_in + trim_h_in) - (y1 / 72.0)
             page_min_margin = min(left_in, right_in, top_in, bottom_in)
 
             if page_min_margin < SAFETY_MARGIN_IN - _MARGIN_TOLERANCE_IN:
@@ -546,12 +586,12 @@ def check_interior_safety_margins(
             severity="fail",
             title=f"{len(bad_size_pages)} of {checked_pages} page(s) checked are the wrong size for your {trim_w_in}\"×{trim_h_in}\" trim",
             why_it_fails=(
-                f"Page {sample['page']} actually measures {sample['found_in'][0]}\"×{sample['found_in'][1]}\", not "
-                f"{trim_w_in}\"×{trim_h_in}\". When a distributor scales or crops a wrong-size page to fit the trim "
+                f"Page {sample['page']} actually measures {sample['found_in'][0]}\"×{sample['found_in'][1]}\". "
+                f"{platform_name} accepts {_shapes_text(trim_w_in, trim_h_in, bleed_in)}. When a distributor scales or crops a wrong-size page to fit the trim "
                 f"you ordered, the text shifts off-center and can land outside the required safety margin -- this "
                 f"alone commonly produces both an 'extends outside safety area' AND a 'not centered' rejection at once."
             ),
-            publisher_rule=f"{platform_name} — interior pages must match the ordered trim size exactly",
+            publisher_rule=f"{platform_name} — interior pages must be the ordered trim size (plus bleed, if the book has bleed)",
             pinpoint={"pages": [b["page"] for b in bad_size_pages[:10]], "expected_in": [trim_w_in, trim_h_in]},
             fix_steps=[
                 "Run Auto-Fix -- it fits and recenters your existing pages onto the correct trim size directly in "

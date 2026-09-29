@@ -456,9 +456,9 @@ TIERS = {
     },
 }
 
-# 99-Day Audit Season launch (Sept 23 → Dec 31)
-AUDIT_SEASON_START = datetime(2026, 9, 23, tzinfo=timezone.utc)
-AUDIT_SEASON_END = datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+# 99-Day Audit Season launch (Sept 23 → Dec 31) -- the same dates the 99-Day Special's audit prices use.
+AUDIT_SEASON_START = book_pass.SPECIAL_START
+AUDIT_SEASON_END = book_pass.SPECIAL_END
 
 
 def audit_season_status():
@@ -973,6 +973,13 @@ def _lock_results(pd: dict) -> dict:
         k = _check_kind(c.get("id"))
         if k not in kinds:
             kinds.append(k)
+    if any(s.get("is_pdf") and s.get("audit_issue_count") is not None for s in slots.values()):
+        kinds.append("Fonts & PDF structure")
+    # The count is the audit's own (see _slot_audit_issue_count), so it always matches what the paid audit shows;
+    # files uploaded before that existed fall back to the Editor's checks.
+    issues = (sum(s["audit_issue_count"] if s.get("audit_issue_count") is not None
+                  else sum(1 for c in (s.get("compliance") or []) if c.get("status") != "pass") for s in slots.values())
+              if slots else sum(1 for c in checks if c.get("status") != "pass"))
     for key, s in list(slots.items()):
         slots[key] = {**_strip_file_facts(s), "compliance": []}
     pd["compliance"] = []
@@ -980,8 +987,7 @@ def _lock_results(pd: dict) -> dict:
     for key in ("repair_log", "final_review"):
         pd.pop(key, None)
     pd["results_locked"] = True
-    pd["results_summary"] = {"scanned": bool(checks), "issues": sum(1 for c in checks if c.get("status") != "pass"),
-                             "checks_run": kinds}
+    pd["results_summary"] = {"scanned": bool(checks), "issues": issues, "checks_run": kinds}
     return pd
 
 
@@ -990,6 +996,11 @@ async def _present_project(p: dict, user: dict) -> dict:
     if await _results_unlocked(p, user):
         pd["results_locked"] = False
         pd["owns_product"] = await _owns_product(p, user)
+        aid = p.get("results_audit_id")
+        a = await db.audits.find_one({"audit_id": aid}) if aid and not pd["owns_product"] else None
+        if a and a.get("paid"):
+            pd["results_audit_level"] = a.get("level") or "standard"
+            pd["results_can_upgrade"] = _audit_can_upgrade(a)
         return pd
     pd["owns_product"] = False
     return _lock_results(pd)
@@ -1000,8 +1011,10 @@ async def _present_upload(p: dict, user: dict, body: dict) -> dict:
     if await _results_unlocked(p, user):
         return body
     checks = body.get("compliance") or []
+    audit_count = (body.get("file_metadata") or {}).get("audit_issue_count")
     return {**body, "compliance": [], "file_metadata": _strip_file_facts(body.get("file_metadata")), "results_locked": True,
-            "results_summary": {"scanned": True, "issues": sum(1 for c in checks if c.get("status") != "pass"),
+            "results_summary": {"scanned": True,
+                                "issues": audit_count if audit_count is not None else sum(1 for c in checks if c.get("status") != "pass"),
                                 "checks_run": list(dict.fromkeys(_check_kind(c.get("id")) for c in checks))}}
 
 
@@ -2995,10 +3008,7 @@ async def stripe_webhook(request: Request):
             if record.get("product") in book_pass.NEW_PRODUCTS:
                 await book_pass.purchases.on_session_paid(db, stripe, record, obj)
             elif record.get("product") == "audit_099" and record.get("audit_id"):
-                await db.audits.update_one(
-                    {"audit_id": record["audit_id"]},
-                    {"$set": {"paid": True, "paid_at": now_iso}},
-                )
+                await _mark_audit_paid(record["audit_id"], record.get("level"))
             elif record.get("product") == "advanced_interior_check":
                 # Unlock from Stripe's own confirmation, not only when the customer's
                 # browser returns to the success page (interior_check_verify) -- someone
@@ -3493,6 +3503,12 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
             if stale:
                 try: os.remove(UPLOAD_DIR / stale)
                 except OSError: pass
+    if book_pass.book_pass_on():
+        # The free scan's "found N issues" must match what the paid audit will show (one defined audit), so
+        # count with the audit itself rather than the Editor's own quicker check list.
+        count = await run_with_timeout(_slot_audit_issue_count, p, slot, str(file_path), metadata)
+        if count is not None:
+            metadata["audit_issue_count"] = count
     slots[slot] = {**metadata, "compliance": compliance}
 
     # If uploading full_wrap, also mirror into legacy uploaded_file for existing flows
@@ -3942,6 +3958,7 @@ class AuditStart(BaseModel):
 
 class AuditCheckoutIn(BaseModel):
     origin_url: str
+    level: Literal["standard", "advanced"] = "standard"
 
 
 @api_router.post("/audit/start")
@@ -4011,7 +4028,8 @@ async def audit_template_upload(audit_id: str, file: UploadFile = File(...)):
 
 def _audit_file_findings(file_path: str, metadata: dict, *, platform: str, trim_size: str, file_type: str,
                          binding: str = "paperback", page_count: int = 0, paper_type: str = "white_50lb",
-                         spine_width_override: Optional[float] = None, piece: Optional[str] = None) -> list:
+                         spine_width_override: Optional[float] = None, piece: Optional[str] = None,
+                         max_pages: int = BASIC_CHECK_MAX_PAGES) -> list:
     """THE audit (owner's rule: one defined audit). Both the no-account /audit page and the Editor's
     "See My Results" run exactly this: what failed, where, why, and the publisher requirement.
     file_type "cover" is a full wrap for `binding`; `piece` ("front_cover"/"back_cover"/"spine") audits one
@@ -4041,18 +4059,21 @@ def _audit_file_findings(file_path: str, metadata: dict, *, platform: str, trim_
             )
     else:
         bleed = plat["bleed"]
-        findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
+        findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"],
+                              pdf_size_checked_elsewhere=bool(metadata.get("is_pdf")))
         # deep_audit() only sees file-level metadata, never where text sits on the page -- so this adds the
-        # "content outside the safety area" check (the most common real rejection), on page 1.
+        # "content outside the safety area" check (the most common real rejection): page 1 for the standard
+        # audit, every page (up to ADVANCED_AUDIT_MAX_PAGES) for the Advanced Audit.
         if metadata.get("is_pdf"):
-            findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES)
+            findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=max_pages,
+                                                      bleed_in=bleed)
     tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), platform, plat["name"])
     if tac_finding:
         findings.append(tac_finding)
     # Structural checks that need the actual PDF: PDF/X-1a declaration, live transparency, layers,
     # embedded fonts, ICC output intent.
     if metadata.get("is_pdf"):
-        findings += run_pdf_structure_audit(str(file_path), plat["name"], max_pages=BASIC_CHECK_MAX_PAGES)
+        findings += run_pdf_structure_audit(str(file_path), plat["name"], max_pages=max_pages)
     return findings
 
 
@@ -4061,7 +4082,7 @@ _EDITOR_AUDIT_PARTS = (("full_wrap", "Cover", None), ("front_cover", "Front cove
                        ("case_wrap", "Case cover", None), ("interior", "Interior", None))
 
 
-def _editor_audit_findings(p: dict) -> list:
+def _editor_audit_findings(p: dict, max_pages: int = BASIC_CHECK_MAX_PAGES) -> list:
     """The same audit, run over every file in an Editor project (a snapshot taken when the results are
     first viewed after paying). Titles say which file each finding is about."""
     slots = dict(p.get("slots") or {})
@@ -4079,24 +4100,59 @@ def _editor_audit_findings(p: dict) -> list:
             file_type="interior" if slot == "interior" else "cover",
             binding="hardcover_case" if slot == "case_wrap" else p.get("binding", "paperback"),
             page_count=p.get("page_count") or 0, paper_type=p.get("paper_type", "white_50lb"),
-            spine_width_override=p.get("spine_width_override"), piece=piece,
+            spine_width_override=p.get("spine_width_override"), piece=piece, max_pages=max_pages,
         )
         findings += [{**f, "title": f"{label}: {f['title']}"} for f in part]
     return findings
 
 
-async def _ensure_editor_audit_built(a: dict) -> dict:
-    """An Editor "See My Results" audit is built from the project's files the first time its paid results
-    are opened, then kept as that audit's record (like the no-account audit's)."""
-    if a.get("source") != "editor" or not a.get("paid") or a.get("full_findings") is not None:
+def _slot_audit_issue_count(p: dict, slot: str, path: str, metadata: dict) -> Optional[int]:
+    """How many issues THE audit finds in this one uploaded file (page-1 level) -- the free scan's count."""
+    part = next(((label, piece) for s, label, piece in _EDITOR_AUDIT_PARTS if s == slot), None)
+    if not part:
+        return None
+    try:
+        return len(_audit_file_findings(
+            path, metadata, platform=p["platform"], trim_size=p["trim_size"],
+            file_type="interior" if slot == "interior" else "cover",
+            binding="hardcover_case" if slot == "case_wrap" else p.get("binding", "paperback"),
+            page_count=p.get("page_count") or 0, paper_type=p.get("paper_type", "white_50lb"),
+            spine_width_override=p.get("spine_width_override"), piece=part[1],
+        ))
+    except Exception:  # noqa: BLE001 - the count falls back to the Editor's own checks; never block an upload
+        logging.exception("audit issue count failed for slot %s", slot)
+        return None
+
+
+async def _ensure_audit_built(a: dict) -> dict:
+    """Builds a paid audit's findings at the level that was paid for, the first time they're opened: an Editor
+    audit from the project's files, an Advanced (every-page) upgrade of a no-account audit from its stored upload.
+    A no-account standard audit was already built at upload. The result is kept as that audit's record."""
+    if not a.get("paid"):
         return a
-    p = await db.projects.find_one({"_id": ObjectId(a["project_id"])})
-    if not p:
+    level = a.get("level") or "standard"
+    built = a.get("findings_level") or ("standard" if a.get("full_findings") is not None else None)
+    if built == level:
         return a
-    findings = await run_with_timeout(_editor_audit_findings, p)
-    update = {"full_findings": findings, "summary": audit_summary(findings),
-              "file_metadata": {"original_filename": p.get("name") or "Your book"},
-              "built_at": datetime.now(timezone.utc).isoformat()}
+    max_pages = book_pass.ADVANCED_AUDIT_MAX_PAGES if level == "advanced" else BASIC_CHECK_MAX_PAGES
+    update = {}
+    if a.get("source") == "editor":
+        p = await db.projects.find_one({"_id": ObjectId(a["project_id"])})
+        if not p:
+            return a
+        findings = await run_with_timeout(_editor_audit_findings, p, max_pages)
+        update["file_metadata"] = {"original_filename": p.get("name") or "Your book"}
+    else:
+        path = UPLOAD_DIR / a["file_id"] if a.get("file_id") else None
+        if not path or not path.exists():
+            return a                                         # upload already deleted: keep the results it has
+        findings = await run_with_timeout(
+            _audit_file_findings, str(path), a.get("file_metadata") or {}, platform=a["platform"],
+            trim_size=a["trim_size"], file_type=a.get("file_type") or "interior", binding=a.get("binding") or "paperback",
+            page_count=a.get("page_count") or 0, paper_type=a.get("paper_type") or "white_50lb", max_pages=max_pages,
+        )
+    update.update({"full_findings": findings, "summary": audit_summary(findings), "findings_level": level,
+                   "built_at": datetime.now(timezone.utc).isoformat()})
     await db.audits.update_one({"audit_id": a["audit_id"]}, {"$set": update})
     return {**a, **update}
 
@@ -4164,7 +4220,7 @@ async def audit_download_report(audit_id: str):
     """
     a = await db.audits.find_one({"audit_id": audit_id})
     if a:
-        a = await _ensure_editor_audit_built(a)
+        a = await _ensure_audit_built(a)
     if not a or a.get("full_findings") is None:
         raise HTTPException(404, "Audit not found or not yet run")
     if not a.get("paid"):
@@ -4175,9 +4231,12 @@ async def audit_download_report(audit_id: str):
         findings=a["full_findings"],
         summary=a.get("summary") or {},
         project_meta={
-            "title": a.get("file_metadata", {}).get("original_filename", "Untitled"),
+            "title": (a.get("file_metadata") or {}).get("original_filename", "Untitled"),
             "platform": PLATFORMS.get(a["platform"], {}).get("name", a.get("platform", "")),
             "trim_size": a.get("trim_size", ""),
+            "audit_label": ("SparkPrep Advanced Audit — every interior page checked"
+                            if (a.get("level") or "standard") == "advanced" else
+                            "SparkPrep Audit" + (" — page 1 of the interior" if a.get("file_type") in ("interior", "combined") else "")),
         },
         output_path=str(report_path),
     )
@@ -4236,7 +4295,7 @@ async def audit_get(audit_id: str):
     a = await db.audits.find_one({"audit_id": audit_id})
     if not a:
         raise HTTPException(404, "Audit not found")
-    a = await _ensure_editor_audit_built(a)
+    a = await _ensure_audit_built(a)
     trim = TRIM_SIZES.get(a["trim_size"])
     plat = PLATFORMS.get(a["platform"])
     paid = a.get("paid", False)
@@ -4250,8 +4309,82 @@ async def audit_get(audit_id: str):
         "file_metadata": a.get("file_metadata") if paid else _strip_file_facts(a.get("file_metadata")),
         "summary": _audit_public_summary(a.get("summary")) if paid else _audit_unpaid_summary(a.get("summary")),
         "paid": paid,
+        "level": a.get("level") or "standard",
+        "can_upgrade": _audit_can_upgrade(a),
+        # what this audit is worth toward a book: everything paid for it, until it's been used on one
+        "credit_cents": 0 if not paid or a.get("credit_consumed") else await _audit_paid_cents(a["audit_id"]),
         "full_report": _audit_public_findings(a.get("full_findings")) if paid else None,
     }
+
+
+def _audit_can_upgrade(a: dict) -> bool:
+    """A paid standard audit of an interior can become an Advanced (every-page) Audit for the difference --
+    while its file still exists (a no-account audit's upload is deleted once its report is downloaded)."""
+    return bool(a.get("paid") and (a.get("level") or "standard") == "standard" and book_pass.book_pass_on()
+                and a.get("file_type") in ("interior", "combined")
+                and (a.get("source") == "editor" or not a.get("files_deleted_at")))
+
+
+async def _audit_paid_cents(audit_id: str) -> int:
+    total = 0
+    async for t in db.payment_transactions.find({"audit_id": audit_id, "product": "audit_099", "payment_status": "paid"}):
+        total += int(t.get("amount") or 0)
+    return total
+
+
+async def _start_audit_checkout(a: dict, level: str, *, origin: str, success_url: str, cancel_url: str,
+                                email: Optional[str] = None, extra_tx: Optional[dict] = None) -> dict:
+    """The one checkout for both audits (the no-account /audit and the Editor's "See My Results"): the standard
+    audit, the Advanced (every-page) Audit, or upgrading a paid standard audit to Advanced for the difference.
+    Prices come from book_pass config (99-Day Special until it ends, then regular). Every payment is an
+    audit_099 record, so the webhook, verify and the credit toward the book work unchanged."""
+    current = a.get("level") or "standard"
+    if a.get("paid") and (level == "standard" or current == "advanced"):
+        return {"already_paid": True}
+    if level == "advanced":
+        if not book_pass.book_pass_on():
+            raise HTTPException(400, "The Advanced Audit isn't available right now.")
+        if a.get("file_type") not in ("interior", "combined"):
+            raise HTTPException(400, "The Advanced Audit checks every page of an interior — a cover is fully checked by the standard audit.")
+        if a.get("paid") and not _audit_can_upgrade(a):
+            raise HTTPException(400, "This audit's file was deleted after its report was downloaded — start a new audit and choose Advanced to check every page.")
+    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
+        raise HTTPException(503, "Payments not configured — Stripe key missing")
+
+    upgrading = bool(a.get("paid"))
+    price = book_pass.audit_level_price_cents(level, AUDIT_PRICE_CENTS)
+    amount = max(price - (await _audit_paid_cents(a["audit_id"]) if upgrading else 0), 50)
+    advanced = level == "advanced"
+    name = f"SparkPrep Advanced Audit — every page{' (upgrade)' if upgrading else ''}" if advanced else "SparkPrep Audit"
+    desc = (f"Every interior page (up to {book_pass.ADVANCED_AUDIT_MAX_PAGES}) checked: what failed, where, and the publisher requirement."
+            if advanced else "Every issue pinpointed: what failed, where, and the publisher requirement it breaks.")
+    if upgrading:
+        desc += " You pay only the difference from your standard audit."
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{"price_data": {"currency": "usd", "product_data": {"name": name, "description": desc},
+                                        "unit_amount": amount}, "quantity": 1}],
+            success_url=success_url, cancel_url=cancel_url,
+            metadata={"audit_id": a["audit_id"], "level": level, "purpose": "print_failure_audit"},
+            **({"customer_email": email} if email else {}),
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(500, f"Stripe error: {e}")
+    await db.audits.update_one({"audit_id": a["audit_id"]}, {"$set": {"session_id": session.id}})
+    await db.payment_transactions.insert_one({
+        "session_id": session.id, "audit_id": a["audit_id"], "amount": amount, "level": level,
+        "currency": "usd", "status": "initiated", "payment_status": "pending", "product": "audit_099",
+        "created_at": datetime.now(timezone.utc).isoformat(), **(extra_tx or {}),
+    })
+    return {"checkout_url": session.url, "session_id": session.id, "audit_id": a["audit_id"], "amount_cents": amount}
+
+
+async def _mark_audit_paid(audit_id: str, level: Optional[str]):
+    update = {"paid": True, "paid_at": datetime.now(timezone.utc).isoformat()}
+    if level == "advanced":
+        update["level"] = "advanced"
+    await db.audits.update_one({"audit_id": audit_id}, {"$set": update})
 
 
 @api_router.post("/audit/{audit_id}/checkout")
@@ -4259,57 +4392,30 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
     a = await db.audits.find_one({"audit_id": audit_id})
     if not a:
         raise HTTPException(404, "Audit not found")
-    if a.get("paid"):
-        return {"already_paid": True}
-    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
-        raise HTTPException(503, "Payments not configured — Stripe key missing")
-    origin = payload.origin_url.rstrip("/")
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": "SparkPrep Print Failure Audit",
-                        "description": "Every issue pinpointed: what failed, where, and the publisher requirement it breaks.",
-                    },
-                    "unit_amount": book_pass.audit_price_cents(AUDIT_PRICE_CENTS),
-                },
-                "quantity": 1,
-            }],
-            success_url=f"{origin}/audit/{audit_id}/report?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{origin}/audit/{audit_id}/preview",
-            metadata={"audit_id": audit_id, "purpose": "print_failure_audit"},
-        )
-    except stripe.error.StripeError as e:
-        raise HTTPException(500, f"Stripe error: {e}")
-
-    await db.audits.update_one({"audit_id": audit_id}, {"$set": {"session_id": session.id}})
-    await db.payment_transactions.insert_one({
-        "session_id": session.id,
-        "audit_id": audit_id,
-        "amount": book_pass.audit_price_cents(AUDIT_PRICE_CENTS),
-        "currency": "usd",
-        "status": "initiated",
-        "payment_status": "pending",
-        "product": "audit_099",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    return {"checkout_url": session.url, "session_id": session.id}
+    origin = book_pass.purchases.safe_origin(payload.origin_url)
+    return await _start_audit_checkout(
+        a, payload.level, origin=origin,
+        success_url=f"{origin}/audit/{audit_id}/report?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{origin}/audit/{audit_id}/{'report' if a.get('paid') else 'preview'}",
+    )
 
 
 @api_router.get("/audit/{audit_id}/verify")
 async def audit_verify(audit_id: str, session_id: str):
+    """Confirms THIS checkout session (not just "is the audit paid") -- an upgrade to Advanced is a second
+    payment on an audit that's already paid, and must still be recorded."""
     a = await db.audits.find_one({"audit_id": audit_id})
     if not a:
         raise HTTPException(404, "Audit not found")
-    if a.get("paid"):
+    tx = await db.payment_transactions.find_one({"session_id": session_id, "audit_id": audit_id})
+    if tx and tx.get("payment_status") == "paid":
+        return {"paid": True}
+    if not tx and a.get("paid"):
         return {"paid": True}
     try:
         s = stripe.checkout.Session.retrieve(session_id)
         if s.payment_status == "paid" or s.status == "complete":
-            await db.audits.update_one({"audit_id": audit_id}, {"$set": {"paid": True, "paid_at": datetime.now(timezone.utc).isoformat()}})
+            await _mark_audit_paid(audit_id, (tx or {}).get("level"))
             await db.payment_transactions.update_one(
                 {"session_id": session_id, "payment_status": {"$ne": "paid"}},
                 {"$set": {"status": "completed", "payment_status": "paid"}},
@@ -4322,6 +4428,7 @@ async def audit_verify(audit_id: str, session_id: str):
 
 class ResultsUnlockIn(BaseModel):
     origin_url: str
+    level: Literal["standard", "advanced"] = "standard"
 
 
 @api_router.post("/projects/{project_id}/results-unlock/checkout")
@@ -4333,55 +4440,36 @@ async def results_unlock_checkout(project_id: str, payload: ResultsUnlockIn, use
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not p:
         raise HTTPException(404, "Project not found")
-    if await _results_unlocked(p, user):
+    if await _owns_product(p, user):
+        return {"already_unlocked": True}                   # the book includes results and the every-page check
+    if payload.level == "standard" and await _results_unlocked(p, user):
         return {"already_unlocked": True}
     if not any((s.get("compliance") for s in (p.get("slots") or {}).values())) and not p.get("compliance"):
         raise HTTPException(400, "Upload your file first — the audit shows what the scan found in it.")
-    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
-        raise HTTPException(503, "Payments not configured — Stripe key missing")
 
     aid = p.get("results_audit_id")
-    if not aid or not await db.audits.find_one({"audit_id": aid}):
+    a = await db.audits.find_one({"audit_id": aid}) if aid else None
+    if not a:
         aid = uuid.uuid4().hex
-        await db.audits.insert_one({
+        a = {
             "audit_id": aid, "source": "editor", "project_id": project_id, "user_id": user["id"],
             "platform": p.get("platform"), "trim_size": p.get("trim_size"), "file_type": p.get("project_type"),
-            "file_id": None, "file_metadata": None, "preview_findings": None, "full_findings": None, "summary": None,
+            "file_id": None, "file_metadata": None, "full_findings": None, "summary": None,
             "paid": False, "session_id": None, "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        await db.audits.insert_one(dict(a))
         await db.projects.update_one({"_id": p["_id"]}, {"$set": {"results_audit_id": aid}})
 
     origin = book_pass.purchases.safe_origin(payload.origin_url)
-    price = book_pass.audit_price_cents(AUDIT_PRICE_CENTS)
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": "SparkPrep Audit — See My Results",
-                        "description": "Exactly what's wrong with your file and where. Credited toward your SparkPrep book.",
-                    },
-                    "unit_amount": price,
-                },
-                "quantity": 1,
-            }],
-            customer_email=user.get("email"),
-            success_url=f"{origin}/editor/{project_id}?results_session={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{origin}/editor/{project_id}",
-            metadata={"audit_id": aid, "project_id": project_id, "purpose": "editor_results_audit"},
-        )
-    except stripe.error.StripeError as e:
-        raise HTTPException(500, f"Stripe error: {e}")
-
-    await db.audits.update_one({"audit_id": aid}, {"$set": {"session_id": session.id}})
-    await db.payment_transactions.insert_one({
-        "session_id": session.id, "audit_id": aid, "project_id": project_id, "user_id": user["id"],
-        "amount": price, "currency": "usd", "status": "initiated", "payment_status": "pending",
-        "product": "audit_099", "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    return {"checkout_url": session.url, "session_id": session.id, "audit_id": aid}
+    result = await _start_audit_checkout(
+        a, payload.level, origin=origin, email=user.get("email"),
+        success_url=f"{origin}/editor/{project_id}?results_session={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{origin}/editor/{project_id}",
+        extra_tx={"project_id": project_id, "user_id": user["id"]},
+    )
+    if result.get("already_paid"):
+        return {"already_unlocked": True}
+    return result
 
 
 # =====================================================================

@@ -18,7 +18,7 @@ def compute_effective_dpi_report(width_px: int, height_px: int, target_w_in: flo
 
 def deep_audit(
     file_metadata: dict, expected_w: float, expected_h: float, bleed: float, platform_name: str,
-    is_cover: bool = False, shape_note: str = "",
+    is_cover: bool = False, shape_note: str = "", pdf_size_checked_elsewhere: bool = False,
 ) -> List[dict]:
     """Return a list of pinpointed failure/risk findings.
 
@@ -47,11 +47,13 @@ def deep_audit(
     file_kind = "cover" if is_cover else "interior"
     size_desc = shape_note or f"trim + {bleed}\" bleed each side"
 
-    # Bleed zone integrity
+    # Bleed zone integrity. An interior PDF's page size is checked page by page -- accepting no-bleed,
+    # outer-edge bleed and all-sides bleed -- by pdfx_validator.check_interior_safety_margins, so the
+    # caller turns this one off for it (it only knew one size, and flagged correct no-bleed novels).
     if file_metadata.get("is_pdf"):
         w_in = (file_metadata.get("width_px") or 0) / 72.0
         h_in = (file_metadata.get("height_px") or 0) / 72.0
-        if abs(w_in - expected_w) > 0.02 or abs(h_in - expected_h) > 0.02:
+        if not pdf_size_checked_elsewhere and (abs(w_in - expected_w) > 0.02 or abs(h_in - expected_h) > 0.02):
             findings.append({
                 "id": "bleed_dimension_mismatch",
                 "severity": "fail",
@@ -183,27 +185,30 @@ def deep_audit(
             "one_click_fix": True,
         })
 
-    # PDF/X-1a
-    findings.append({
-        "id": "pdf_x1a_export",
-        "severity": "warning",
-        "title": "Output must be PDF/X-1a:2001",
-        "why_it_fails": (
-            f"{platform_name} requires PDF/X-1a — a subset of PDF designed for print with embedded fonts, "
-            "flattened transparency, CMYK color, and no external references. Standard 'Save as PDF' from "
-            "most apps produces PDF 1.7 with RGB elements and unembedded fonts, which will be rejected."
-        ),
-        "publisher_rule": f"{platform_name} — 'PDF/X-1a:2001 or PDF/X-1a:2003 required for print files'",
-        "pinpoint": {"region": "PDF standard header", "required": "PDF/X-1a:2001"},
-        "fix_steps": [
-            "In Acrobat Pro: File → Save As Other → More Options → PDF/X-1a → Save.",
-            "In InDesign: File → Export → PDF (Print) → Standard: PDF/X-1a:2001.",
-            "Or use SparkPrep Export — every file leaves as PDF/X-1a automatically.",
-        ],
-        "fix_tools": ["Adobe Acrobat Pro", "Adobe InDesign", "SparkPrep Export"],
-        "est_fix_minutes": 2,
-        "one_click_fix": True,
-    })
+    # PDF/X-1a -- only for an image upload, which can never be PDF/X-1a itself. A PDF gets the real check
+    # (pdfx_validator.check_pdfx1a_declared reads its /GTS_PDFXVersion); adding this unconditionally
+    # reported a genuine PDF/X-1a file -- SparkPrep's own export included -- as an issue.
+    if not file_metadata.get("is_pdf"):
+        findings.append({
+            "id": "pdf_x1a_export",
+            "severity": "warning",
+            "title": "Output must be PDF/X-1a:2001",
+            "why_it_fails": (
+                f"{platform_name} requires PDF/X-1a — a subset of PDF designed for print with embedded fonts, "
+                "flattened transparency, CMYK color, and no external references. Standard 'Save as PDF' from "
+                "most apps produces PDF 1.7 with RGB elements and unembedded fonts, which will be rejected."
+            ),
+            "publisher_rule": f"{platform_name} — 'PDF/X-1a:2001 or PDF/X-1a:2003 required for print files'",
+            "pinpoint": {"region": "PDF standard header", "required": "PDF/X-1a:2001"},
+            "fix_steps": [
+                "In Acrobat Pro: File → Save As Other → More Options → PDF/X-1a → Save.",
+                "In InDesign: File → Export → PDF (Print) → Standard: PDF/X-1a:2001.",
+                "Or use SparkPrep Export — every file leaves as PDF/X-1a automatically.",
+            ],
+            "fix_tools": ["Adobe Acrobat Pro", "Adobe InDesign", "SparkPrep Export"],
+            "est_fix_minutes": 2,
+            "one_click_fix": True,
+        })
 
     return findings
 
