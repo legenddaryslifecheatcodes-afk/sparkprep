@@ -165,6 +165,35 @@ def test_1_99_unlocks_results_only_and_is_credited_toward_the_book(client, strip
     assert r.json()["audit_credit_cents"] == 199
 
 
+def test_one_audit_the_editor_unlock_gives_the_same_full_report(client, stripe_fake):
+    pid, _ = rgb_cover_project(client)
+    co = client.post(f"/api/projects/{pid}/results-unlock/checkout", json={"origin_url": "https://sparkprep.legenddary.com"}).json()
+    unpaid = client.get(f"/api/audit/{co['audit_id']}").json()
+    assert unpaid["full_report"] is None and "preview" not in unpaid
+    pay(client, co["session_id"])
+
+    report = client.get(f"/api/audit/{co['audit_id']}").json()            # the same report page the /audit flow uses
+    assert report["paid"] and report["full_report"]
+    for f in report["full_report"]:
+        assert f["title"].startswith("Cover: ") and f["publisher_rule"] and f["why_it_fails"]
+        assert not any(k in f for k in ("fix_steps", "fix_tools", "est_fix_minutes"))
+    pdf = client.get(f"/api/audit/{co['audit_id']}/report")
+    assert pdf.status_code == 200 and pdf.content[:4] == b"%PDF"
+
+
+def test_no_free_preview_before_paying_for_the_no_account_audit(client):
+    aid = client.post("/api/audit/start", json={"platform": "kdp", "trim_size": "6x9", "file_type": "interior"}).json()["audit_id"]
+    buf = io.BytesIO()
+    Image.new("RGB", (900, 1350), (200, 40, 40)).save(buf, "JPEG")
+    up = client.post(f"/api/audit/{aid}/upload", files={"file": ("page.jpg", buf.getvalue(), "image/jpeg")}).json()
+    assert set(up["summary"]) == {"total_issues"} and up["summary"]["total_issues"] > 0 and "preview" not in up
+    got = client.get(f"/api/audit/{aid}").json()
+    assert set(got["summary"]) == {"total_issues"} and "preview" not in got and got["full_report"] is None
+    assert "color_mode" not in got["file_metadata"] and "dpi_x" not in got["file_metadata"]
+    text = json.dumps(got)
+    assert "RGB" not in text and "Resolution" not in text
+
+
 def test_the_book_unlocks_repairs_and_results(client):
     pid, _ = rgb_cover_project(client)
     asyncio.run(book_pass.entitlements.grant_credit(server.db, uid(), "pass", dedupe_key=f"rf:{time.time_ns()}"))

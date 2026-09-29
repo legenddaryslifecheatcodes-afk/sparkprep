@@ -55,18 +55,9 @@ class TestAuditUpload:
         assert r.status_code == 200, r.text
         data = r.json()
         assert data["audit_id"] == audit_id
-        s = data["summary"]
-        for k in ("total_issues", "critical_failures", "warnings", "estimated_fix_minutes", "rejection_risk"):
-            assert k in s, f"Missing summary key: {k}"
-        assert isinstance(data["preview"], list)
-        # 600x900 raster => low DPI vs 6x9 trim, should have some findings
-        for item in data["preview"]:
-            for req_k in ("id", "severity", "title", "why_it_fails", "one_click_fix"):
-                assert req_k in item
-            assert len(item["why_it_fails"]) <= 121, f"why_it_fails too long: {len(item['why_it_fails'])}"
-            # Preview must NOT leak paid fields
-            for forbidden in ("fix_steps", "publisher_rule", "pinpoint"):
-                assert forbidden not in item, f"Preview leaked {forbidden}"
+        # Owner's rule: no free preview -- before paying, only the honest total leaves the server.
+        assert data["summary"] == {"total_issues": data["summary"]["total_issues"]}
+        assert "preview" not in data
 
     def test_upload_bad_ext(self, audit_id, tmp_path):
         bad = tmp_path / "x.txt"
@@ -95,8 +86,8 @@ class TestAuditGetAndPaidPath:
         data = r.json()
         assert data["paid"] is False
         assert data["full_report"] is None
-        assert data["preview"] is not None
-        assert data["summary"] is not None
+        assert "preview" not in data                                      # no free preview (owner's rule)
+        assert set(data["summary"]) == {"total_issues"}
 
     def test_get_after_manual_paid(self, audit_id):
         # Flip paid=true directly in Mongo via admin route? None exists. Use motor via env.

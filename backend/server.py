@@ -4009,6 +4009,98 @@ async def audit_template_upload(audit_id: str, file: UploadFile = File(...)):
     return {"detected_spec": detected_spec}
 
 
+def _audit_file_findings(file_path: str, metadata: dict, *, platform: str, trim_size: str, file_type: str,
+                         binding: str = "paperback", page_count: int = 0, paper_type: str = "white_50lb",
+                         spine_width_override: Optional[float] = None, piece: Optional[str] = None) -> list:
+    """THE audit (owner's rule: one defined audit). Both the no-account /audit page and the Editor's
+    "See My Results" run exactly this: what failed, where, why, and the publisher requirement.
+    file_type "cover" is a full wrap for `binding`; `piece` ("front_cover"/"back_cover"/"spine") audits one
+    separately uploaded paperback piece against its own size. Interiors are checked on page 1
+    (BASIC_CHECK_MAX_PAGES) -- every page is the book's Advanced Interior Check."""
+    trim = TRIM_SIZES[trim_size]
+    plat = PLATFORMS[platform]
+    if file_type == "cover":
+        paper = PAPER_TYPES.get(paper_type, PAPER_TYPES["white_50lb"])
+        spine_w = calculate_spine_width_for_platform(page_count or 0, paper["ppi"], platform, binding)[0]
+        if spine_width_override:
+            spine_w = float(spine_width_override)
+        bleed = resolve_binding_spec(binding, platform)["bleed"]
+        full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, platform)
+        if piece:
+            h = full["panel_height"] + 2 * bleed
+            w = full["spine_width"] if piece == "spine" else full["panel_width"] + 2 * bleed
+            findings = deep_audit(metadata, w, h, bleed, plat["name"], is_cover=True,
+                                  shape_note=f"{piece.replace('_', ' ')} piece, with bleed")
+        else:
+            shape_note = f"front + back + {spine_w:.3f}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
+            findings = deep_audit(metadata, full["total_width"], full["total_height"], bleed, plat["name"],
+                                  is_cover=True, shape_note=shape_note)
+            findings += check_cover_safety_margins(
+                str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
+                spine_x_in=full["spine_x"], spine_w_in=full["spine_width"], page_count=page_count, binding=binding,
+            )
+    else:
+        bleed = plat["bleed"]
+        findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
+        # deep_audit() only sees file-level metadata, never where text sits on the page -- so this adds the
+        # "content outside the safety area" check (the most common real rejection), on page 1.
+        if metadata.get("is_pdf"):
+            findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES)
+    tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), platform, plat["name"])
+    if tac_finding:
+        findings.append(tac_finding)
+    # Structural checks that need the actual PDF: PDF/X-1a declaration, live transparency, layers,
+    # embedded fonts, ICC output intent.
+    if metadata.get("is_pdf"):
+        findings += run_pdf_structure_audit(str(file_path), plat["name"], max_pages=BASIC_CHECK_MAX_PAGES)
+    return findings
+
+
+_EDITOR_AUDIT_PARTS = (("full_wrap", "Cover", None), ("front_cover", "Front cover", "front_cover"),
+                       ("spine", "Spine", "spine"), ("back_cover", "Back cover", "back_cover"),
+                       ("case_wrap", "Case cover", None), ("interior", "Interior", None))
+
+
+def _editor_audit_findings(p: dict) -> list:
+    """The same audit, run over every file in an Editor project (a snapshot taken when the results are
+    first viewed after paying). Titles say which file each finding is about."""
+    slots = dict(p.get("slots") or {})
+    if not slots and p.get("uploaded_file"):                 # a project from before per-slot uploads
+        slots["interior" if p.get("project_type") == "interior" else "full_wrap"] = {
+            **(p.get("file_metadata") or {}), "stored_filename": p["uploaded_file"]}
+    findings = []
+    for slot, label, piece in _EDITOR_AUDIT_PARTS:
+        meta = slots.get(slot)
+        path = UPLOAD_DIR / meta["stored_filename"] if meta and meta.get("stored_filename") else None
+        if not path or not path.exists():
+            continue
+        part = _audit_file_findings(
+            str(path), meta, platform=p["platform"], trim_size=p["trim_size"],
+            file_type="interior" if slot == "interior" else "cover",
+            binding="hardcover_case" if slot == "case_wrap" else p.get("binding", "paperback"),
+            page_count=p.get("page_count") or 0, paper_type=p.get("paper_type", "white_50lb"),
+            spine_width_override=p.get("spine_width_override"), piece=piece,
+        )
+        findings += [{**f, "title": f"{label}: {f['title']}"} for f in part]
+    return findings
+
+
+async def _ensure_editor_audit_built(a: dict) -> dict:
+    """An Editor "See My Results" audit is built from the project's files the first time its paid results
+    are opened, then kept as that audit's record (like the no-account audit's)."""
+    if a.get("source") != "editor" or not a.get("paid") or a.get("full_findings") is not None:
+        return a
+    p = await db.projects.find_one({"_id": ObjectId(a["project_id"])})
+    if not p:
+        return a
+    findings = await run_with_timeout(_editor_audit_findings, p)
+    update = {"full_findings": findings, "summary": audit_summary(findings),
+              "file_metadata": {"original_filename": p.get("name") or "Your book"},
+              "built_at": datetime.now(timezone.utc).isoformat()}
+    await db.audits.update_one({"audit_id": a["audit_id"]}, {"$set": update})
+    return {**a, **update}
+
+
 @api_router.post("/audit/{audit_id}/upload")
 async def audit_upload(audit_id: str, file: UploadFile = File(...)):
     a = await db.audits.find_one({"audit_id": audit_id})
@@ -4035,46 +4127,11 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
         metadata = analyze_file(str(file_path))
         metadata["original_filename"] = file.filename
         metadata["stored_filename"] = file_id
-
-        trim = TRIM_SIZES[a["trim_size"]]
-        plat = PLATFORMS[a["platform"]]
-        file_type = a.get("file_type", "interior")
-        if file_type == "cover":
-            binding = a.get("binding", "paperback")
-            paper = PAPER_TYPES.get(a.get("paper_type", "white_50lb"), PAPER_TYPES["white_50lb"])
-            spine_w, _ = calculate_spine_width_for_platform(a.get("page_count", 0), paper["ppi"], a["platform"], binding)
-            bleed = resolve_binding_spec(binding, a["platform"])["bleed"]
-            full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, a["platform"])
-            shape_note = f"front + back + {spine_w:.3f}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
-            findings = deep_audit(
-                metadata, full["total_width"], full["total_height"], bleed, plat["name"],
-                is_cover=True, shape_note=shape_note,
-            )
-            findings += check_cover_safety_margins(
-                str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
-                spine_x_in=full["spine_x"], spine_w_in=full["spine_width"],
-                page_count=a.get("page_count"), binding=binding,
-            )
-        else:
-            bleed = plat["bleed"]
-            findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"])
-            # deep_audit() only sees file-level metadata, never where text sits on the
-            # page -- so an interior audit couldn't catch "content extends outside the
-            # safety area" / "not centered" (the most common real distributor rejection).
-            # Kept at page 1 (BASIC_CHECK_MAX_PAGES), same depth as the structural check
-            # below and the Basic check -- this $0.99 diagnostic is priced below Basic, so
-            # it shouldn't see deeper into the file than the paid tier above it.
-            if metadata.get("is_pdf"):
-                findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES)
-        tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), a["platform"], plat["name"])
-        if tac_finding:
-            findings.append(tac_finding)
-        # Structural checks that require opening the actual PDF (not just its
-        # source metadata): PDF/X-1a declaration, live transparency, layers,
-        # embedded fonts, ICC output intent. Only applies to PDFs -- an image
-        # upload has none of this structure yet.
-        if metadata.get("is_pdf"):
-            findings += run_pdf_structure_audit(str(file_path), plat["name"], max_pages=BASIC_CHECK_MAX_PAGES)
+        findings = _audit_file_findings(
+            str(file_path), metadata, platform=a["platform"], trim_size=a["trim_size"],
+            file_type=a.get("file_type", "interior"), binding=a.get("binding") or "paperback",
+            page_count=a.get("page_count") or 0, paper_type=a.get("paper_type") or "white_50lb",
+        )
         return metadata, findings
 
     # The whole synchronous check sequence above (OCR, PDF structure audit,
@@ -4084,28 +4141,16 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
     metadata, findings = await run_with_timeout(_run_audit_checks)
     summary = audit_summary(findings)
 
-    preview = [
-        {
-            "id": f["id"],
-            "severity": f["severity"],
-            "title": f["title"],
-            "why_it_fails": f["why_it_fails"][:120] + ("…" if len(f["why_it_fails"]) > 120 else ""),
-            "one_click_fix": f.get("one_click_fix", False),
-        }
-        for f in findings
-    ]
-
     await db.audits.update_one(
         {"audit_id": audit_id},
         {"$set": {
             "file_id": file_id,
             "file_metadata": metadata,
-            "preview_findings": preview,
             "full_findings": findings,
             "summary": summary,
         }},
     )
-    return {"audit_id": audit_id, "summary": _audit_public_summary(summary), "preview": preview, "check_type": "basic"}
+    return {"audit_id": audit_id, "summary": _audit_unpaid_summary(summary), "check_type": "basic"}
 
 
 @api_router.get("/audit/{audit_id}/report")
@@ -4118,7 +4163,9 @@ async def audit_download_report(audit_id: str):
     not a free bypass of it.
     """
     a = await db.audits.find_one({"audit_id": audit_id})
-    if not a or not a.get("full_findings"):
+    if a:
+        a = await _ensure_editor_audit_built(a)
+    if not a or a.get("full_findings") is None:
         raise HTTPException(404, "Audit not found or not yet run")
     if not a.get("paid"):
         raise HTTPException(402, "Unlock the full report ($1.99) to download the PDF.")
@@ -4178,24 +4225,32 @@ def _audit_public_summary(summary: Optional[dict]) -> Optional[dict]:
     return {k: v for k, v in summary.items() if k != "estimated_fix_minutes"} if summary else summary
 
 
+def _audit_unpaid_summary(summary: Optional[dict]) -> Optional[dict]:
+    """Owner's rule: no free preview. Before paying, only the honest total leaves the server -- not which
+    issues, not their severity, not the rejection risk (the same view the Editor's free scan gives)."""
+    return {"total_issues": summary.get("total_issues", 0)} if summary else summary
+
+
 @api_router.get("/audit/{audit_id}")
 async def audit_get(audit_id: str):
     a = await db.audits.find_one({"audit_id": audit_id})
     if not a:
         raise HTTPException(404, "Audit not found")
+    a = await _ensure_editor_audit_built(a)
     trim = TRIM_SIZES.get(a["trim_size"])
     plat = PLATFORMS.get(a["platform"])
+    paid = a.get("paid", False)
     return {
         "audit_id": a["audit_id"],
         "platform": a["platform"],
         "platform_name": plat["name"] if plat else a["platform"],
         "trim_size": a["trim_size"],
         "trim_label": trim["label"] if trim else a["trim_size"],
-        "file_metadata": a.get("file_metadata"),
-        "summary": _audit_public_summary(a.get("summary")),
-        "preview": a.get("preview_findings"),
-        "paid": a.get("paid", False),
-        "full_report": _audit_public_findings(a.get("full_findings")) if a.get("paid") else None,
+        "file_type": a.get("file_type"),
+        "file_metadata": a.get("file_metadata") if paid else _strip_file_facts(a.get("file_metadata")),
+        "summary": _audit_public_summary(a.get("summary")) if paid else _audit_unpaid_summary(a.get("summary")),
+        "paid": paid,
+        "full_report": _audit_public_findings(a.get("full_findings")) if paid else None,
     }
 
 
