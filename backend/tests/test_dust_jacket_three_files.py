@@ -103,6 +103,29 @@ def test_wrong_size_pdf_jacket_fails_the_size_check(client):
     assert '20.438" x 9.500"' in check(r, "cover_size")["message"]
 
 
+def pdf_page(w_in, h_in):
+    from reportlab.pdfgen import canvas
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(w_in * 72, h_in * 72))
+    c.setFillColorRGB(0.1, 0.1, 0.1); c.rect(0, 0, w_in * 72, h_in * 72, fill=1, stroke=0)
+    c.setFillColorRGB(0.85, 0.7, 0.3); c.drawString(72, 72, "Legenddary Mindset")
+    c.showPage(); c.save()
+    return buf.getvalue()
+
+
+def test_pdf_covers_export(client):
+    """Authors mostly deliver covers as PDFs. Export used to open every cover with PIL, which can't
+    read a PDF, so a PDF jacket or case failed the whole export."""
+    pid = make_project(client)
+    assert upload(client, pid, "interior", "book.pdf", interior_pdf(), "application/pdf").status_code == 200
+    assert check(upload(client, pid, "full_wrap", "jacket.pdf", pdf_page(*JACKET), "application/pdf"), "cover_size")["status"] == "pass"
+    assert check(upload(client, pid, "case_wrap", "case.pdf", pdf_page(*CASE), "application/pdf"), "cover_size")["status"] == "pass"
+    r = client.post(f"/api/projects/{pid}/export")
+    assert r.status_code == 200, r.text
+    assert r.json()["cover"]["page_size_inches"] == pytest.approx(list(JACKET), abs=0.002)
+    assert r.json()["case"]["page_size_inches"] == pytest.approx(list(CASE), abs=0.002)
+
+
 def test_dust_jacket_book_exports_case_jacket_and_interior_together(client):
     pid = make_project(client)
     assert upload(client, pid, "interior", "book.pdf", interior_pdf(), "application/pdf").status_code == 200

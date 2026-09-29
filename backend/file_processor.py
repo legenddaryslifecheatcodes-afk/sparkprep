@@ -1048,6 +1048,26 @@ def build_print_ready_pdf(
 
     # Draw image scaled to full canvas. A cover that can't be read fails the export (the server reports it)
     # rather than shipping a blank page with an error string printed on it.
+    # A PDF cover (the most common way authors deliver one) isn't an image PIL can open, so render its
+    # first page at print resolution first and carry on through the same path as an uploaded image.
+    if Path(image_path).suffix.lower() == ".pdf":
+        import fitz
+        with fitz.open(image_path) as doc:
+            pix = doc[0].get_pixmap(dpi=300, alpha=False, colorspace=fitz.csRGB)
+            rendered = image_path + ".render.png"
+            pix.save(rendered)
+        try:
+            return build_print_ready_pdf(
+                rendered, output_pdf_path, trim_w, trim_h, bleed, spine_w=spine_w, is_cover=is_cover,
+                title=title, author=author, barcode_png_bytes=barcode_png_bytes, color_profile=color_profile,
+                producer_name=producer_name, binding=binding, platform=platform,
+            )
+        finally:
+            try:
+                os.remove(rendered)
+            except OSError:
+                pass
+
     with Image.open(image_path) as img:
         if img.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", img.size, (255, 255, 255))
