@@ -3705,9 +3705,10 @@ _GEOMETRY_FIELDS = ("page_count", "spine_width_override", "paper_type", "trim_si
 
 def _spine_number_needed(platform: str, binding: str, page_count: int, paper_type: str,
                          override: Optional[float]) -> bool:
-    """True for a hardcover whose distributor publishes no spine formula (IngramSpark, KDP) when the user
-    hasn't entered the real number. IngramSpark's own templates show why a guess won't do: Creme paper,
-    74 pages = 0.313", 108 pages = 0.375" -- no pages-per-inch formula gives both."""
+    """True for an IngramSpark / KDP / B&N hardcover when the user hasn't entered its spine width. Their cover
+    formulas are published (SparkPrep uses them), but the hardcover spine width itself comes on the cover template
+    ("the template ... contains book size and spine width information" -- IngramSpark File Creation Guide p.20-26).
+    Their own templates show why a guess won't do: Creme, 74 pages = 0.313", 108 pages = 0.375"."""
     if binding not in ("hardcover_case", "hardcover_jacket") or override:
         return False
     paper = PAPER_TYPES.get(paper_type, PAPER_TYPES["white_50lb"])
@@ -3720,9 +3721,9 @@ def _project_needs_spine_number(p: dict) -> bool:
 
 
 def _spine_needed_message(platform_name: str) -> str:
-    return (f"{platform_name} doesn't publish its hardcover spine formula, so the spine width has to come from "
-            f"your {platform_name} cover template (it's printed under the spine, e.g. 0.313). Enter it in "
-            "Spine Width -- until then SparkPrep can't tell whether this cover is the right size.")
+    return (f"{platform_name} gives a hardcover's spine width on its cover template, set for your exact page count "
+            f"and paper (it's printed under the spine, e.g. 0.313). Enter it in Spine Width -- SparkPrep builds your "
+            "cover from it, so until then it can't tell whether this cover is the right size.")
 
 
 def _cover_bleed_for_slot(p: dict, slot: str) -> Optional[float]:

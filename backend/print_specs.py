@@ -73,8 +73,9 @@ BINDING_TYPES = {
         # "square"). Pinned to two real IngramSpark case templates (6x9, Creme):
         # spine 0.313" -> 14.194 x 10.5, spine 0.375" -> 14.256 x 10.5 -- both
         # give a fixed 13.881" besides the spine, i.e. each board is trim -
-        # 0.1845". (The guide's rounded "- 0.185" gave 14.193 / 14.255, and an
-        # earlier comment here wrongly said it matched "to the third decimal".)
+        # 0.1845". (The File Creation Guide states "- .185"", which gives 14.193 /
+        # 14.255 -- 0.001" under what IngramSpark's own generated templates say.
+        # SparkPrep matches the templates, since that's what the customer sees.)
         "board_width_adjust": -0.1845,
         "board_height_adjust": 0.25,
     },
@@ -201,7 +202,8 @@ def calculate_spine_width_for_platform(
     page/PPI estimate that should be verified against the distributor's own
     calculator for a hardcover binding). Only Lulu has a publicly documented
     formula/table for both bindings; IngramSpark and KDP hardcover spine
-    comes from an internal calculator with no public formula -- for those,
+    comes on the distributor's cover template (IngramSpark: "book size and spine width information" on
+    the template from its template generator) rather than a page/PPI formula -- for those,
     this still returns the page/PPI estimate, flagged as unconfirmed, and
     the project's spine_width_override is how the user supplies the real
     number.
