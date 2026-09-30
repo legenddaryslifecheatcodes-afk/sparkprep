@@ -153,6 +153,9 @@ class MemoryCollection:
         self._docs = [doc for doc in self._docs if not all(doc.get(key) == value for key, value in (filter or {}).items())]
         return type("DeleteResult", (), {"deleted_count": before - len(self._docs)})()
 
+    async def delete_many(self, filter=None):
+        return await self.delete_one(filter)  # this shim's delete_one already removes every match
+
     async def insert_many(self, docs):
         inserted_ids = []
         for doc in docs:
@@ -581,7 +584,7 @@ async def get_billing_user(user: dict) -> dict:
 # ---- Models ----
 class RegisterIn(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=6)
+    password: str = Field(min_length=8)
     name: Optional[str] = None
 
 class LoginIn(BaseModel):
@@ -693,12 +696,38 @@ async def register(payload: RegisterIn, response: Response):
     return {"user": enrich_user(doc), "token": token}
 
 
+# A cool-down, never a lockout (owner's rule): after LOGIN_MAX_FAILS wrong passwords for one account within
+# LOGIN_WINDOW_S, that account's login waits until the oldest of those tries is LOGIN_WINDOW_S old. That makes
+# guessing by a program useless while the real owner is never locked out and never needs a phone or codes.
+LOGIN_MAX_FAILS = 10
+LOGIN_WINDOW_S = 15 * 60
+
+
+async def _recent_login_fails(email: str) -> list:
+    doc = await db.login_guard.find_one({"email": email}) or {}
+    cutoff = datetime.now(timezone.utc).timestamp() - LOGIN_WINDOW_S
+    return [t for t in (doc.get("fails") or []) if t > cutoff]
+
+
 @api_router.post("/auth/login")
 async def login(payload: LoginIn, response: Response):
     email = payload.email.lower()
+    fails = await _recent_login_fails(email)
+    if len(fails) >= LOGIN_MAX_FAILS:
+        wait_min = max(1, round((min(fails) + LOGIN_WINDOW_S - datetime.now(timezone.utc).timestamp()) / 60))
+        raise HTTPException(status_code=429, detail=(
+            f"Too many wrong passwords for this account. To keep it safe, please wait about {wait_min} minute"
+            f"{'' if wait_min == 1 else 's'} and try again. Nothing is locked -- your password works as soon as the wait is over."))
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
+        fails.append(datetime.now(timezone.utc).timestamp())
+        if await db.login_guard.find_one({"email": email}):
+            await db.login_guard.update_one({"email": email}, {"$set": {"fails": fails}})
+        else:
+            await db.login_guard.insert_one({"email": email, "fails": fails})
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if fails:
+        await db.login_guard.update_one({"email": email}, {"$set": {"fails": []}})
     uid = str(user["_id"])
     token = create_access_token(uid, email)
     set_auth_cookie(response, token)
@@ -4727,7 +4756,7 @@ async def results_unlock_checkout(project_id: str, payload: ResultsUnlockIn, use
 class BetaRedeemIn(BaseModel):
     code: str
     email: EmailStr
-    password: str = Field(min_length=6)
+    password: str = Field(min_length=8)
     name: Optional[str] = None
 
 
@@ -5038,6 +5067,92 @@ async def _find_owned_project(project_id: str, user: dict):
 
 api_router.include_router(book_pass.build_router(db=db, get_current_user=get_current_user, stripe=stripe,
                                                  find_project=_find_owned_project))
+# ---- Database backups (owner's rule, 2026-09-29: no lockout or accident can ever cost SparkPrep its customers)
+# Every collection, exported to one gzip'd JSON file (Mongo-exact types via bson.json_util, so a restore brings
+# back real ObjectIds and dates). Nightly copies stay on the server (last BACKUP_KEEP); the admin page's
+# "Download backup" gives the owner a copy for a USB drive at home. tools/restore_backup.py puts one back.
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(exist_ok=True)
+BACKUP_KEEP = 7
+BACKUP_FORMAT = "sparkprep-backup-v1"
+
+
+async def _collection_names() -> list:
+    if isinstance(db, MemoryDatabase):
+        fixed = [k for k, v in vars(db).items() if isinstance(v, MemoryCollection)]
+        return sorted(set(fixed) | set(db._dynamic))
+    return sorted(n for n in await db.list_collection_names() if not n.startswith("system."))
+
+
+async def _export_database() -> tuple:
+    """-> (gzip bytes, {collection: document count})."""
+    import gzip
+    from bson import json_util
+    collections, counts = {}, {}
+    for name in await _collection_names():
+        docs = [d async for d in getattr(db, name).find({})]
+        collections[name] = docs
+        counts[name] = len(docs)
+    payload = {"format": BACKUP_FORMAT, "exported_at": datetime.now(timezone.utc).isoformat(), "counts": counts,
+               "collections": collections}
+    return gzip.compress(json_util.dumps(payload).encode("utf-8")), counts
+
+
+async def _write_nightly_backup() -> Path:
+    data, counts = await _export_database()
+    path = BACKUP_DIR / f"sparkprep-backup-{datetime.now(timezone.utc):%Y-%m-%d}.json.gz"
+    path.write_bytes(data)
+    for old in sorted(BACKUP_DIR.glob("sparkprep-backup-*.json.gz"))[:-BACKUP_KEEP]:
+        old.unlink(missing_ok=True)
+    logger.info("backup written: %s (%d bytes, %s)", path.name, len(data), counts)
+    return path
+
+
+async def _nightly_backup_loop():
+    while True:
+        try:
+            today = BACKUP_DIR / f"sparkprep-backup-{datetime.now(timezone.utc):%Y-%m-%d}.json.gz"
+            if not today.exists():
+                await _write_nightly_backup()
+        except Exception as e:                      # a failed backup must never take the site down
+            await log_failure(db, "nightly_backup", e)
+        await asyncio.sleep(60 * 60)                # check hourly; writes once per day
+
+
+@api_router.get("/admin/backup")
+async def admin_download_backup(_: dict = Depends(require_admin)):
+    """A full backup right now, as a file for the owner to keep (USB drive at home)."""
+    data, _counts = await _export_database()
+    name = f"sparkprep-backup-{datetime.now(timezone.utc):%Y-%m-%d-%H%M}.json.gz"
+    return Response(content=data, media_type="application/gzip",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@api_router.get("/admin/backups")
+async def admin_list_backups(_: dict = Depends(require_admin)):
+    files = sorted(BACKUP_DIR.glob("sparkprep-backup-*.json.gz"), reverse=True)
+    return {"backups": [{"name": f.name, "bytes": f.stat().st_size,
+                         "created_at": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat()} for f in files],
+            "keep": BACKUP_KEEP}
+
+
+@api_router.get("/admin/backups/{name}")
+async def admin_download_nightly_backup(name: str, _: dict = Depends(require_admin)):
+    path = BACKUP_DIR / name
+    if not name.startswith("sparkprep-backup-") or path.parent != BACKUP_DIR or not path.exists():
+        raise HTTPException(404, "Backup not found")
+    return FileResponse(str(path), filename=name, media_type="application/gzip")
+
+
+@app.on_event("startup")
+async def start_nightly_backups():
+    if client is None:                              # local in-memory runs have nothing worth backing up
+        return
+    task = asyncio.create_task(_nightly_backup_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 app.include_router(api_router)
 
 app.add_middleware(RequestTimeoutMiddleware)
