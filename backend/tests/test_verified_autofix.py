@@ -835,12 +835,13 @@ def test_export_bundles_a_found_and_fixed_report_when_repairs_happened(client):
     assert dl.status_code == 200
     import zipfile
     zf = zipfile.ZipFile(io.BytesIO(dl.content))
-    report_names = [n for n in zf.namelist() if "found_and_fixed" in n]
+    report_names = [n for n in zf.namelist() if "SparkPrep_" in n and n.endswith("Report.pdf")]
     assert len(report_names) == 1
     assert zf.read(report_names[0])[:4] == b"%PDF"
 
 
-def test_export_stays_a_single_file_when_nothing_needed_fixing(client):
+def test_a_clean_export_still_gets_its_preflight_report(client):
+    # Owner's rule (2026-09-29): every finished book gets a report -- a clean one included.
     import numpy as np
     from file_processor import rgb_array_to_cmyk_array
     cmyk = rgb_array_to_cmyk_array(np.full((2775, 3810, 3), 245, dtype=np.uint8))
@@ -850,4 +851,6 @@ def test_export_stays_a_single_file_when_nothing_needed_fixing(client):
     client.post(f"/api/projects/{pid}/slot-upload/full_wrap", files={"file": ("c.tif", buf.getvalue(), "image/tiff")})
     r = client.post(f"/api/projects/{pid}/export")
     assert r.status_code == 200, r.text
-    assert not r.json()["export_name"].endswith(".zip")
+    data = r.json()
+    assert data["export_name"].endswith(".zip") and data["found_and_fixed_report"] is False
+    assert data["report_name"] in ("The SparkPrep Certified Complete Publisher Preflight Report", "SparkPrep Preflight Report")

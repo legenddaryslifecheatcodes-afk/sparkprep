@@ -66,7 +66,11 @@ def exported_cover(client, pid):
     r = client.post(f"/api/projects/{pid}/export")
     assert r.status_code == 200, r.text
     import pymupdf
-    doc = pymupdf.open(server.EXPORT_DIR / r.json()["export_name"])
+    import zipfile
+    # every book now comes with its preflight report, so the download is a zip: open the cover inside it
+    with zipfile.ZipFile(server.EXPORT_DIR / r.json()["export_name"]) as zf:
+        cover_name = next(n for n in zf.namelist() if not n.endswith("Report.pdf"))
+        doc = pymupdf.open(stream=zf.read(cover_name), filetype="pdf")
     page = doc[0]
     pix = page.get_pixmap(dpi=50)
     return r.json(), page.rect.width / 72, pix

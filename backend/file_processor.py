@@ -395,6 +395,45 @@ def autofix_interior_safety_margins(input_path: str, output_path: str,
     }
 
 
+def check_final_pdf_ink_coverage(file_path: str, platform: str, platform_name: str,
+                                 max_pages: Optional[int] = None) -> Optional[dict]:
+    """Ink coverage of a FINAL (already CMYK) print PDF, measured on every page (up to max_pages) from its
+    real CMYK ink -- used by the SparkPrep Certified check. (check_total_ink_coverage looks at page 1 of a
+    PDF through an RGB preview, which is right for a source file but not for certifying a final one.)"""
+    import numpy as np
+    import fitz
+    threshold = TAC_THRESHOLD_BY_PLATFORM.get(platform, TAC_THRESHOLD_DEFAULT)
+    over_pages, worst = [], 0.0
+    try:
+        doc = fitz.open(file_path)
+    except Exception:
+        return None
+    try:
+        for i, page in enumerate(doc):
+            if max_pages is not None and i >= max_pages:
+                break
+            zoom = min(1.0, _TAC_SAMPLE_MAX_DIM / max(page.rect.width, page.rect.height))
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csCMYK, alpha=False)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
+            totals = arr.astype(np.int32).sum(axis=-1)
+            if (totals * 100 > threshold * 255).sum() / max(totals.size, 1) >= _TAC_MIN_AFFECTED_FRACTION:
+                over_pages.append(i + 1)
+                worst = max(worst, int(totals.max()) / 255.0 * 100.0)
+    finally:
+        doc.close()
+    if not over_pages:
+        return None
+    from pdfx_validator import _finding
+    return _finding(
+        id="total_ink_coverage", severity="warning",
+        title=f"Ink coverage over {threshold}% on page{'s' if len(over_pages) > 1 else ''} {', '.join(map(str, over_pages[:10]))}",
+        why_it_fails=(f"{platform_name}'s limit is {threshold}% total ink; these pages reach about {round(worst)}%. "
+                      "Heavy ink can dry slowly, show through the page, or lose detail in dark areas."),
+        publisher_rule=f"{platform_name} — total ink coverage at or under {threshold}%",
+        pinpoint={"pages_affected": over_pages[:50]},
+    )
+
+
 def check_total_ink_coverage(file_path: str, is_pdf: bool, platform: str, platform_name: str) -> Optional[dict]:
     """Checks whether a meaningful share of a cover or interior page's real
     CMYK ink coverage exceeds the distributor's rich-black/TAC ceiling.
@@ -1201,6 +1240,7 @@ def run_compliance_checks(
     file_path: str = None, slot: str = None, platform_name: str = None, max_pages: int = None,
     final_w: float = None, final_h: float = None,
     spine_x_in: float = None, spine_w_in: float = None, page_count: int = None, binding: str = None,
+    cover_bleed_in: float = None,
 ) -> list:
     """Return a list of compliance issues with severity and auto-fix availability.
 
@@ -1399,6 +1439,7 @@ def run_compliance_checks(
         cover_margin_findings = check_cover_safety_margins(
             file_path, file_metadata.get("is_pdf", False), final_w, final_h, platform_name or platform,
             spine_x_in=spine_x_in, spine_w_in=spine_w_in, page_count=page_count, binding=binding,
+            bleed_in=cover_bleed_in if cover_bleed_in is not None else bleed,
         )
         for f in cover_margin_findings:
             checks.append({

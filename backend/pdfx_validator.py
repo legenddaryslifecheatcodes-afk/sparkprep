@@ -154,6 +154,77 @@ def check_transparency(pdf: pikepdf.Pdf, max_pages: Optional[int] = None) -> Opt
     )
 
 
+def _is_rgb_space(cs) -> bool:
+    """True for a PDF color space that is RGB (DeviceRGB, CalRGB, or a 3-channel ICC profile)."""
+    try:
+        if isinstance(cs, pikepdf.Name):
+            return str(cs) in ("/DeviceRGB", "/CalRGB")
+        if isinstance(cs, pikepdf.Array) and len(cs) >= 1:
+            kind = str(cs[0])
+            if kind == "/CalRGB":
+                return True
+            if kind == "/ICCBased" and len(cs) > 1:
+                return int(cs[1].get("/N", 0)) == 3
+            if kind in ("/Indexed", "/I") and len(cs) > 1:
+                return _is_rgb_space(cs[1])
+    except Exception:
+        return False
+    return False
+
+
+def _rgb_in_resources(obj, depth: int = 0) -> bool:
+    """RGB anywhere in this page/form's own drawing: colors set with rg/RG, an RGB color space picked
+    with cs/CS, or an RGB image -- following nested forms a few levels deep."""
+    if depth > 4:
+        return False
+    resources = obj.get("/Resources") or {}
+    named = resources.get("/ColorSpace") or {}
+    try:
+        for operands, op in pikepdf.parse_content_stream(obj):
+            name = str(op)
+            if name in ("rg", "RG"):
+                return True
+            if name in ("cs", "CS") and operands:
+                cs = operands[0]
+                if _is_rgb_space(cs) or (isinstance(cs, pikepdf.Name) and cs in named and _is_rgb_space(named[cs])):
+                    return True
+    except Exception:
+        pass
+    xobjects = resources.get("/XObject") or {}
+    for xobj in (xobjects.values() if hasattr(xobjects, "values") else []):
+        try:
+            subtype = str(xobj.get("/Subtype"))
+            if subtype == "/Image" and _is_rgb_space(xobj.get("/ColorSpace")):
+                return True
+            if subtype == "/Form" and _rgb_in_resources(xobj, depth + 1):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def check_rgb_color(pdf: pikepdf.Pdf, max_pages: Optional[int] = None) -> Optional[dict]:
+    """Checks the FINAL file for any RGB (screen) color left in its pages -- print is CMYK. Used by the
+    SparkPrep Certified check: export converts everything to CMYK, and this verifies it actually did,
+    rather than trusting that it should have."""
+    pages_to_scan = pdf.pages[:max_pages] if max_pages is not None else pdf.pages
+    pages = []
+    for page_num, page in enumerate(pages_to_scan, start=1):
+        if _rgb_in_resources(page.obj):
+            pages.append(page_num)
+    if not pages:
+        return None
+    return _finding(
+        id="rgb_color_in_final",
+        severity="fail",
+        title=f"RGB color left on page{'s' if len(pages) > 1 else ''} {', '.join(map(str, pages[:10]))}",
+        why_it_fails=("Print uses CMYK ink. RGB color left in a print file gets converted by the printer's "
+                      "equipment, and colors can shift."),
+        publisher_rule="Print files must be CMYK only",
+        pinpoint={"region": f"page(s) {pages[:10]}", "pages_affected": pages[:50]},
+    )
+
+
 def check_layers(pdf: pikepdf.Pdf) -> Optional[dict]:
     """Checks for Optional Content Groups (PDF's real name for layers).
     A PDF authored with layers left in (rather than flattened to one
@@ -465,14 +536,16 @@ _MARGIN_TOLERANCE_IN = 0.02
 MIN_BODY_BLOCK_CHARS = 20
 
 
-def _interior_page_shapes(trim_w_in: float, trim_h_in: float, bleed_in: float) -> list:
-    """Every page size a distributor accepts for this trim: exactly trim (no bleed -- most novels),
-    trim + bleed on the top, bottom and OUTER edge only (KDP's and IngramSpark's published spec, and
-    SparkPrep's own export), or trim + bleed on all four sides (Lulu's)."""
+def _interior_page_shapes(trim_w_in: float, trim_h_in: float, bleed_in: float, all_sides_bleed_ok: bool = False) -> list:
+    """Every page size the distributor accepts for this trim: exactly trim (no bleed -- most novels), or
+    trim + bleed on the top, bottom and OUTER edge only -- IngramSpark's PDF checklist: "Bleed should not
+    be added to the bind/gutter side", and SparkPrep's own export. Lulu alone asks for bleed on all four
+    sides (all_sides_bleed_ok)."""
     shapes = [(trim_w_in, trim_h_in)]
     if bleed_in > 0:
-        shapes += [(trim_w_in + bleed_in, trim_h_in + 2 * bleed_in),
-                   (trim_w_in + 2 * bleed_in, trim_h_in + 2 * bleed_in)]
+        shapes.append((trim_w_in + bleed_in, trim_h_in + 2 * bleed_in))
+        if all_sides_bleed_ok:
+            shapes.append((trim_w_in + 2 * bleed_in, trim_h_in + 2 * bleed_in))
     return shapes
 
 
@@ -495,16 +568,18 @@ def _trim_origin_in(page, page_index: int, page_w_in: float, page_h_in: float,
     return extra_w / 2, top
 
 
-def _shapes_text(trim_w_in: float, trim_h_in: float, bleed_in: float) -> str:
-    sizes = [f"{w:g}\"×{h:g}\"" for w, h in _interior_page_shapes(trim_w_in, trim_h_in, bleed_in)]
+def _shapes_text(trim_w_in: float, trim_h_in: float, bleed_in: float, all_sides_bleed_ok: bool = False) -> str:
+    sizes = [f"{w:g}\"×{h:g}\"" for w, h in _interior_page_shapes(trim_w_in, trim_h_in, bleed_in, all_sides_bleed_ok)]
     if len(sizes) == 1:
         return sizes[0]
-    return f"{sizes[0]} (no bleed) or {sizes[1]} (with bleed; some printers use {sizes[2]})"
+    if len(sizes) == 2:
+        return f"{sizes[0]} (no bleed) or {sizes[1]} (with bleed on the top, bottom and outside edge -- none on the gutter)"
+    return f"{sizes[0]} (no bleed) or {sizes[2]} (with bleed on all sides)"
 
 
 def check_interior_safety_margins(
     pdf_path: str, platform_name: str, trim_w_in: float, trim_h_in: float, max_pages: Optional[int] = None,
-    bleed_in: float = 0.125,
+    bleed_in: float = 0.125, all_sides_bleed_ok: bool = False,
 ) -> List[dict]:
     """Checks that interior page size matches the ordered trim, and that no
     text block comes closer than SAFETY_MARGIN_IN to any trim edge.
@@ -541,7 +616,7 @@ def check_interior_safety_margins(
             page_h_in = page.rect.height / 72.0
 
             if not any(abs(page_w_in - w) <= _SIZE_TOLERANCE_IN and abs(page_h_in - h) <= _SIZE_TOLERANCE_IN
-                       for w, h in _interior_page_shapes(trim_w_in, trim_h_in, bleed_in)):
+                       for w, h in _interior_page_shapes(trim_w_in, trim_h_in, bleed_in, all_sides_bleed_ok)):
                 bad_size_pages.append({"page": i + 1, "found_in": [round(page_w_in, 2), round(page_h_in, 2)]})
                 continue
             trim_left_in, trim_top_in = _trim_origin_in(page, i, page_w_in, page_h_in, trim_w_in, trim_h_in)
@@ -587,7 +662,7 @@ def check_interior_safety_margins(
             title=f"{len(bad_size_pages)} of {checked_pages} page(s) checked are the wrong size for your {trim_w_in}\"×{trim_h_in}\" trim",
             why_it_fails=(
                 f"Page {sample['page']} actually measures {sample['found_in'][0]}\"×{sample['found_in'][1]}\". "
-                f"{platform_name} accepts {_shapes_text(trim_w_in, trim_h_in, bleed_in)}. When a distributor scales or crops a wrong-size page to fit the trim "
+                f"{platform_name} accepts {_shapes_text(trim_w_in, trim_h_in, bleed_in, all_sides_bleed_ok)}. When a distributor scales or crops a wrong-size page to fit the trim "
                 f"you ordered, the text shifts off-center and can land outside the required safety margin -- this "
                 f"alone commonly produces both an 'extends outside safety area' AND a 'not centered' rejection at once."
             ),
@@ -763,7 +838,7 @@ def cover_ocr(file_path: str, is_pdf: bool, total_w_in: Optional[float] = None) 
 def check_cover_safety_margins(
     file_path: str, is_pdf: bool, total_w_in: float, total_h_in: float, platform_name: str,
     spine_x_in: Optional[float] = None, spine_w_in: Optional[float] = None,
-    page_count: Optional[int] = None, binding: Optional[str] = None,
+    page_count: Optional[int] = None, binding: Optional[str] = None, bleed_in: float = 0.0,
 ) -> List[dict]:
     """Checks whether any text detected on a cover sits too close to the
     OUTER trim edge of the whole flat cover (top/bottom/left/right), and --
@@ -854,7 +929,10 @@ def check_cover_safety_margins(
         word_right_in = (x + w) / px_per_in_x
         word_bottom_in = (y + h) / px_per_in_y
 
-        outer_margin = min(word_left_in, word_top_in, img_w_in - word_right_in, img_h_in - word_bottom_in)
+        # Distance from the TRIM line (where the book is cut), not the file's edge: the bleed (bleed_in) sits
+        # outside the trim and is cut off. Measuring from the file edge let a title 0.19" from the cut pass a
+        # 0.25" rule on a paperback -- and on a 0.625" case wrap, text right at the board edge passed.
+        outer_margin = min(word_left_in, word_top_in, img_w_in - word_right_in, img_h_in - word_bottom_in) - bleed_in
         if outer_margin < COVER_SAFETY_MARGIN_RECOMMENDED_IN:
             outer_flagged += 1
             if outer_worst_in is None or outer_margin < outer_worst_in:
@@ -892,7 +970,8 @@ def check_cover_safety_margins(
                 )
             ),
             publisher_rule=f"{platform_name} — cover text/art must stay at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" from the trim edge",
-            pinpoint={"detected_text": outer_worst_word, "margin_in": round(outer_worst_in, 2), "flagged_word_count": outer_flagged},
+            pinpoint={"detected_text": outer_worst_word, "margin_in": round(outer_worst_in, 2), "flagged_word_count": outer_flagged,
+                      "margin_from_file_edge_in": round(outer_worst_in + bleed_in, 3), "bleed_in": bleed_in},
             fix_steps=[
                 "SparkPrep's Auto-Fix can pull this back into the safe margin automatically by scaling the cover slightly inward -- run Auto-Fix on this file (image covers only; PDF covers should be re-exported with corrected margins from the source design file instead).",
                 f"To fix it manually instead: open your cover design file and move all text/logos at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" inside the trim edge on every side, then re-export and re-upload.",

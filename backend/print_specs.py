@@ -15,14 +15,28 @@ TRIM_SIZES = {
 }
 
 # Paper types with weight in pages-per-inch (PPI) - critical for spine width
+# "ppi" is the default pages-per-inch; "ppi_by_platform" holds a distributor's own published figure where
+# we have it. IngramSpark's come from its official Paper Specifications sheet (Lightning Source, rev.
+# 8/18/23): Groundwood 38# = 400, Creme 50# = 444, White 50# = 512, Color/Premium Color White 70# = 377.
+# SparkPrep used to apply one number to every distributor, so an IngramSpark white-paper spine came out
+# ~15% too wide and a groundwood spine ~22% too narrow. Always read it through paper_ppi().
 PAPER_TYPES = {
-    "white_50lb": {"label": "50lb White (Standard B&W)", "ppi": 444, "platforms": ["kdp", "ingramspark"]},
-    "cream_50lb": {"label": "50lb Cream (Fiction)", "ppi": 434, "platforms": ["kdp", "ingramspark"]},
+    "white_50lb": {"label": "50lb White (Standard B&W)", "ppi": 444, "platforms": ["kdp", "ingramspark"],
+                   "ppi_by_platform": {"ingramspark": 512}},
+    "cream_50lb": {"label": "50lb Cream (Fiction)", "ppi": 434, "platforms": ["kdp", "ingramspark"],
+                   "ppi_by_platform": {"ingramspark": 444}},
     "white_60lb": {"label": "60lb White (Premium)", "ppi": 400, "platforms": ["ingramspark"]},
     "color_60lb_standard": {"label": "60lb Color Standard", "ppi": 460, "platforms": ["kdp"]},
-    "color_60lb_premium": {"label": "60lb Color Premium", "ppi": 426, "platforms": ["kdp", "ingramspark"]},
-    "groundwood_38lb": {"label": "38lb Groundwood (Novel)", "ppi": 512, "platforms": ["ingramspark"]},
+    "color_60lb_premium": {"label": "60lb Color Premium", "ppi": 426, "platforms": ["kdp", "ingramspark"],
+                           "ppi_by_platform": {"ingramspark": 377}},
+    "groundwood_38lb": {"label": "38lb Groundwood (Novel)", "ppi": 512, "platforms": ["ingramspark"],
+                        "ppi_by_platform": {"ingramspark": 400}},
 }
+
+
+def paper_ppi(paper: dict, platform: str) -> int:
+    """Pages per inch for this paper at this distributor (its own published figure when we have one)."""
+    return (paper.get("ppi_by_platform") or {}).get(platform, paper["ppi"])
 
 # Binding types
 # Values below are IngramSpark's numbers, taken directly from their own File
@@ -56,11 +70,12 @@ BINDING_TYPES = {
         # The board a case-laminate cover wraps is NOT the trim size itself --
         # it's narrower (a hardcover board sits slightly inside the page
         # block's width) and taller (the board overhangs top/bottom, the
-        # "square"). Confirmed exactly against a real rejection: for this
-        # book's real 6x9 / spine 0.313" numbers, this formula reproduces
-        # IngramSpark's stated required cover size (14.194 x 10.5) to the
-        # third decimal.
-        "board_width_adjust": -0.185,
+        # "square"). Pinned to two real IngramSpark case templates (6x9, Creme):
+        # spine 0.313" -> 14.194 x 10.5, spine 0.375" -> 14.256 x 10.5 -- both
+        # give a fixed 13.881" besides the spine, i.e. each board is trim -
+        # 0.1845". (The guide's rounded "- 0.185" gave 14.193 / 14.255, and an
+        # earlier comment here wrongly said it matched "to the third decimal".)
+        "board_width_adjust": -0.1845,
         "board_height_adjust": 0.25,
     },
     "hardcover_jacket": {
@@ -124,6 +139,31 @@ PLATFORM_BINDING_OVERRIDES = {
             "board_width_adjust": 0.0,
             "board_height_adjust": 0.0,
         },
+        # Measured from Lulu's own generated jacket template (6x9, 74 pages, spine 0.25"; the owner's
+        # "LULU FULL JACKET TEMPLATE.pdf", 20" x 9.75"): bleed 0.25 | flap 3.25 | fold 0.25 | panel 6.125 |
+        # spine 0.25 | panel 6.125 | fold 0.25 | flap 3.25 | bleed 0.25; panel height 9.25. (Lulu calls the
+        # fold line to the spine, 6.25" x 9.25", the "book cover size".) IngramSpark's jacket numbers used to
+        # be applied to Lulu too -- a 20.352" x 9.5" file instead of 20" x 9.75". One data point (6x9).
+        "hardcover_jacket": {
+            "bleed": 0.25,
+            "flap": 3.25,
+            "wrap_fold": 0.25,
+            "board_width_adjust": 0.125,
+            "board_height_adjust": 0.25,
+        },
+    },
+    # Measured from Barnes & Noble Press's own "6 x 9 Hardcover w/ Dust Jacket" template (74 pages, spine
+    # 0.31"; 20.451" x 9.5"): same layout as IngramSpark's -- bleed 0.125, flap 3.25, fold 0.25, panel
+    # height trim + 0.25 -- but each panel is ~6.4445" (trim + 0.4445) where IngramSpark's is trim + 0.4375.
+    # One data point (6x9).
+    "barnes_noble": {
+        "hardcover_jacket": {
+            "bleed": 0.125,
+            "flap": 3.25,
+            "wrap_fold": 0.25,
+            "board_width_adjust": 0.4445,
+            "board_height_adjust": 0.25,
+        },
     },
 }
 
@@ -167,7 +207,9 @@ def calculate_spine_width_for_platform(
     number.
     """
     if platform == "lulu":
-        if binding == "hardcover_case":
+        # A jacket wraps the same hardcover book, so its spine comes from the hardcover table too (Lulu's
+        # jacket template: 74 pages -> 0.25", the table's value; the paperback formula gave 0.227").
+        if binding in ("hardcover_case", "hardcover_jacket"):
             for upper, width in LULU_HARDCOVER_SPINE_TABLE:
                 if page_count <= upper:
                     # Below 24 pages Lulu's own table is "N/A" -- hardcover
@@ -302,7 +344,7 @@ def calculate_full_cover_dimensions(
     (Cover Setup: Casebound / Dust Jacket + the Custom Trim Sizes bleed
     formulas, p.24-27 & 42):
 
-      Case laminate: board_w = trim_w - 0.185, board_h = trim_h + 0.25
+      Case laminate: board_w = trim_w - 0.1845, board_h = trim_h + 0.25
                       bleed_w = 2*bleed + 2*gutter_hinge + 2*board_w + spine_w
                       bleed_h = 2*bleed + board_h
       Dust jacket:    panel_w = trim_w + 0.4375, panel_h = trim_h + 0.25

@@ -134,94 +134,151 @@ def _pinpoint_text(p: Optional[dict]) -> str:
     return " · ".join(str(x) for x in parts)
 
 
-def generate_repair_report_pdf(
-    repair_log: list,
-    final_compliance: list,
-    project_meta: dict,
-    output_path: str,
-    brand_name: str = "SparkPrep",
-) -> str:
-    """Writes the "found & fixed" companion report bundled with every export --
-    the owner's own words: customers should see the depth of what the app
-    actually did, not just a pass/fail badge.
+_GOLD = colors.HexColor("#B8912F")
+_INK = colors.HexColor("#16161a")
 
-    repair_log: the project's full repair_log field (see
-        autofix_agents.pipeline._append_repair_log) -- one entry per Repair Bay
-        run that found something, in the order they happened.
-    final_compliance: the CURRENT compliance list for whatever's being
-        exported right now (export already guarantees no "fail" is present).
-    """
+
+def _seal_drawing(size: float = 1.9 * inch):
+    """The "SparkPrep Certified" seal: a gold double ring with the words in the middle."""
+    from reportlab.graphics.shapes import Drawing, Circle, String
+    d = Drawing(size, size)
+    c = size / 2
+    d.add(Circle(c, c, c - 2, strokeColor=_GOLD, strokeWidth=3, fillColor=colors.HexColor("#FBF6E8")))
+    d.add(Circle(c, c, c - 9, strokeColor=_GOLD, strokeWidth=1, fillColor=None))
+    d.add(String(c, c + 20, "SPARKPREP", textAnchor="middle", fontName="Helvetica-Bold", fontSize=13, fillColor=_INK))
+    d.add(String(c, c - 4, "CERTIFIED", textAnchor="middle", fontName="Helvetica-Bold", fontSize=19, fillColor=_GOLD))
+    d.add(String(c, c - 24, "PUBLISHER PREFLIGHT", textAnchor="middle", fontName="Helvetica", fontSize=7.5, fillColor=_INK))
+    return d
+
+
+def generate_preflight_report_pdf(cert: dict, repair_log: list, project_meta: dict, output_path: str,
+                                  brand_name: str = "SparkPrep") -> str:
+    """The report every finished book gets (owner's rule). `cert` is server._certify_final_files()'s result,
+    measured on the FINAL files. Certified -> "The SparkPrep Certified Complete Publisher Preflight Report"
+    with the seal; otherwise the plainer "SparkPrep Preflight Report" listing what's still open. Every claim
+    in it is a check that actually ran -- the seal is only worth something if it's never overclaimed."""
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("RepairTitle", parent=styles["Title"], fontSize=18, spaceAfter=4)
-    h2_style = ParagraphStyle("H2", parent=styles["Heading2"], spaceBefore=14, spaceAfter=6)
-    body_style = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=14)
-    small_style = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, textColor=colors.grey)
-    run_title_style = ParagraphStyle("RunTitle", parent=styles["Heading3"], fontSize=11, spaceAfter=2)
-    item_style = ParagraphStyle("Item", parent=styles["BodyText"], fontSize=10, leading=14, leftIndent=14)
+    certified = bool(cert.get("certified"))
+    title_style = ParagraphStyle("PFTitle", parent=styles["Title"], fontSize=17 if certified else 18,
+                                 leading=21, spaceAfter=4, textColor=_INK)
+    h2_style = ParagraphStyle("PFH2", parent=styles["Heading2"], fontSize=12.5, spaceBefore=12, spaceAfter=5, textColor=_INK)
+    body_style = ParagraphStyle("PFBody", parent=styles["BodyText"], fontSize=10, leading=14)
+    small_style = ParagraphStyle("PFSmall", parent=styles["BodyText"], fontSize=8.5, leading=11.5, textColor=colors.grey)
+    center_small = ParagraphStyle("PFCenterSmall", parent=small_style, alignment=1)
+    item_style = ParagraphStyle("PFItem", parent=styles["BodyText"], fontSize=10, leading=14, leftIndent=14)
+    run_title_style = ParagraphStyle("PFRun", parent=styles["Heading3"], fontSize=10.5, spaceAfter=2)
+    green = _SEVERITY_COLOR["pass"].hexval()
+    amber = _SEVERITY_COLOR["warning"].hexval()
 
-    doc = SimpleDocTemplate(
-        output_path, pagesize=letter,
-        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
-        leftMargin=0.75 * inch, rightMargin=0.75 * inch,
-    )
+    doc = SimpleDocTemplate(output_path, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.7 * inch,
+                            leftMargin=0.75 * inch, rightMargin=0.75 * inch,
+                            title=cert.get("report_name") or "SparkPrep Preflight Report", author=brand_name)
     story = []
+    checked = (cert.get("checked_at") or datetime.now(timezone.utc).isoformat())[:16].replace("T", " ")
 
-    story.append(Paragraph(f"{brand_name} — What We Found &amp; Fixed", title_style))
-    story.append(Paragraph(
-        f"{project_meta.get('title', 'Untitled project')} — "
-        f"{project_meta.get('platform', 'Unknown platform')} — "
-        f"{project_meta.get('trim_size', 'Unknown trim size')}",
-        body_style,
-    ))
-    story.append(Paragraph(f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", small_style))
-    story.append(Spacer(1, 0.2 * inch))
+    if certified:
+        seal = Table([[_seal_drawing()]], colWidths=[7 * inch])
+        seal.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER")]))
+        story.append(seal)
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(Paragraph("The SparkPrep Certified Complete Publisher Preflight Report",
+                               ParagraphStyle("PFTitleC", parent=title_style, alignment=1)))
+        story.append(Paragraph(f"Certificate {_esc(cert.get('certificate_id'))} &nbsp;·&nbsp; checked {checked} UTC", center_small))
+    else:
+        story.append(Paragraph(f"{brand_name} Preflight Report", title_style))
+        story.append(Paragraph(f"Checked {checked} UTC", small_style))
+    story.append(Spacer(1, 0.15 * inch))
 
+    # The book
+    # Plain table cells aren't parsed as markup, so they take the raw text (escaping here printed "&amp;").
+    rows = [["Book", str(project_meta.get("title", "Untitled"))],
+            ["Distributor", str(project_meta.get("platform", ""))],
+            ["Trim size", str(project_meta.get("trim_size", ""))],
+            ["Binding", str(project_meta.get("binding", ""))],
+            ["Paper", str(project_meta.get("paper", ""))]]
+    if project_meta.get("page_count"):
+        rows.append(["Page count", str(project_meta["page_count"])])
+    if project_meta.get("spine_width"):
+        rows.append(["Spine width", f'{project_meta["spine_width"]:.3f}"'])
+    for f in cert.get("files") or []:
+        rows.append([f"{f['part']} file", f'{f["size_in"][0]}" x {f["size_in"][1]}"'
+                     + (f", {f['pages']} pages" if f["part"] == "Interior" else "")])
+    t = Table(rows, colWidths=[1.6 * inch, 5.4 * inch])
+    t.setStyle(TableStyle([
+        ("FONT", (0, 0), (0, -1), "Helvetica-Bold", 9.5), ("FONT", (1, 0), (1, -1), "Helvetica", 9.5),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#555555")),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.25, colors.HexColor("#dddddd")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4), ("TOPPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t)
+
+    # What was checked
+    story.append(Paragraph("What SparkPrep checked on your final files", h2_style))
+    ip = cert.get("interior_pages")
+    if ip:
+        story.append(Paragraph(f"Interior: {ip['checked']} of {ip['total']} pages checked, every page.", small_style))
+    for c in cert.get("checks") or []:
+        mark = f'<font color="{green}">&#10003;</font>' if c["passed"] else f'<font color="{amber}">!</font>'
+        story.append(Paragraph(f"{mark} {_esc(c['label'])}", item_style))
+
+    if not certified:
+        story.append(Paragraph("Still open", h2_style))
+        for o in cert.get("open") or []:
+            story.append(Paragraph(f'<font color="{amber}">!</font> <b>{_esc(o["title"])}</b>', item_style))
+            if o.get("why"):
+                story.append(Paragraph(_esc(o["why"]), ParagraphStyle("PFWhy", parent=small_style, leftIndent=26)))
+            if o.get("steps"):
+                story.append(Paragraph("<b>How to fix it yourself:</b>", ParagraphStyle("PFHow", parent=body_style, leftIndent=26, spaceBefore=3)))
+                for n, step in enumerate(o["steps"], start=1):
+                    story.append(Paragraph(f"{n}. {_esc(step)}", ParagraphStyle("PFStep", parent=body_style, leftIndent=38, fontSize=9.5, leading=13)))
+            if o.get("tools"):
+                story.append(Paragraph(f"Tools that can do this: {_esc(', '.join(o['tools']))}",
+                                       ParagraphStyle("PFTools", parent=small_style, leftIndent=26)))
+            story.append(Spacer(1, 0.06 * inch))
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(Paragraph("SparkPrep couldn't fix these on its own, so the steps to fix each one are above. "
+                               "Fix them and export again — once everything is clear, your book earns "
+                               "<b>SparkPrep Certified</b>.", body_style))
+
+    # What SparkPrep found and fixed along the way
+    story.append(Paragraph("What SparkPrep found and fixed", h2_style))
     if not repair_log:
-        story.append(Paragraph(
-            "Nothing needed fixing. Every check we run passed the first time your file was scanned.",
-            body_style,
-        ))
-    else:
-        story.append(Paragraph(
-            "SparkPrep found and fixed real print-compliance issues on this file. Here's a plain-language "
-            "record of each pass, in order, so you can see exactly what changed and why.",
-            body_style,
-        ))
-        story.append(Spacer(1, 0.15 * inch))
-        for i, entry in enumerate(repair_log, start=1):
-            by_id = {f["id"]: f for f in entry.get("found", [])}
-            when = (entry.get("at") or "")[:16].replace("T", " ")
-            slot_label = {"full_wrap": "cover", "front_cover": "cover", "back_cover": "cover",
-                          "spine": "cover spine", "interior": "interior"}.get(entry.get("slot"), entry.get("slot") or "file")
-            story.append(Paragraph(f"Pass {i} — {slot_label} — {when} UTC", run_title_style))
-            for f in entry.get("found", []):
-                story.append(Paragraph(f"• Found: {f['label']} — {f['message']}", item_style))
-            # Older log entries stored remaining issues as whole objects rather than ids; a
-            # dict can't be a lookup key, which crashed every export of such a project.
-            def _name(r):
-                if isinstance(r, dict):
-                    return r.get("label") or r.get("id") or "issue"
-                return by_id.get(r, {}).get("label", r)
-            resolved = entry.get("resolved") or []
-            if resolved:
-                names = ", ".join(_name(r) for r in resolved)
-                story.append(Paragraph(f'<font color="{_SEVERITY_COLOR["pass"].hexval()}">✓ Fixed: {names}</font>', item_style))
-            remaining = entry.get("remaining") or []
-            if remaining:
-                names = ", ".join(_name(r) for r in remaining)
-                story.append(Paragraph(f'<font color="{_SEVERITY_COLOR["warning"].hexval()}">Still open at this pass: {names}</font>', item_style))
-            story.append(Spacer(1, 0.15 * inch))
+        story.append(Paragraph("Nothing needed fixing — every check passed the first time your files were scanned.", body_style))
+    for i, entry in enumerate(repair_log or [], start=1):
+        by_id = {f["id"]: f for f in entry.get("found", [])}
+        when = (entry.get("at") or "")[:16].replace("T", " ")
+        slot_label = {"full_wrap": "cover", "front_cover": "cover", "back_cover": "cover", "case_wrap": "case cover",
+                      "spine": "cover spine", "interior": "interior"}.get(entry.get("slot"), entry.get("slot") or "file")
+        how = " — AI Upscale" if entry.get("status") == "ai_upscale" else ""
+        story.append(Paragraph(f"Pass {i} — {slot_label}{how} — {when} UTC", run_title_style))
+        for f in entry.get("found", []):
+            story.append(Paragraph(f"• Found: {_esc(f['label'])} — {_esc(f['message'])}", item_style))
 
-    story.append(Spacer(1, 0.1 * inch))
-    story.append(Paragraph("Final status at export", h2_style))
-    real_checks = [c for c in (final_compliance or []) if c.get("id") not in ("bleed", "pdfx1a", "pdf_dpi")]
-    if not real_checks:
-        story.append(Paragraph("All checks passed.", body_style))
-    else:
-        for c in real_checks:
-            ok = c.get("status") == "pass"
-            mark = f'<font color="{_SEVERITY_COLOR["pass"].hexval()}">✓</font>' if ok else f'<font color="{_SEVERITY_COLOR["warning"].hexval()}">!</font>'
-            story.append(Paragraph(f"{mark} {c.get('label', c.get('id'))}", item_style))
+        # Older log entries stored remaining issues as whole objects rather than ids.
+        def _name(r):
+            if isinstance(r, dict):
+                return r.get("label") or r.get("id") or "issue"
+            return by_id.get(r, {}).get("label", r)
+        resolved = entry.get("resolved") or []
+        if resolved:
+            story.append(Paragraph(f'<font color="{green}">&#10003; Fixed: {_esc(", ".join(_name(r) for r in resolved))}</font>', item_style))
+        remaining = entry.get("remaining") or []
+        if remaining:
+            story.append(Paragraph(f'<font color="{amber}">Still open at this pass: {_esc(", ".join(_name(r) for r in remaining))}</font>', item_style))
+        story.append(Spacer(1, 0.08 * inch))
+
+    # The statement
+    story.append(Spacer(1, 0.12 * inch))
+    platform = _esc(project_meta.get("platform", "the distributor"))
+    if certified:
+        story.append(Paragraph(
+            f"<b>SparkPrep certifies</b> that on {checked} UTC the files listed above passed every check in this "
+            f"report, measured on the final files themselves, against {platform}'s published file specifications.",
+            body_style))
+    story.append(Paragraph(
+        f"The printer makes the final acceptance decision. SparkPrep checks files against {platform}'s published "
+        "specifications; it does not control printing, trimming or binding. For the best result, order a printed proof.",
+        small_style))
 
     doc.build(story)
     return output_path

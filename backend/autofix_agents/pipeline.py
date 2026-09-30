@@ -43,6 +43,8 @@ class Deps:
     repair_fn: Callable[[], Awaitable[dict]]                  # the existing engine; used only by Agent 2
     ai_review: Optional[Callable[[dict], Awaitable[Optional[dict]]]] = None
     log: Optional[Callable[[str, Exception, dict], Awaitable[None]]] = None
+    # Called with the issues a run could NOT fix -- the server keeps these as "unsolved cases" to study.
+    on_unsolved: Optional[Callable[[list], Awaitable[None]]] = None
     # Whole-run ceiling. A live-streamed run keeps bytes flowing to the browser
     # the whole time (events + repair heartbeats), so Cloudflare's ~100s idle
     # cut-off doesn't apply and it can use most of that window; a single
@@ -174,6 +176,13 @@ async def _append_repair_log(deps: Deps, diagnosis: dict, pipeline: dict) -> Non
     if len(log) > REPAIR_LOG_MAX_ENTRIES:
         log = log[-REPAIR_LOG_MAX_ENTRIES:]
     await deps.save_fields({"repair_log": log}, [])
+    if entry["remaining"] and deps.on_unsolved:
+        by_id = {f["id"]: f for f in entry["found"]}
+        try:
+            await deps.on_unsolved([by_id.get(r, {"id": r, "label": r, "message": ""}) for r in entry["remaining"]])
+        except Exception as e:                      # recording a case must never break a repair run
+            if deps.log:
+                await deps.log("unsolved_case_record", e, {"slot": deps.slot})
 
 
 async def _run(deps: Deps, sink) -> dict:

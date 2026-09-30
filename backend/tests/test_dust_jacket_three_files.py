@@ -146,4 +146,6 @@ def test_dust_jacket_book_exports_case_jacket_and_interior_together(client):
 
     with zipfile.ZipFile(server.EXPORT_DIR / body["export_name"]) as zf:
         names = sorted(zf.namelist())
-    assert names == ["Jacket Book_case.pdf", "Jacket Book_cover.pdf", "Jacket Book_interior.pdf"]
+    prints = [n for n in names if not n.endswith("Report.pdf")]
+    assert prints == ["Jacket Book_case.pdf", "Jacket Book_cover.pdf", "Jacket Book_interior.pdf"]
+    assert len([n for n in names if n.endswith("Report.pdf")]) == 1        # plus the book's preflight report

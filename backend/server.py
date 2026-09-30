@@ -33,23 +33,23 @@ from bson import ObjectId
 from print_specs import (
     TRIM_SIZES, PAPER_TYPES, BINDING_TYPES, PLATFORMS, COLOR_PROFILES, DEFAULT_COLOR_PROFILE,
     calculate_spine_width, calculate_spine_width_for_platform, calculate_full_cover_dimensions,
-    resolve_binding_spec, PLATFORM_UNSUPPORTED_BINDINGS,
+    resolve_binding_spec, PLATFORM_UNSUPPORTED_BINDINGS, paper_ppi,
 )
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks, assemble_cover_pieces,
-    check_total_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
+    check_total_ink_coverage, check_final_pdf_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
     autofix_spine_text_margin,
     TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
 )
 from audit_engine import deep_audit, audit_summary
 from template_interpreter_adapter import interpret_publisher_template
 from pdfx_validator import (
-    run_pdf_structure_audit, check_interior_safety_margins, check_cover_safety_margins, ocr_status,
+    run_pdf_structure_audit, check_interior_safety_margins, check_cover_safety_margins, check_rgb_color, ocr_status,
     SPINE_SAFETY_WIDE_IN, SPINE_SAFETY_NARROW_IN, SPINE_WIDTH_TIER_THRESHOLD_IN,
 )
 from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
-from report_export import generate_audit_brief_pdf, generate_repair_report_pdf
+from report_export import generate_audit_brief_pdf, generate_preflight_report_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
 from failure_log import log_failure
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
@@ -878,7 +878,7 @@ async def spine_calc(payload: dict):
     # Cover bleed is a property of the (platform, binding) pair -- case
     # laminate/jacket bleed varies by distributor, not just by binding.
     bleed = resolve_binding_spec(binding, plat)["bleed"]
-    spine_w, spine_is_estimate = calculate_spine_width_for_platform(page_count, paper_info["ppi"], plat, binding)
+    spine_w, spine_is_estimate = calculate_spine_width_for_platform(page_count, paper_ppi(paper_info, plat), plat, binding)
     spine_is_estimate = not spine_is_estimate
     if payload.get("spine_width_override"):
         spine_w = float(payload["spine_width_override"])
@@ -890,7 +890,7 @@ async def spine_calc(payload: dict):
         "binding_unsupported_on_platform": binding_unsupported,
         "full_cover": full,
         "trim": trim,
-        "paper_ppi": paper_info["ppi"],
+        "paper_ppi": paper_ppi(paper_info, plat),
         "bleed": bleed,
         "spine_text_allowed": page_count >= PLATFORMS.get(plat, PLATFORMS["kdp"])["spine_text_min_pages"],
     }
@@ -946,7 +946,7 @@ async def _results_unlocked(p: dict, user: dict) -> bool:
 def _check_kind(check_id: str) -> str:
     """What kind of check ran, without revealing its result (labels like "Color Space (RGB)" would)."""
     c = (check_id or "").lower()
-    for keys, name in ((("size",), "Page & cover size"), (("dpi",), "Resolution"), (("color",), "Color space"),
+    for keys, name in ((("size", "spine_width"), "Page & cover size"), (("dpi",), "Resolution"), (("color",), "Color space"),
                        (("transparen",), "Transparency"), (("ink", "tac"), "Ink coverage"), (("bleed",), "Bleed"),
                        (("pdfx",), "PDF/X-1a print standard"), (("margin", "safety", "spine", "center"), "Safe margins")):
         if any(k in c for k in keys):
@@ -1062,12 +1062,17 @@ async def get_project(project_id: str, user: dict = Depends(get_current_user)):
 async def update_project(project_id: str, payload: ProjectUpdate, user: dict = Depends(get_current_user)):
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    result = await db.projects.update_one(
-        {"_id": ObjectId(project_id), "user_id": user["id"]}, {"$set": updates}
-    )
-    if result.matched_count == 0:
+    before = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not before:
         raise HTTPException(404, "Project not found")
+    await db.projects.update_one({"_id": ObjectId(project_id), "user_id": user["id"]}, {"$set": updates})
     p = await db.projects.find_one({"_id": ObjectId(project_id)})
+    if any(k in updates and updates[k] != before.get(k) for k in _GEOMETRY_FIELDS):
+        # The covers were checked against the old size -- re-check them so the Editor never shows a stale verdict.
+        rescan = await run_with_timeout(_rescan_cover_slots, p)
+        if rescan:
+            await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": rescan})
+            p = await db.projects.find_one({"_id": ObjectId(project_id)})
     return await _present_project(p, user)
 
 
@@ -1412,10 +1417,11 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             geom = _full_wrap_geometry(p)
             margin_geom_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
                                    "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
+        margin_bleed = _cover_bleed_for_slot(p, effective_slot_for_margins) or 0.0
         margin_findings = await run_with_timeout(
             check_cover_safety_margins,
             str(file_path), False, final_w, final_h, plat.get("name", "your distributor"),
-            **margin_geom_kwargs,
+            bleed_in=margin_bleed, **margin_geom_kwargs,
         )
         outer_margin_finding = next((f for f in margin_findings if f["id"] == "cover_safety_margin"), None)
         if outer_margin_finding:
@@ -1425,7 +1431,9 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 await run_with_timeout(
                     autofix_cover_safe_margin,
                     str(file_path), str(margin_fixed_path),
-                    outer_margin_finding["pinpoint"]["margin_in"], final_w, final_h,
+                    # the fixer works in distances from the file's edge: the trim line is margin_bleed in
+                    outer_margin_finding["pinpoint"]["margin_in"] + margin_bleed, final_w, final_h,
+                    target_margin_in=0.27 + margin_bleed,
                 )
                 margin_source_path = margin_fixed_path
             except HTTPException:
@@ -1641,6 +1649,9 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
         scan_fn=_scan_slot_sync,
         repair_fn=lambda: autofix(project_id=project_id, slot=slot, user=user),
         ai_review=ai_review, log=log,
+        on_unsolved=lambda issues: _record_unsolved_case(project_id, user["id"], "repair_bay", [slot] if slot else [],
+                                                         [{"title": i.get("label") or i.get("id"), "why": i.get("message", ""),
+                                                           "id": i.get("id")} for i in issues]),
         budget_s=(85.0 if stream else REQUEST_TIMEOUT_S - 5.0) if autofix_agents.common.time_limits_on() else REQUEST_TIMEOUT_S,
     )
     queue: asyncio.Queue = asyncio.Queue()
@@ -1907,6 +1918,9 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     case_data = (p.get("slots") or {}).get("case_wrap") if needs_case else None
     if needs_case and not case_data:
         raise HTTPException(404, "No case cover uploaded -- a Hardcover with Dust Jacket book needs a separate plain case file too, in addition to the jacket.")
+    # Never build a hardcover cover around a guessed spine.
+    if needs_cover and _project_needs_spine_number(p):
+        raise HTTPException(400, _spine_needed_message(PLATFORMS.get(p["platform"], PLATFORMS["kdp"])["name"]))
 
     # Mandatory book title -- required before any export so exports are
     # traceable to a real book, not left on a never-renamed placeholder.
@@ -1995,7 +2009,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     # Interior bleed stays platform-level since that genuinely doesn't vary
     # by binding.
     cover_bleed = resolve_binding_spec(binding, platform_key)["bleed"]
-    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0] if needs_cover else 0
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper_ppi(paper, platform_key), platform_key, binding)[0] if needs_cover else 0
     if needs_cover and p.get("spine_width_override"):
         spine_w = float(p["spine_width_override"])
     export_id = uuid.uuid4().hex[:6]
@@ -2099,7 +2113,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
         case_path = UPLOAD_DIR / case_data["stored_filename"]
         case_export_path = EXPORT_DIR / f"{project_id}_case_{export_id}.pdf"
         case_bleed = resolve_binding_spec("hardcover_case", platform_key)["bleed"]
-        case_spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, "hardcover_case")[0]
+        case_spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper_ppi(paper, platform_key), platform_key, "hardcover_case")[0]
         if p.get("spine_width_override"):
             case_spine_w = float(p["spine_width_override"])
         try:
@@ -2150,34 +2164,50 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
         export_path = src_path
         result = res
 
-    # Owner's rule: a customer should see the depth of what SparkPrep actually
-    # did, not just a pass/fail badge -- so whenever Repair Bay found and fixed
-    # something real over this project's lifetime, bundle a plain-language
-    # "found & fixed" report alongside the print file(s). A project that never
-    # needed a fix skips this entirely -- nothing to report, no reason to
-    # force a zip on the common clean-upload case.
-    if p.get("repair_log"):
-        import zipfile
-        report_path = EXPORT_DIR / f"{project_id}_report_{export_id}.pdf"
-        generate_repair_report_pdf(
-            repair_log=p["repair_log"], final_compliance=all_compliance,
-            project_meta={"title": title, "platform": plat.get("name", platform_key), "trim_size": p["trim_size"]},
-            output_path=str(report_path),
-        )
-        if export_path.suffix.lower() == ".zip":
-            with zipfile.ZipFile(export_path, "a", zipfile.ZIP_DEFLATED) as zf:
-                zf.write(report_path, arcname=f"{title}_found_and_fixed.pdf")
-            report_path.unlink()
-        else:
-            bundled_name = f"{project_id}_export_{export_id}.zip"
-            bundled_path = EXPORT_DIR / bundled_name
-            with zipfile.ZipFile(bundled_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.write(export_path, arcname=f"{title}{export_path.suffix}")
-                zf.write(report_path, arcname=f"{title}_found_and_fixed.pdf")
-            report_path.unlink()
-            export_path.unlink()
-            export_name, export_path = bundled_name, bundled_path
-            result = {"bundled": True, "found_and_fixed_report": True, **result}
+    # Every finished book gets a report (owner's rule). Its seal is earned, never assumed: SparkPrep
+    # re-checks the FINAL files themselves -- every interior page up to 300 -- and only when everything
+    # is clear does the book get "The SparkPrep Certified Complete Publisher Preflight Report".
+    # Anything else gets the plainer "SparkPrep Preflight Report", which says what's still open.
+    import zipfile
+    cert = await run_with_timeout(
+        _certify_final_files, p, parts, plat, platform_key, trim, all_compliance, spine_w, export_id)
+    report_path = EXPORT_DIR / f"{project_id}_report_{export_id}.pdf"
+    generate_preflight_report_pdf(
+        cert=cert, repair_log=p.get("repair_log") or [],
+        project_meta={"title": title, "platform": plat.get("name", platform_key),
+                      "trim_size": trim.get("label", p["trim_size"]),
+                      "binding": BINDING_TYPES.get(binding, {}).get("label", binding),
+                      "paper": PAPER_TYPES.get(p["paper_type"], {}).get("label", p["paper_type"]),
+                      "page_count": p.get("page_count"), "spine_width": spine_w if needs_cover else None},
+        output_path=str(report_path),
+    )
+    report_arcname = f"{title}_{'SparkPrep_Certified_Report' if cert['certified'] else 'SparkPrep_Preflight_Report'}.pdf"
+    if export_path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(export_path, "a", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(report_path, arcname=report_arcname)
+    else:
+        bundled_name = f"{project_id}_export_{export_id}.zip"
+        bundled_path = EXPORT_DIR / bundled_name
+        with zipfile.ZipFile(bundled_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(export_path, arcname=f"{title}{export_path.suffix}")
+            zf.write(report_path, arcname=report_arcname)
+        export_path.unlink()
+        export_name, export_path = bundled_name, bundled_path
+        result = {"bundled": True, **result}
+    report_path.unlink()
+    result = {**result, "certified": cert["certified"], "certificate_id": cert.get("certificate_id"),
+              "report_name": cert["report_name"], "found_and_fixed_report": bool(p.get("repair_log")),
+              "still_open": [o["title"] for o in cert["open"]]}
+    if not cert["certified"]:
+        await _record_unsolved_case(project_id, user["id"], "export", [k for k, v in (p.get("slots") or {}).items() if v],
+                                    cert["open"])
+    if cert["certified"]:
+        # Kept so a certificate can be looked up later (the seal is only worth something if it can be verified).
+        await db.certificates.insert_one({
+            "certificate_id": cert["certificate_id"], "project_id": project_id, "user_id": user["id"],
+            "title": title, "platform": plat.get("name", platform_key), "trim_size": p["trim_size"],
+            "binding": binding, "files": cert["files"], "checked_at": cert["checked_at"],
+        })
     _prune_old_exports(project_id, keep=KEEP_EXPORTS_PER_PROJECT)
 
     # Increment usage -- always against the billing account, not necessarily
@@ -3466,24 +3496,13 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
         if compose_warnings:
             metadata["compose_warnings"] = compose_warnings
 
-        trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
-        plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-        final_w, final_h = _target_inches_for_slot(p, slot)
-        spine_kwargs = {}
-        if slot == "full_wrap":
-            geom = _full_wrap_geometry(p)
-            spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
-                             "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
-        elif slot == "case_wrap":
-            geom = _case_wrap_geometry(p)
-            spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
-                             "page_count": p.get("page_count"), "binding": "hardcover_case"}
-        compliance = await run_with_timeout(
-            run_compliance_checks,
-            metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
-            file_path=str(file_path), slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
-            final_w=final_w, final_h=final_h, **spine_kwargs,
-        )
+        # The page count decides the spine, and so every cover size -- so it comes from the interior itself
+        # rather than trusting a typed number (which starts at 200 for a new project).
+        page_count_set = None
+        if slot == "interior" and metadata.get("pdf_pages") and metadata["pdf_pages"] != p.get("page_count"):
+            page_count_set = {"from": p.get("page_count"), "to": metadata["pdf_pages"]}
+            p["page_count"] = metadata["pdf_pages"]
+        compliance = await run_with_timeout(_slot_compliance, p, slot, str(file_path), metadata)
     except HTTPException:
         raise
     except Exception as e:
@@ -3520,9 +3539,222 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
         update["uploaded_file"] = file_id
         update["file_metadata"] = metadata
         update["compliance"] = compliance
+    if page_count_set:
+        update["page_count"] = p["page_count"]
+        p["slots"] = slots
+        update.update(await run_with_timeout(_rescan_cover_slots, p))   # covers were sized for the old count
 
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
-    return await _present_upload(p, user, {"slot": slot, "file_metadata": metadata, "compliance": compliance})
+    body = {"slot": slot, "file_metadata": metadata, "compliance": compliance}
+    if page_count_set:
+        body["page_count_set"] = page_count_set
+    return await _present_upload(p, user, body)
+
+
+# Checks the export re-verifies on the final files -- a source-file warning in one of these areas is
+# replaced by the final file's own result (e.g. an RGB upload is CMYK after export, and that's measured).
+_REVERIFIED_ON_FINAL = ("colorspace", "transparency", "pdfx1a", "bleed", "pdf_dpi", "total_ink_coverage",
+                        "cover_size", "interior_page_size_mismatch", "interior_safety_margin",
+                        "cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden")
+_CERT_CHECKS = (   # (label, finding ids that fail it)
+    ("PDF/X-1a:2001 print standard", ("pdfx1a_not_declared", "pdfx1a_missing_output_intent", "icc_profile_missing")),
+    ("All fonts embedded and licensed for print", ("fonts_not_embedded", "font_license_restricted")),
+    ("No live transparency", ("live_transparency_detected",)),
+    ("No hidden layers", ("layers_detected",)),
+    ("CMYK color only (no RGB)", ("rgb_color_in_final",)),
+    ("Ink coverage within the distributor's limit", ("total_ink_coverage",)),
+)
+
+
+def _diy_fix(f: dict, p: dict, where: str) -> tuple:
+    """Step-by-step instructions (and tools) for fixing an issue by hand -- for the rare case SparkPrep
+    couldn't fix it. Uses the check's own steps when it has them, else a guide written for that issue."""
+    steps = [s for s in (f.get("fix_steps") or []) if s]
+    tools = [t for t in (f.get("fix_tools") or []) if t]
+    fid = (f.get("id") or "").lower()
+    if not steps:
+        if fid == "dpi" or "resolution" in fid:
+            steps = ["Open the original artwork file (Photoshop, Canva, Affinity, InDesign) -- not an exported copy.",
+                     "Export it again at 300 DPI at its full final size (the exact size SparkPrep shows under the upload box).",
+                     "If you only have a small version, rebuild or re-source the image at full size -- enlarging a small "
+                     "image can't add real detail, it only makes it look soft.",
+                     "Upload the new file to SparkPrep and export again."]
+            tools = tools or ["Adobe Photoshop", "Affinity Photo", "Canva (download as PDF Print)"]
+        elif "size" in fid:
+            steps = ["Set your document to the exact size SparkPrep shows under the upload box (it already includes bleed "
+                     "and the spine for your page count).",
+                     "Re-position your artwork so the spine and panels line up with your distributor's template.",
+                     "Export as PDF and upload it to SparkPrep again."]
+            tools = tools or ["Your distributor's cover template", "Adobe InDesign", "Affinity Publisher"]
+        else:
+            steps = ["Open the original design file for this " + where.lower() + " and correct the issue described above.",
+                     "Export it again as a PDF, upload it to SparkPrep, and export -- SparkPrep re-checks everything."]
+    steps.append("Stuck? Ask the SparkPrep Assistant in the app -- tell it the issue name shown here.")
+    return steps, tools
+
+
+def _certify_final_files(p: dict, parts: list, plat: dict, platform_key: str, trim: dict,
+                         source_compliance: list, spine_w: float, export_id: str) -> dict:
+    """The SparkPrep Certified check: every check below, run on the FINAL exported files (not the uploads).
+    Certified only when every one passes AND no source-file issue is left open."""
+    import pikepdf
+    name = plat.get("name", platform_key)
+    checked_at = datetime.now(timezone.utc)
+    files, checks, open_items = [], [], []
+    interior_pages = None
+
+    def record(label, findings, where):
+        ok = not findings
+        checks.append({"label": f"{where}: {label}", "passed": ok})
+        for f in findings:
+            steps, tools = _diy_fix(f, p, where)
+            open_items.append({"title": f"{where}: {f.get('title') or label}", "why": f.get("why_it_fails", ""),
+                               "id": f.get("id"), "steps": steps, "tools": tools})
+
+    for path, _arc, key, _res in parts:
+        where = {"cover": "Cover", "case": "Case cover", "interior": "Interior"}[key]
+        with pikepdf.open(str(path)) as pdf:
+            n_pages = len(pdf.pages)
+            box = pdf.pages[0].mediabox
+            size = [round(float(box[2] - box[0]) / 72, 3), round(float(box[3] - box[1]) / 72, 3)]
+            rgb = check_rgb_color(pdf, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        files.append({"part": where, "size_in": size, "pages": n_pages})
+        found = run_pdf_structure_audit(str(path), name, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        if rgb:
+            found.append(rgb)
+        ink = check_final_pdf_ink_coverage(str(path), platform_key, name, max_pages=ADVANCED_INTERIOR_MAX_PAGES)
+        if ink:
+            found.append(ink)
+        for label, ids in _CERT_CHECKS:
+            record(label, [f for f in found if f["id"] in ids], where)
+        other = [f for f in found if not any(f["id"] in ids for _l, ids in _CERT_CHECKS)]
+        if other:
+            record("Other print checks", other, where)
+
+        if key == "interior":
+            interior_pages = {"checked": min(n_pages, ADVANCED_INTERIOR_MAX_PAGES), "total": n_pages}
+            margins = check_interior_safety_margins(
+                str(path), name, trim["w"], trim["h"], max_pages=ADVANCED_INTERIOR_MAX_PAGES,
+                bleed_in=plat["bleed"], all_sides_bleed_ok=(platform_key == "lulu"))
+            record(f"Page size and text safe margins (all {interior_pages['checked']} pages)", margins, where)
+            if n_pages > ADVANCED_INTERIOR_MAX_PAGES:
+                open_items.append({"title": f"Interior: pages {ADVANCED_INTERIOR_MAX_PAGES + 1}-{n_pages} weren't checked",
+                                   "why": f"SparkPrep checks up to {ADVANCED_INTERIOR_MAX_PAGES} pages, so a longer book can't be certified yet."})
+        else:
+            geom = _case_wrap_geometry(p) if key == "case" else _full_wrap_geometry(p)
+            size_ok = abs(size[0] - geom["total_width"]) <= 0.02 and abs(size[1] - geom["total_height"]) <= 0.02
+            record(f"Exact size for a {spine_w:.3f}\" spine ({geom['total_width']:.3f}\" x {geom['total_height']:.3f}\")",
+                   [] if size_ok else [{"title": f"is {size[0]}\" x {size[1]}\"", "why_it_fails": "Wrong size for this book."}], where)
+            safety = check_cover_safety_margins(
+                str(path), True, geom["total_width"], geom["total_height"], name,
+                spine_x_in=geom["spine_x"], spine_w_in=geom["spine_width"], page_count=p.get("page_count"),
+                binding="hardcover_case" if key == "case" else p.get("binding", "paperback"),
+                bleed_in=geom["bleed"])
+            record("Text inside the safe area, spine text clear of the folds", safety, where)
+
+    carried = [c for c in (source_compliance or [])
+               if c.get("status") != "pass" and not any(k in (c.get("id") or "") for k in _REVERIFIED_ON_FINAL)]
+    record("Image resolution and remaining upload checks", [
+        {"title": c.get("label") or c.get("id"), "why_it_fails": c.get("message", ""), "id": c.get("id")}
+        for c in carried], "All files")
+
+    certified = not open_items
+    return {
+        "certified": certified,
+        "report_name": ("The SparkPrep Certified Complete Publisher Preflight Report" if certified
+                        else "SparkPrep Preflight Report"),
+        "certificate_id": f"SPC-{checked_at:%Y%m%d}-{export_id.upper()}" if certified else None,
+        "checked_at": checked_at.isoformat(),
+        "platform": name,
+        "files": files, "checks": checks, "open": open_items, "interior_pages": interior_pages,
+    }
+
+
+_COVER_SLOTS = ("full_wrap", "case_wrap", "front_cover", "back_cover", "spine")
+_GEOMETRY_FIELDS = ("page_count", "spine_width_override", "paper_type", "trim_size", "binding", "platform")
+
+
+def _spine_number_needed(platform: str, binding: str, page_count: int, paper_type: str,
+                         override: Optional[float]) -> bool:
+    """True for a hardcover whose distributor publishes no spine formula (IngramSpark, KDP) when the user
+    hasn't entered the real number. IngramSpark's own templates show why a guess won't do: Creme paper,
+    74 pages = 0.313", 108 pages = 0.375" -- no pages-per-inch formula gives both."""
+    if binding not in ("hardcover_case", "hardcover_jacket") or override:
+        return False
+    paper = PAPER_TYPES.get(paper_type, PAPER_TYPES["white_50lb"])
+    return not calculate_spine_width_for_platform(page_count or 0, paper_ppi(paper, platform), platform, binding)[1]
+
+
+def _project_needs_spine_number(p: dict) -> bool:
+    return _spine_number_needed(p.get("platform", "kdp"), p.get("binding", "paperback"), p.get("page_count") or 0,
+                                p.get("paper_type", "white_50lb"), p.get("spine_width_override"))
+
+
+def _spine_needed_message(platform_name: str) -> str:
+    return (f"{platform_name} doesn't publish its hardcover spine formula, so the spine width has to come from "
+            f"your {platform_name} cover template (it's printed under the spine, e.g. 0.313). Enter it in "
+            "Spine Width -- until then SparkPrep can't tell whether this cover is the right size.")
+
+
+def _cover_bleed_for_slot(p: dict, slot: str) -> Optional[float]:
+    """How far outside the trim a cover file extends on each side -- 0.625" for a case wrap, 0.125" for most."""
+    if slot == "interior":
+        return None
+    binding = "hardcover_case" if slot == "case_wrap" else p.get("binding", "paperback")
+    return resolve_binding_spec(binding, p.get("platform", "kdp"))["bleed"]
+
+
+def _slot_compliance(p: dict, slot: str, file_path: str, metadata: dict) -> list:
+    """The Editor's checks for one uploaded file, against the project's current specs."""
+    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    final_w, final_h = _target_inches_for_slot(p, slot)
+    spine_kwargs = {}
+    if slot == "full_wrap":
+        geom = _full_wrap_geometry(p)
+        spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                        "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
+    elif slot == "case_wrap":
+        geom = _case_wrap_geometry(p)
+        spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
+                        "page_count": p.get("page_count"), "binding": "hardcover_case"}
+    compliance = run_compliance_checks(
+        metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
+        file_path=file_path, slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
+        final_w=final_w, final_h=final_h, cover_bleed_in=_cover_bleed_for_slot(p, slot), **spine_kwargs,
+    )
+    if slot in ("full_wrap", "case_wrap") and _project_needs_spine_number(p):
+        compliance = [{"id": "spine_width_needed", "label": "Spine width needed", "status": "fail",
+                       "message": _spine_needed_message(plat.get("name", p["platform"])),
+                       "auto_fix": False, "fix_action": None}] + [c for c in compliance if c.get("id") != "cover_size"]
+    return compliance
+
+
+def _rescan_cover_slots(p: dict) -> dict:
+    """Re-check every uploaded cover against the project's CURRENT specs -- a cover's right size depends on
+    page count, spine, paper, trim and binding, so its stored result goes stale when any of them change.
+    Returns the fields to $set."""
+    slots = dict(p.get("slots") or {})
+    update = {}
+    for slot in _COVER_SLOTS:
+        meta = slots.get(slot)
+        path = UPLOAD_DIR / meta["stored_filename"] if meta and meta.get("stored_filename") else None
+        if not path or not path.exists():
+            continue
+        clean = {k: v for k, v in meta.items() if k not in ("compliance", "audit_issue_count")}
+        compliance = _slot_compliance(p, slot, str(path), clean)
+        new_meta = {**clean, "compliance": compliance}
+        if book_pass.book_pass_on():
+            count = _slot_audit_issue_count(p, slot, str(path), clean)
+            if count is not None:
+                new_meta["audit_issue_count"] = count
+        slots[slot] = new_meta
+        if slot == "full_wrap":
+            update["compliance"] = compliance
+            update["file_metadata"] = {k: v for k, v in new_meta.items() if k != "compliance"}
+    if slots != (p.get("slots") or {}):
+        update["slots"] = slots
+    return update
 
 
 def _save_generated_slot_file(p: dict, project_id: str, slot: str, file_id: str, data: bytes,
@@ -3541,20 +3773,8 @@ def _save_generated_slot_file(p: dict, project_id: str, slot: str, file_id: str,
     metadata["slot"] = slot
     metadata.update(extra_meta)
 
-    trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
-    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
-    final_w, final_h = _target_inches_for_slot(p, slot)
-    spine_kwargs = {}
-    if slot == "full_wrap":
-        geom = _full_wrap_geometry(p)
-        spine_kwargs = {"spine_x_in": geom["spine_x"], "spine_w_in": geom["spine_width"],
-                         "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
-    compliance = run_compliance_checks(
-        metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
-        file_path=str(file_path), slot=slot, platform_name=plat.get("name"),
-        final_w=final_w, final_h=final_h, **spine_kwargs,
-    )
-    return metadata, compliance
+    # The same checks as an upload (_slot_compliance), so a generated file is judged exactly like any other.
+    return metadata, _slot_compliance(p, slot, str(file_path), metadata)
 
 
 async def _replace_slot(project_id: str, p: dict, slot: str, metadata: dict, compliance: list):
@@ -3663,7 +3883,7 @@ def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
 
     if slot == "full_wrap":
         paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
-        spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+        spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper_ppi(paper, platform_key), platform_key, binding)[0]
         if p.get("spine_width_override"):
             spine_w = float(p["spine_width_override"])
         dims = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, platform_key)
@@ -3671,7 +3891,7 @@ def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
 
     if slot == "spine":
         paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
-        spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+        spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper_ppi(paper, platform_key), platform_key, binding)[0]
         if p.get("spine_width_override"):
             spine_w = float(p["spine_width_override"])
         return round(spine_w * 300), round((trim["h"] + bleed * 2) * 300)
@@ -3710,7 +3930,7 @@ def _full_wrap_geometry(p: dict) -> dict:
     binding = p.get("binding", "paperback")
     platform_key = p.get("platform", "kdp")
     paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
-    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper_ppi(paper, platform_key), platform_key, binding)[0]
     if p.get("spine_width_override"):
         spine_w = float(p["spine_width_override"])
     bleed = resolve_binding_spec(binding, platform_key)["bleed"]
@@ -3727,7 +3947,7 @@ def _case_wrap_geometry(p: dict) -> dict:
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     platform_key = p.get("platform", "kdp")
     paper = PAPER_TYPES.get(p["paper_type"], PAPER_TYPES["white_50lb"])
-    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, "hardcover_case")[0]
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper_ppi(paper, platform_key), platform_key, "hardcover_case")[0]
     if p.get("spine_width_override"):
         spine_w = float(p["spine_width_override"])
     bleed = resolve_binding_spec("hardcover_case", platform_key)["bleed"]
@@ -3792,6 +4012,16 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
         extra_meta={"ai_enhanced": True},
     )
     await _replace_slot(project_id, p, slot, metadata, compliance)
+    # Part of the book's story in its preflight report: what was wrong, and that AI Upscale fixed it.
+    before = next((c for c in slot_data.get("compliance") or [] if c.get("id") == "dpi"), None)
+    after = next((c for c in compliance if c.get("id") == "dpi"), None)
+    if before and before.get("status") != "pass":
+        entry = {"at": datetime.now(timezone.utc).isoformat(), "slot": slot, "status": "ai_upscale",
+                 "found": [{"id": "dpi", "label": before.get("label", "Resolution"), "message": before.get("message", "")}],
+                 "resolved": ["dpi"] if after and after.get("status") == "pass" else [],
+                 "remaining": [] if after and after.get("status") == "pass" else ["dpi"]}
+        log = list((await db.projects.find_one({"_id": ObjectId(project_id)}) or {}).get("repair_log") or []) + [entry]
+        await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"repair_log": log[-200:]}})
     return {"slot": slot, "file_metadata": metadata, "compliance": compliance}
 
 
@@ -3818,7 +4048,7 @@ async def apply_cover_template(project_id: str, payload: CoverTemplateApplyIn, u
     binding = p.get("binding", "paperback")
     platform_key = p.get("platform", "kdp")
     cover_bleed = resolve_binding_spec(binding, platform_key)["bleed"]
-    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper["ppi"], platform_key, binding)[0]
+    spine_w = calculate_spine_width_for_platform(p.get("page_count", 0), paper_ppi(paper, platform_key), platform_key, binding)[0]
     if p.get("spine_width_override"):
         spine_w = float(p["spine_width_override"])
 
@@ -3954,6 +4184,7 @@ class AuditStart(BaseModel):
     binding: str = "paperback"
     page_count: int = 0
     paper_type: str = "white_50lb"
+    spine_width: Optional[float] = None   # a hardcover's spine from the distributor's cover template
 
 
 class AuditCheckoutIn(BaseModel):
@@ -3971,6 +4202,9 @@ async def audit_start(payload: AuditStart):
         raise HTTPException(400, "file_type must be 'interior' or 'cover'")
     if payload.file_type == "cover" and payload.binding not in BINDING_TYPES:
         raise HTTPException(400, "Invalid binding")
+    if payload.file_type == "cover" and _spine_number_needed(payload.platform, payload.binding, payload.page_count,
+                                                             payload.paper_type, payload.spine_width):
+        raise HTTPException(400, _spine_needed_message(PLATFORMS[payload.platform]["name"]))
     audit_id = uuid.uuid4().hex
     doc = {
         "audit_id": audit_id,
@@ -3980,6 +4214,7 @@ async def audit_start(payload: AuditStart):
         "binding": payload.binding,
         "page_count": payload.page_count,
         "paper_type": payload.paper_type,
+        "spine_width_override": payload.spine_width if payload.file_type == "cover" else None,
         "file_id": None,
         "file_metadata": None,
         "preview_findings": None,
@@ -4037,9 +4272,11 @@ def _audit_file_findings(file_path: str, metadata: dict, *, platform: str, trim_
     (BASIC_CHECK_MAX_PAGES) -- every page is the book's Advanced Interior Check."""
     trim = TRIM_SIZES[trim_size]
     plat = PLATFORMS[platform]
+    spine_unknown = file_type == "cover" and not piece and _spine_number_needed(
+        platform, binding, page_count, paper_type, spine_width_override)
     if file_type == "cover":
         paper = PAPER_TYPES.get(paper_type, PAPER_TYPES["white_50lb"])
-        spine_w = calculate_spine_width_for_platform(page_count or 0, paper["ppi"], platform, binding)[0]
+        spine_w = calculate_spine_width_for_platform(page_count or 0, paper_ppi(paper, platform), platform, binding)[0]
         if spine_width_override:
             spine_w = float(spine_width_override)
         bleed = resolve_binding_spec(binding, platform)["bleed"]
@@ -4053,10 +4290,20 @@ def _audit_file_findings(file_path: str, metadata: dict, *, platform: str, trim_
             shape_note = f"front + back + {spine_w:.3f}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
             findings = deep_audit(metadata, full["total_width"], full["total_height"], bleed, plat["name"],
                                   is_cover=True, shape_note=shape_note)
-            findings += check_cover_safety_margins(
-                str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
-                spine_x_in=full["spine_x"], spine_w_in=full["spine_width"], page_count=page_count, binding=binding,
-            )
+            if spine_unknown:
+                # Size, resolution-for-size and spine position all depend on the real spine width.
+                findings = [{
+                    "id": "spine_width_needed", "severity": "fail", "title": "Spine width needed",
+                    "why_it_fails": _spine_needed_message(plat["name"]),
+                    "publisher_rule": f"{plat['name']} — the cover must match the spine width on your cover template",
+                    "pinpoint": {"region": "spine"},
+                }] + [f for f in findings if f["id"] not in ("bleed_dimension_mismatch", "resolution_too_low", "resolution_marginal")]
+            else:
+                findings += check_cover_safety_margins(
+                    str(file_path), metadata.get("is_pdf", False), full["total_width"], full["total_height"], plat["name"],
+                    spine_x_in=full["spine_x"], spine_w_in=full["spine_width"], page_count=page_count, binding=binding,
+                    bleed_in=full["bleed"],
+                )
     else:
         bleed = plat["bleed"]
         findings = deep_audit(metadata, trim["w"] + bleed * 2, trim["h"] + bleed * 2, bleed, plat["name"],
@@ -4066,7 +4313,7 @@ def _audit_file_findings(file_path: str, metadata: dict, *, platform: str, trim_
         # audit, every page (up to ADVANCED_AUDIT_MAX_PAGES) for the Advanced Audit.
         if metadata.get("is_pdf"):
             findings += check_interior_safety_margins(str(file_path), plat["name"], trim["w"], trim["h"], max_pages=max_pages,
-                                                      bleed_in=bleed)
+                                                      bleed_in=bleed, all_sides_bleed_ok=(platform == "lulu"))
     tac_finding = check_total_ink_coverage(str(file_path), metadata.get("is_pdf", False), platform, plat["name"])
     if tac_finding:
         findings.append(tac_finding)
@@ -4149,7 +4396,8 @@ async def _ensure_audit_built(a: dict) -> dict:
         findings = await run_with_timeout(
             _audit_file_findings, str(path), a.get("file_metadata") or {}, platform=a["platform"],
             trim_size=a["trim_size"], file_type=a.get("file_type") or "interior", binding=a.get("binding") or "paperback",
-            page_count=a.get("page_count") or 0, paper_type=a.get("paper_type") or "white_50lb", max_pages=max_pages,
+            page_count=a.get("page_count") or 0, paper_type=a.get("paper_type") or "white_50lb",
+            spine_width_override=a.get("spine_width_override"), max_pages=max_pages,
         )
     update.update({"full_findings": findings, "summary": audit_summary(findings), "findings_level": level,
                    "built_at": datetime.now(timezone.utc).isoformat()})
@@ -4187,6 +4435,7 @@ async def audit_upload(audit_id: str, file: UploadFile = File(...)):
             str(file_path), metadata, platform=a["platform"], trim_size=a["trim_size"],
             file_type=a.get("file_type", "interior"), binding=a.get("binding") or "paperback",
             page_count=a.get("page_count") or 0, paper_type=a.get("paper_type") or "white_50lb",
+            spine_width_override=a.get("spine_width_override"),
         )
         return metadata, findings
 
@@ -4644,6 +4893,64 @@ async def admin_list_failures(stage: str = None, limit: int = 100, _: dict = Dep
         f["id"] = str(f.pop("_id"))
         items.append(f)
     return {"failures": items, "count": len(items)}
+
+
+# Owner's rule (2026-09-29): every issue SparkPrep can't fix is kept as an "unsolved case" to study, until
+# SparkPrep has no issue it can't fix. DETAILS ONLY -- never the customer's file: the book's specs, what
+# went wrong and why, and file facts that carry none of its content (format, size, resolution, color type).
+_CASE_FILE_FACTS = ("format", "is_pdf", "width_px", "height_px", "dpi_x", "dpi_y", "color_mode",
+                    "has_transparency", "pdf_pages", "file_size", "size_bytes")
+
+
+async def _record_unsolved_case(project_id: str, user_id: str, source: str, slots: list, open_items: list) -> None:
+    """Keeps the details of an issue SparkPrep couldn't fix. The same project + same open issues is one
+    case (seen again -> its count goes up)."""
+    if not open_items:
+        return
+    p = await db.projects.find_one({"_id": ObjectId(project_id)})
+    if not p:
+        return
+    key = f"{project_id}|{'/'.join(sorted(slots))}|{'/'.join(sorted(o.get('title', '') for o in open_items))}"
+    now = datetime.now(timezone.utc).isoformat()
+    existing = await db.unsolved_cases.find_one({"key": key, "solved": False})
+    if existing:
+        await db.unsolved_cases.update_one({"_id": existing["_id"]}, {"$set": {"last_seen": now}, "$inc": {"times_seen": 1}})
+        return
+    file_facts = {}
+    for slot in slots:
+        meta = (p.get("slots") or {}).get(slot) or {}
+        facts = {k: meta[k] for k in _CASE_FILE_FACTS if meta.get(k) is not None}
+        if facts:
+            file_facts[slot] = facts
+    await db.unsolved_cases.insert_one({
+        "case_id": uuid.uuid4().hex[:12], "key": key, "project_id": project_id, "user_id": user_id, "source": source,
+        "platform": p.get("platform"), "trim_size": p.get("trim_size"), "binding": p.get("binding"),
+        "paper_type": p.get("paper_type"), "page_count": p.get("page_count"),
+        "spine_width_override": p.get("spine_width_override"), "slots": slots, "file_facts": file_facts,
+        "open": [{"title": o.get("title"), "why": o.get("why", ""), "id": o.get("id")} for o in open_items],
+        "created_at": now, "last_seen": now, "times_seen": 1, "solved": False,
+    })
+
+
+@api_router.get("/admin/unsolved-cases")
+async def admin_unsolved_cases(include_solved: bool = False, limit: int = 200, _: dict = Depends(require_admin)):
+    """Every issue SparkPrep couldn't fix, newest first -- the to-do list for "no issue SparkPrep can't fix"."""
+    query = {} if include_solved else {"solved": False}
+    items = []
+    async for c in db.unsolved_cases.find(query).sort("last_seen", -1).limit(max(1, min(500, limit))):
+        c.pop("_id", None)
+        items.append(c)
+    return {"cases": items, "count": len(items)}
+
+
+@api_router.post("/admin/unsolved-cases/{case_id}/solved")
+async def admin_mark_case_solved(case_id: str, _: dict = Depends(require_admin)):
+    """Once SparkPrep can fix this kind of issue, mark it solved (the case stays as a record)."""
+    r = await db.unsolved_cases.update_one({"case_id": case_id}, {"$set": {"solved": True,
+                                           "solved_at": datetime.now(timezone.utc).isoformat()}})
+    if not r.matched_count:
+        raise HTTPException(404, "Case not found")
+    return {"ok": True}
 
 
 @api_router.get("/admin/book-flags")
