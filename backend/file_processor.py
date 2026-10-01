@@ -1235,6 +1235,9 @@ _SIZE_SUBJECT = {
 }
 
 
+from print_specs import fmt_in  # inches the way distributors print them (half-up, 3 decimals)
+
+
 def run_compliance_checks(
     file_metadata: dict, target_w: float, target_h: float, bleed: float, platform: str = "kdp",
     file_path: str = None, slot: str = None, platform_name: str = None, max_pages: int = None,
@@ -1406,11 +1409,11 @@ def run_compliance_checks(
     if slot in ("full_wrap", "case_wrap", "front_cover", "back_cover", "spine") and final_w and final_h:
         w, h = file_metadata.get("width_px") or 0, file_metadata.get("height_px") or 0
         if w and h:
-            need = f'{final_w:.3f}" x {final_h:.3f}"'
+            need = f'{fmt_in(final_w)}" x {fmt_in(final_h)}"'
             if file_metadata.get("is_pdf"):
                 got_w, got_h = w / 72.0, h / 72.0
                 ok = abs(got_w - final_w) <= 0.02 and abs(got_h - final_h) <= 0.02
-                got = f'{got_w:.3f}" x {got_h:.3f}"'
+                got = f'{fmt_in(got_w)}" x {fmt_in(got_h)}"'
             else:
                 # Shape check in pixels, allowing 1% or 2px of rounding -- a thin spine can be only ~16px wide,
                 # where a single pixel of rounding is already several percent.

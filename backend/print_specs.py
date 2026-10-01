@@ -195,6 +195,46 @@ LULU_HARDCOVER_SPINE_TABLE = [
 ]
 
 
+# IngramSpark hardcover spine (case laminate AND dust jacket -- the jacket's spine equals the case's on every
+# template), worked out from IngramSpark's own generated cover templates rather than a published formula:
+#     spine = round UP to the next 1/16" of ( even page count / PPI + board allowance )
+# Creme (444 PPI, IngramSpark's paper sheet) reproduces all 7 real templates exactly (6x9; 74, 108, 122, 198,
+# 300, 500 pages; 0.313 ... 1.250), for any allowance from 0.117 to 0.123 -- 0.12 is the middle. Keyed by the
+# PPI paper_ppi() returns for IngramSpark (444 = Creme only). White is NOT here yet: its 3 templates (74, 108,
+# 200) fit two different explanations; White 400/500 templates will settle it. Owner's data, 2026-09-30.
+INGRAMSPARK_HARDCOVER_ALLOWANCE_BY_PPI = {444: 0.12}
+
+
+def _round_up_to_sixteenth(v: float) -> float:
+    import math
+    return math.ceil(v * 16 - 1e-9) / 16
+
+
+def even_page_count(page_count: int, platform: str) -> int:
+    """IngramSpark: "All templates should be ordered and files built with a mod2 spine calculation (page count
+    divisible by 2)" (File Creation Guide p.19) -- confirmed by its template generator turning 197 into 198."""
+    if platform == "ingramspark" and page_count and page_count % 2:
+        return page_count + 1
+    return page_count
+
+
+def fmt_in(value: float) -> str:
+    """Inches to 3 decimals, rounding half UP the way IngramSpark's templates print (0.4375 -> 0.438,
+    14.3185 -> 14.319). Plain .3f rounds 14.3185 down (binary), so SparkPrep would read 0.001 off the template."""
+    from decimal import Decimal, ROUND_HALF_UP
+    return str(Decimal(repr(round(value, 6))).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+
+def spine_source(platform: str, binding: str, paper_ppi: int) -> str:
+    """Where SparkPrep's spine number comes from -- so the screen can say so honestly."""
+    hard = binding in ("hardcover_case", "hardcover_jacket")
+    if platform == "lulu":
+        return "lulu_table" if hard else "lulu_formula"
+    if platform == "ingramspark" and hard and paper_ppi in INGRAMSPARK_HARDCOVER_ALLOWANCE_BY_PPI:
+        return "ingramspark_templates"
+    return "template_needed" if hard else "paper_formula"
+
+
 def calculate_spine_width_for_platform(
     page_count: int, paper_ppi: int, platform: str = "ingramspark", binding: str = "paperback",
 ) -> tuple[float, bool]:
@@ -223,7 +263,12 @@ def calculate_spine_width_for_platform(
             return LULU_HARDCOVER_SPINE_TABLE[-1][1], False
         return round(page_count / 444, 4) + LULU_PAPERBACK_SPINE_CONSTANT, True
 
-    estimate = calculate_spine_width(page_count, paper_ppi)
+    pages = even_page_count(page_count, platform)
+    if (platform == "ingramspark" and binding in ("hardcover_case", "hardcover_jacket")
+            and paper_ppi in INGRAMSPARK_HARDCOVER_ALLOWANCE_BY_PPI and pages > 0):
+        return _round_up_to_sixteenth(pages / paper_ppi + INGRAMSPARK_HARDCOVER_ALLOWANCE_BY_PPI[paper_ppi]), True
+
+    estimate = calculate_spine_width(pages, paper_ppi)
     is_confirmed = binding not in ("hardcover_case", "hardcover_jacket")
     return estimate, is_confirmed
 

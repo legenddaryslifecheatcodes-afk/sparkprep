@@ -33,7 +33,7 @@ from bson import ObjectId
 from print_specs import (
     TRIM_SIZES, PAPER_TYPES, BINDING_TYPES, PLATFORMS, COLOR_PROFILES, DEFAULT_COLOR_PROFILE,
     calculate_spine_width, calculate_spine_width_for_platform, calculate_full_cover_dimensions,
-    resolve_binding_spec, PLATFORM_UNSUPPORTED_BINDINGS, paper_ppi,
+    resolve_binding_spec, PLATFORM_UNSUPPORTED_BINDINGS, paper_ppi, fmt_in, spine_source, even_page_count,
 )
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
@@ -915,7 +915,11 @@ async def spine_calc(payload: dict):
     full = calculate_full_cover_dimensions(trim["w"], trim["h"], spine_w, bleed, binding, plat)
     return {
         "spine_width": spine_w,
+        "spine_display": fmt_in(spine_w),
         "spine_is_estimate": spine_is_estimate,
+        # where the number comes from, so the Editor can say so honestly (see print_specs.spine_source)
+        "spine_source": "your_number" if payload.get("spine_width_override") else spine_source(plat, binding, paper_ppi(paper_info, plat)),
+        "page_count_used": even_page_count(page_count, plat),
         "binding_unsupported_on_platform": binding_unsupported,
         "full_cover": full,
         "trim": trim,
@@ -3672,7 +3676,7 @@ def _certify_final_files(p: dict, parts: list, plat: dict, platform_key: str, tr
         else:
             geom = _case_wrap_geometry(p) if key == "case" else _full_wrap_geometry(p)
             size_ok = abs(size[0] - geom["total_width"]) <= 0.02 and abs(size[1] - geom["total_height"]) <= 0.02
-            record(f"Exact size for a {spine_w:.3f}\" spine ({geom['total_width']:.3f}\" x {geom['total_height']:.3f}\")",
+            record(f"Exact size for a {fmt_in(spine_w)}\" spine ({fmt_in(geom['total_width'])}\" x {fmt_in(geom['total_height'])}\")",
                    [] if size_ok else [{"title": f"is {size[0]}\" x {size[1]}\"", "why_it_fails": "Wrong size for this book."}], where)
             safety = check_cover_safety_margins(
                 str(path), True, geom["total_width"], geom["total_height"], name,
@@ -4317,7 +4321,7 @@ def _audit_file_findings(file_path: str, metadata: dict, *, platform: str, trim_
             findings = deep_audit(metadata, w, h, bleed, plat["name"], is_cover=True,
                                   shape_note=f"{piece.replace('_', ' ')} piece, with bleed")
         else:
-            shape_note = f"front + back + {spine_w:.3f}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
+            shape_note = f"front + back + {fmt_in(spine_w)}\" spine (binding: {BINDING_TYPES[binding]['label']}), plus bleed"
             findings = deep_audit(metadata, full["total_width"], full["total_height"], bleed, plat["name"],
                                   is_cover=True, shape_note=shape_note)
             if spine_unknown:
