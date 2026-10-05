@@ -723,6 +723,54 @@ def _has_non_cmyk_colour(container, seen: set, depth: int = 0) -> bool:
     return False
 
 
+def _gray_space_ok(cs, resources) -> bool:
+    if isinstance(cs, pikepdf.Name):
+        if str(cs) == "/DeviceGray":
+            return True
+        named = (resources.get("/ColorSpace") or {}).get(str(cs)) if resources is not None else None
+        return named is not None and _gray_space_ok(named, None)
+    if isinstance(cs, pikepdf.Array) and len(cs) > 1 and str(cs[0]) == "/Indexed":
+        return _gray_space_ok(cs[1], resources)
+    return False
+
+
+def _has_non_gray_colour(container, seen: set, depth: int = 0) -> bool:
+    """True the moment anything on this page (or a Form XObject it draws) uses more than black ink: RGB, a CMYK
+    colour with any cyan/magenta/yellow (incl. 4-colour "rich black" text), a colour image, a shading, or an
+    inline image. Used for black & white books, which are exported as true grayscale."""
+    resources = container.get("/Resources") or pikepdf.Dictionary()
+    for xobj in (resources.get("/XObject") or {}).values():
+        try:
+            key = xobj.objgen
+            if key != (0, 0) and key in seen:
+                continue
+            seen.add(key)
+            subtype = xobj.get("/Subtype")
+            if subtype == pikepdf.Name.Image:
+                if xobj.get("/ImageMask", False):
+                    continue
+                cs = xobj.get("/ColorSpace")
+                if cs is None or not _gray_space_ok(cs, resources):
+                    return True
+            elif subtype == pikepdf.Name.Form and depth < 6:
+                if _has_non_gray_colour(xobj, seen, depth + 1):
+                    return True
+        except Exception:
+            return True
+    try:
+        for op in pikepdf.parse_content_stream(container):
+            name = str(op.operator)
+            if name in ("rg", "RG", "sh", "INLINE IMAGE"):
+                return True
+            if name in ("k", "K") and any(float(v) > 0 for v in op.operands[:3]):
+                return True
+            if name in ("cs", "CS") and op.operands and not _gray_space_ok(op.operands[0], resources):
+                return True
+    except Exception:
+        return True
+    return False
+
+
 def _font_is_embedded(font) -> bool:
     if font.get("/Subtype") == pikepdf.Name("/Type3"):
         return True                                          # Type3 glyphs are drawn by the PDF itself
@@ -752,9 +800,10 @@ def _declares_unembedded_font(pdf) -> bool:
     return False
 
 
-def print_conversion_reasons(pdf_path: str) -> list:
+def print_conversion_reasons(pdf_path: str, grayscale: bool = False) -> list:
     """Why this interior can't honestly be called PDF/X-1a as-is. Empty list = already print-clean (fonts
-    embedded, no live transparency, CMYK/gray colour only), so it's passed through untouched."""
+    embedded, no live transparency, CMYK/gray colour only -- black ink only for a black & white book), so it's
+    passed through untouched."""
     from pdfx_validator import check_fonts_embedded, check_transparency
     reasons = []
     with pikepdf.open(pdf_path) as pdf:
@@ -767,13 +816,25 @@ def print_conversion_reasons(pdf_path: str) -> list:
         seen: set = set()
         if any(_has_non_cmyk_colour(page.obj, seen) for page in pdf.pages):
             reasons.append("non_cmyk_colour")
+        non_gray = False
+        if grayscale:
+            seen = set()
+            non_gray = any(_has_non_gray_colour(page.obj, seen) for page in pdf.pages)
+    # Black & white book with colour in it: when Ghostscript runs anyway, that same pass makes it grayscale (no
+    # extra cost). Otherwise it's already a clean CMYK file -- converting a big image-heavy one took ~9 minutes
+    # -- so it's only converted when its ink really is over the limit (240%, the strictest distributor's).
+    if non_gray:
+        if reasons:
+            reasons.append("not_grayscale")
+        elif check_final_pdf_ink_coverage(pdf_path, "", "", max_pages=None):
+            reasons.append("ink_over_limit")
     return reasons
 
 
 GS_INTERIOR_TIMEOUT_S = 1500    # measured ~103 s locally for a 300-page, image-heavy 24.7 MB interior
 
 
-def _print_ready_interior_source(source_pdf_path: str) -> tuple:
+def _print_ready_interior_source(source_pdf_path: str, grayscale: bool = False) -> tuple:
     """Returns (path_to_build_from, conversion_info). When the interior has unembedded fonts, live
     transparency or non-CMYK colour, Ghostscript's PDF/X pipeline embeds every font, flattens transparency and
     converts every colour to CMYK -- the parts pikepdf can't do. The result is cached beside the source
@@ -781,16 +842,18 @@ def _print_ready_interior_source(source_pdf_path: str) -> tuple:
     so re-exports of an unchanged manuscript don't pay the conversion twice.
 
     Never makes an export fail that would have worked before: if Ghostscript is missing or errors, the
-    original file is used exactly as it was, and the reason is reported in conversion_info."""
+    original file is used exactly as it was, and the reason is reported in conversion_info.
+
+    grayscale=True (black & white paper): anything that isn't black ink only is converted to true grayscale."""
     try:
-        reasons = print_conversion_reasons(source_pdf_path)
+        reasons = print_conversion_reasons(source_pdf_path, grayscale=grayscale)
     except Exception as e:
         reasons = [f"unreadable_for_check: {e.__class__.__name__}"]
     if not reasons:
         return source_pdf_path, {"converted": False, "reasons": []}
 
     src = Path(source_pdf_path)
-    cached = src.with_name(f"{src.stem}_printready.pdf")
+    cached = src.with_name(f"{src.stem}_printready{'_gray' if grayscale else ''}.pdf")
     if cached.exists() and cached.stat().st_size > 0 and cached.stat().st_mtime >= src.stat().st_mtime:
         return str(cached), {"converted": True, "reasons": reasons, "cached": True}
 
@@ -799,7 +862,7 @@ def _print_ready_interior_source(source_pdf_path: str) -> tuple:
         return source_pdf_path, {"converted": False, "reasons": reasons, "error": "ghostscript_not_installed"}
     tmp = cached.with_name(cached.name + ".part")
     try:
-        convert_to_pdfx1a(str(src), str(tmp), title=src.stem, timeout_s=GS_INTERIOR_TIMEOUT_S)
+        convert_to_pdfx1a(str(src), str(tmp), title=src.stem, timeout_s=GS_INTERIOR_TIMEOUT_S, grayscale=grayscale)
         os.replace(tmp, cached)
     except Exception as e:
         try:
@@ -812,13 +875,13 @@ def _print_ready_interior_source(source_pdf_path: str) -> tuple:
     # version's copy (often 2-3x the source size) would otherwise sit on the 1 GB disk until the project is deleted.
     prefix = src.name[:25]
     if len(prefix) == 25 and prefix[24] == "_" and all(ch in "0123456789abcdef" for ch in prefix[:24]):
-        for old in src.parent.glob(f"{prefix}*_printready.pdf"):
+        for old in src.parent.glob(f"{prefix}*_printready*.pdf"):
             if old != cached:
                 try:
                     old.unlink()
                 except OSError:
                     pass
-    return str(cached), {"converted": True, "reasons": reasons, "cached": False}
+    return str(cached), {"converted": True, "reasons": reasons, "cached": False, "grayscale": grayscale}
 
 
 def build_interior_pdf_x1a(
@@ -831,8 +894,11 @@ def build_interior_pdf_x1a(
     author: str = "",
     color_profile: str = DEFAULT_COLOR_PROFILE,
     producer_name: str = "SparkPrep",
+    grayscale: bool = False,
 ) -> dict:
     """Stream a multi-page manuscript PDF into a real PDF/X-1a:2001 output.
+
+    grayscale=True for black & white paper: the interior comes out as black ink only (see BLACK_AND_WHITE_PAPERS).
 
     - Preserves vector text and embedded fonts (no rasterization)
     - Sets MediaBox / TrimBox / BleedBox on every page to the correct ASYMMETRIC interior bleed
@@ -852,7 +918,7 @@ def build_interior_pdf_x1a(
     profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
 
     # Fonts / transparency / colour first (Ghostscript, only when needed), THEN the lossless bleed shift + boxes.
-    build_source, print_conversion = _print_ready_interior_source(source_pdf_path)
+    build_source, print_conversion = _print_ready_interior_source(source_pdf_path, grayscale=grayscale)
     shifted_path = source_pdf_path + ".bleedshift.pdf"
     _shift_interior_pages_for_asymmetric_bleed(build_source, shifted_path, trim_w, trim_h, bleed)
     try:

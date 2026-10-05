@@ -134,6 +134,11 @@ def compose_manuscript_pdf(
         title=title, author=author,
         creator="SparkPrep Book Production Engine",
         subject="Interior manuscript",
+        # Every colour is written in printing ink (CMYK), never screen colour (RGB). RGB black text gets converted
+        # for print into "rich black" -- all four inks stacked to ~294% -- which broke IngramSpark's 240% total-ink
+        # limit on nearly every page. ReportLab's CMYK mode writes black and every grey as black ink ONLY
+        # (0,0,0,K), so a composed book's text is never more than 100% ink.
+        enforceColorSpace="cmyk",
     )
 
     def draw_page_furniture(canv, doc):

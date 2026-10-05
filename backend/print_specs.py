@@ -34,6 +34,11 @@ PAPER_TYPES = {
 }
 
 
+# Black & white papers: their interiors are exported as true grayscale (black ink only), the way IngramSpark's
+# file checklist asks for B&W books. Grayscale can never pass 100% ink, so the 240% total-ink limit can't fail.
+BLACK_AND_WHITE_PAPERS = {"white_50lb", "cream_50lb", "groundwood_38lb"}
+
+
 def paper_ppi(paper: dict, platform: str) -> int:
     """Pages per inch for this paper at this distributor (its own published figure when we have one)."""
     return (paper.get("ppi_by_platform") or {}).get(platform, paper["ppi"])

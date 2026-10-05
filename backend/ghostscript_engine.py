@@ -84,8 +84,12 @@ def convert_to_pdfx1a(
     icc_profile_path: Optional[str] = None,
     title: str = "SparkPrep Export",
     timeout_s: int = 300,
+    grayscale: bool = False,
 ) -> dict:
-    """Authoritative PDF/X-1a:2001 conversion via Ghostscript's built-in
+    """grayscale=True (black & white books): every colour becomes black ink only, so no page can go over 100%
+    total ink -- screen-black text otherwise converts to ~294% "rich black" and fails the printer's limit.
+
+    Authoritative PDF/X-1a:2001 conversion via Ghostscript's built-in
     PDF/X pipeline (-dPDFX). This is the industry-standard way to produce
     PDF/X-1a and is what most print distributors' own preflight tools
     use internally, so a file that passes gs's -dPDFX conversion is
@@ -104,8 +108,8 @@ def convert_to_pdfx1a(
         "-sDEVICE=pdfwrite",
         "-dPDFX", "-dPDFSETTINGS=/prepress",
         "-dCompatibilityLevel=1.4",
-        "-sColorConversionStrategy=CMYK",
-        "-dProcessColorModel=/DeviceCMYK",
+        "-sColorConversionStrategy=Gray" if grayscale else "-sColorConversionStrategy=CMYK",
+        "-dProcessColorModel=/DeviceGray" if grayscale else "-dProcessColorModel=/DeviceCMYK",
         "-dPreserveTransparency=false",
         f"-sOutputFile={output_path}",
     ]

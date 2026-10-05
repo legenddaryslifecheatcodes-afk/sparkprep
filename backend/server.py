@@ -35,6 +35,7 @@ from print_specs import (
     TRIM_SIZES, PAPER_TYPES, BINDING_TYPES, PLATFORMS, COLOR_PROFILES, DEFAULT_COLOR_PROFILE,
     calculate_spine_width, calculate_spine_width_for_platform, calculate_full_cover_dimensions,
     resolve_binding_spec, PLATFORM_UNSUPPORTED_BINDINGS, paper_ppi, fmt_in, spine_source, even_page_count,
+    BLACK_AND_WHITE_PAPERS,
 )
 from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
@@ -2123,6 +2124,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
                     author=(user.get("name") or ""),
                     color_profile=color_profile,
                     producer_name=producer_name,
+                    grayscale=p.get("paper_type", "white_50lb") in BLACK_AND_WHITE_PAPERS,
                 )
             else:
                 # Image-source interior (e.g. a single scanned page) → rasterized single-page flow
