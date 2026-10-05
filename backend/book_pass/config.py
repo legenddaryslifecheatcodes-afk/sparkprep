@@ -53,7 +53,7 @@ PAID_EFFECTIVE_TIER = "author"
 BOOK_INCLUDES = [
     "One book — cover, interior, or both — same price",
     f"Unlimited exports for {PASS_WINDOW_DAYS} days",
-    "Full interior deep-check included",
+    "SparkPrep Standard Check of every page included",
     "Auto-Fix with independent verification",
 ]
 

@@ -130,3 +130,27 @@ def test_anything_sparkprep_cant_fix_is_kept_as_an_unsolved_case(client, monkeyp
     assert any(c["case_id"] == case["case_id"] for c in listing["cases"])
     assert client.post(f"/api/admin/unsolved-cases/{case['case_id']}/solved").json()["ok"] is True
     assert not any(c["case_id"] == case["case_id"] for c in client.get("/api/admin/unsolved-cases").json()["cases"])
+
+
+def test_export_runs_as_a_background_job_and_hands_back_the_same_result(client):
+    # A long book's export can outlast the ~100 s one request may take on the live server, so the page starts a
+    # job and checks on it instead of waiting on one long request.
+    pid = client.post("/api/projects", json={"name": "Job Book", "platform": "ingramspark", "trim_size": "6x9",
+                                             "paper_type": "white_50lb", "binding": "paperback", "page_count": 200,
+                                             "project_type": "combined"}).json()["id"]
+    client.post(f"/api/projects/{pid}/slot-upload/interior", files={"file": ("book.pdf", interior_pdf(), "application/pdf")})
+    client.post(f"/api/projects/{pid}/slot-upload/full_wrap", files={"file": ("cover.tif", cover_tiff(300), "image/tiff")})
+    uid = str(asyncio.run(server.db.users.find_one({"email": EMAIL}))["_id"])
+    asyncio.run(book_pass.entitlements.grant_credit(server.db, uid, "pass", dedupe_key=f"job:{time.time_ns()}"))
+    assert client.post(f"/api/projects/{pid}/activate-book").status_code == 200
+
+    job = client.post(f"/api/projects/{pid}/export-jobs").json()["job_id"]
+    assert client.post(f"/api/projects/{pid}/export-jobs").json()["job_id"] == job      # a double click joins it
+    for _ in range(300):
+        st = client.get(f"/api/export-jobs/{job}").json()
+        if st["status"] != "running":
+            break
+        time.sleep(0.5)
+    assert st["status"] == "done", st
+    assert st["result"]["certified"] is True and st["result"]["download_url"]
+    assert client.get("/api/export-jobs/not-a-real-job").status_code == 404

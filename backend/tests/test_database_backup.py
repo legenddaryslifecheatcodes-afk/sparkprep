@@ -60,6 +60,7 @@ def test_a_backup_restores_everything_exactly(monkeypatch):
 
 
 def test_nightly_backups_keep_the_last_seven(monkeypatch):
+    server.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     for day in range(1, 10):
         (server.BACKUP_DIR / f"sparkprep-backup-2026-09-{day:02d}.json.gz").write_bytes(b"old")
     path = asyncio.run(server._write_nightly_backup())

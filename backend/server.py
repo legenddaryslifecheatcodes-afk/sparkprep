@@ -9,6 +9,7 @@ import re
 import copy
 import uuid
 import asyncio
+import time
 import logging
 import shutil
 import secrets
@@ -2287,6 +2288,56 @@ async def export_project(project_id: str, user: dict = Depends(get_current_user)
     return await _export_project_core(project_id, user)
 
 
+# Export as a background job. One export (building the print files + checking every page for SparkPrep
+# Certified) can take longer than the ~100 s the network in front of Render allows a single request -- a long book
+# then got cut off and the customer received nothing. The page starts a job, checks on it every few seconds, and
+# downloads when it's done. Jobs live in memory (one server instance); a restart just means "export again".
+_EXPORT_JOBS: dict = {}
+_EXPORT_JOB_TTL_S = 2 * 60 * 60
+
+
+@api_router.post("/projects/{project_id}/export-jobs")
+async def start_export_job(project_id: str, user: dict = Depends(get_current_user)):
+    now = time.time()
+    for jid in [j for j, v in _EXPORT_JOBS.items() if now - v["started"] > _EXPORT_JOB_TTL_S]:
+        _EXPORT_JOBS.pop(jid, None)
+    running = next((j for j, v in _EXPORT_JOBS.items()
+                    if v["project_id"] == project_id and v["user_id"] == user["id"] and v["status"] == "running"), None)
+    if running:                                   # a double click joins the export already under way
+        return {"job_id": running}
+    job_id = uuid.uuid4().hex
+    job = {"project_id": project_id, "user_id": user["id"], "status": "running", "started": now}
+    _EXPORT_JOBS[job_id] = job
+
+    async def run():
+        try:
+            job["result"] = await _export_project_core(project_id, user)
+            job["status"] = "done"
+        except HTTPException as e:
+            job.update(status="error", status_code=e.status_code, detail=e.detail)
+        except Exception as e:                    # noqa: BLE001
+            await log_failure(db, "export_job", e, project_id=project_id, user_id=user["id"])
+            job.update(status="error", status_code=500, detail=f"Export failed: {e}")
+
+    task = asyncio.create_task(run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return {"job_id": job_id}
+
+
+@api_router.get("/export-jobs/{job_id}")
+async def export_job_status(job_id: str, user: dict = Depends(get_current_user)):
+    job = _EXPORT_JOBS.get(job_id)
+    if not job or job["user_id"] != user["id"]:
+        raise HTTPException(404, "That export isn't running any more -- please press Export again.")
+    out = {"status": job["status"], "seconds": round(time.time() - job["started"])}
+    if job["status"] == "done":
+        out["result"] = job["result"]
+    elif job["status"] == "error":
+        out.update(status_code=job["status_code"], detail=job["detail"])
+    return out
+
+
 @api_router.get("/projects/{project_id}/download/{export_name}")
 async def download_export(project_id: str, export_name: str, request: Request):
     token = request.cookies.get("access_token") or request.query_params.get("token")
@@ -2601,7 +2652,7 @@ class InteriorCheckCheckoutIn(BaseModel):
 @api_router.post("/projects/{project_id}/interior-check/checkout")
 async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckoutIn, user: dict = Depends(get_current_user)):
     if book_pass.book_pass_on():
-        raise HTTPException(410, "The interior deep-check is now included with every book. Start your book to use it.")
+        raise HTTPException(410, "The SparkPrep Standard Check of every page is included with every book. Start your book to use it.")
     """One-time purchase for a full structural interior check, up to
     ADVANCED_INTERIOR_MAX_PAGES pages. Priced by the buyer's current
     subscription tier. This is a one-time purchase, not a lifetime license --
@@ -2761,17 +2812,17 @@ async def interior_check_run(project_id: str, user: dict = Depends(get_current_u
     if not p:
         raise HTTPException(404, "Project not found")
     if p.get("project_type") not in ("interior", "combined"):
-        raise HTTPException(400, "Advanced Interior Check only applies to projects with an interior")
+        raise HTTPException(400, "The SparkPrep Standard Check is for a book's interior -- this project doesn't have one.")
     interior_meta = _interior_file_meta(p)
     if not interior_meta or not interior_meta.get("stored_filename"):
         raise HTTPException(404, "No interior file uploaded yet")
     if not interior_meta.get("is_pdf"):
-        raise HTTPException(400, "Advanced Interior Check only applies to a PDF interior")
+        raise HTTPException(400, "The SparkPrep Standard Check needs a PDF interior.")
 
     if book_pass.book_pass_on() and not is_admin_user(user):
         window = await book_pass.entitlements.project_window(db, user["id"], project_id)
         if not window:
-            raise HTTPException(402, {"code": "book_required", "msg": "Start this book to use the full interior check -- it's included."})
+            raise HTTPException(402, {"code": "book_required", "msg": "Start this book to use the SparkPrep Standard Check -- it's included."})
         if not await db.interior_checks.find_one({"project_id": project_id, "user_id": user["id"], "paid": True}):
             await db.interior_checks.insert_one({
                 "project_id": project_id, "user_id": user["id"], "session_id": f"book:{window['credit_id']}",
@@ -2785,7 +2836,7 @@ async def interior_check_run(project_id: str, user: dict = Depends(get_current_u
         raise HTTPException(402, "Purchase the Advanced Interior Check for this book first.")
     runs_used = check.get("runs_used", 0)
     if runs_used >= ADVANCED_MAX_RUNS:
-        raise HTTPException(400, f"You've used all {ADVANCED_MAX_RUNS} Advanced Interior Check runs for this book.")
+        raise HTTPException(400, f"You've used all {ADVANCED_MAX_RUNS} SparkPrep Standard Check runs for this book. (Your export still checks every page automatically.)")
 
     file_path = UPLOAD_DIR / interior_meta["stored_filename"]
     if not file_path.exists():
@@ -3589,6 +3640,7 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
 _REVERIFIED_ON_FINAL = ("colorspace", "transparency", "pdfx1a", "bleed", "pdf_dpi", "total_ink_coverage",
                         "cover_size", "interior_page_size_mismatch", "interior_safety_margin",
                         "cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden")
+_COVER_TEXT_CHECKS = ("cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden")
 _CERT_CHECKS = (   # (label, finding ids that fail it)
     ("PDF/X-1a:2001 print standard", ("pdfx1a_not_declared", "pdfx1a_missing_output_intent", "icc_profile_missing")),
     ("All fonts embedded and licensed for print", ("fonts_not_embedded", "font_license_restricted")),
@@ -3678,12 +3730,16 @@ def _certify_final_files(p: dict, parts: list, plat: dict, platform_key: str, tr
             size_ok = abs(size[0] - geom["total_width"]) <= 0.02 and abs(size[1] - geom["total_height"]) <= 0.02
             record(f"Exact size for a {fmt_in(spine_w)}\" spine ({fmt_in(geom['total_width'])}\" x {fmt_in(geom['total_height'])}\")",
                    [] if size_ok else [{"title": f"is {size[0]}\" x {size[1]}\"", "why_it_fails": "Wrong size for this book."}], where)
-            safety = check_cover_safety_margins(
-                str(path), True, geom["total_width"], geom["total_height"], name,
-                spine_x_in=geom["spine_x"], spine_w_in=geom["spine_width"], page_count=p.get("page_count"),
-                binding="hardcover_case" if key == "case" else p.get("binding", "paperback"),
-                bleed_in=geom["bleed"])
-            record("Text inside the safe area, spine text clear of the folds", safety, where)
+            # Checked on the uploaded cover (it had to pass before export), not re-read here: export never moves
+            # the artwork -- it's placed at exactly the size the cover-size check already confirmed -- and reading
+            # the text on a full-size final cover took 1-4 minutes and ~1 GB on a 2 GB server, which made long
+            # exports time out with nothing delivered (2026-10-01).
+            slots_here = ("case_wrap",) if key == "case" else ("full_wrap", "front_cover", "back_cover", "spine")
+            safety = [{"title": c.get("label") or c.get("id"), "why_it_fails": c.get("message", ""), "id": c.get("id")}
+                      for sl in slots_here for c in ((p.get("slots") or {}).get(sl) or {}).get("compliance") or []
+                      if c.get("id") in _COVER_TEXT_CHECKS and c.get("status") != "pass"]
+            record("Text inside the safe area, spine text clear of the folds (checked on your cover file; export keeps your art in place)",
+                   safety, where)
 
     carried = [c for c in (source_compliance or [])
                if c.get("status") != "pass" and not any(k in (c.get("id") or "") for k in _REVERIFIED_ON_FINAL)]
@@ -5104,6 +5160,7 @@ async def _export_database() -> tuple:
 
 
 async def _write_nightly_backup() -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)   # recreate it if anything ever removed it
     data, counts = await _export_database()
     path = BACKUP_DIR / f"sparkprep-backup-{datetime.now(timezone.utc):%Y-%m-%d}.json.gz"
     path.write_bytes(data)
