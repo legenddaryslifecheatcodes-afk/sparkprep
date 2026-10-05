@@ -126,3 +126,35 @@ def test_clean_cmyk_rich_black_bw_book_is_converted(tmp_path):
         pdf.save(str(src))
     assert fp.print_conversion_reasons(str(src)) == []                       # fine for a colour book's structure
     assert fp.print_conversion_reasons(str(src), grayscale=True) == ["ink_over_limit"]
+
+
+def test_editor_marks_ink_as_fixed_on_export(monkeypatch, tmp_path):
+    """The editor no longer says "upload a new file" for ink that export fixes by itself."""
+    import os
+    import tempfile
+    os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="sp_ink_"))
+    os.environ.setdefault("USE_MEMORY_DB", "1")
+    os.environ.setdefault("JWT_SECRET", "ink-test-" + "x" * 32)
+    import server
+    ink = {"id": "total_ink_coverage", "status": "warning", "message": "Too much ink.", "auto_fix": False}
+    other = {"id": "dpi", "status": "warning", "message": "Soft.", "auto_fix": True}
+    stored = [dict(ink), dict(other)]
+    bw = {"paper_type": "cream_50lb"}
+    colour = {"paper_type": "color_60lb_premium"}
+    pdf, cmyk_img, rgb_img = {"color_mode": "PDF"}, {"color_mode": "CMYK"}, {"color_mode": "RGB"}
+
+    marked = server._mark_export_fixes(bw, "interior", pdf, stored)
+    assert marked[0]["fixed_on_export"] is True and "automatically" in marked[0]["message"]
+    assert "fixed_on_export" not in marked[1], "only the ink check is fixed by export"
+    assert "fixed_on_export" not in stored[0], "the stored check is never changed"
+
+    assert not server._export_fixes_ink(colour, "interior", pdf)       # colour PDF interiors aren't clamped yet
+    assert server._export_fixes_ink(colour, "interior", rgb_img)       # an RGB image interior is
+    assert server._export_fixes_ink(colour, "full_wrap", pdf)          # a PDF cover is redrawn with the limit
+    assert server._export_fixes_ink(colour, "case_wrap", rgb_img)
+    assert not server._export_fixes_ink(colour, "full_wrap", cmyk_img)  # CMYK art keeps its exact ink
+
+    project = {"paper_type": "cream_50lb", "slots": {"interior": {"color_mode": "PDF", "compliance": stored}}}
+    pd = server._mark_project_export_fixes(project, server.project_to_dict({**project, "_id": "x"}))
+    assert pd["slots"]["interior"]["compliance"][0]["fixed_on_export"] is True
+    assert "fixed_on_export" not in project["slots"]["interior"]["compliance"][0]

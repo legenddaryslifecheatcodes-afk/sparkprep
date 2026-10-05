@@ -1026,9 +1026,50 @@ def _lock_results(pd: dict) -> dict:
     return pd
 
 
+_EXPORT_FIXES_INK_NOTE = (" SparkPrep fixes this automatically when it builds your print files -- nothing for you to do. "
+                          "The export then measures every page to prove it.")
+
+
+def _export_fixes_ink(p: dict, slot: str, meta: dict) -> bool:
+    """Whether export itself brings this file's ink under the limit (owner, 2026-10-05: "why can't we fix this
+    for the users"): a cover PDF is redrawn and an RGB cover converted with the ink limit applied; a black & white
+    book's PDF interior is exported as true grayscale (never over 100%); an RGB image interior is converted
+    with the limit. A file that's already CMYK artwork keeps its exact ink at export, so it isn't covered here."""
+    mode = (meta.get("color_mode") or "").upper()
+    if slot == "interior":
+        if mode == "PDF":
+            return p.get("paper_type", "white_50lb") in BLACK_AND_WHITE_PAPERS
+        return mode not in ("", "CMYK")
+    return mode == "PDF" or mode not in ("", "CMYK")
+
+
+def _mark_export_fixes(p: dict, slot: str, meta: dict, compliance: list) -> list:
+    if not compliance or not _export_fixes_ink(p, slot, meta or {}):
+        return compliance
+    out = []
+    for c in compliance:
+        if c.get("id") == "total_ink_coverage" and c.get("status") != "pass" and not c.get("fixed_on_export"):
+            c = {**c, "fixed_on_export": True, "message": (c.get("message") or "") + _EXPORT_FIXES_INK_NOTE}
+        out.append(c)
+    return out
+
+
+def _mark_project_export_fixes(p: dict, pd: dict) -> dict:
+    slots = {k: (dict(v) if isinstance(v, dict) else v) for k, v in (pd.get("slots") or {}).items()}
+    pd["slots"] = slots                           # copies: never touch the stored document
+    for slot, meta in slots.items():
+        if isinstance(meta, dict) and meta.get("compliance"):
+            meta["compliance"] = _mark_export_fixes(p, slot, meta, meta["compliance"])
+    if pd.get("compliance"):                      # the top-level copy of the cover's (full_wrap / legacy) checks
+        cover_meta = slots.get("full_wrap") or pd.get("file_metadata") or {}
+        pd["compliance"] = _mark_export_fixes(p, "full_wrap", cover_meta, pd["compliance"])
+    return pd
+
+
 async def _present_project(p: dict, user: dict) -> dict:
     pd = project_to_dict(p)
     if await _results_unlocked(p, user):
+        pd = _mark_project_export_fixes(p, pd)
         pd["results_locked"] = False
         pd["owns_product"] = await _owns_product(p, user)
         aid = p.get("results_audit_id")
@@ -1804,10 +1845,14 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
                 platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
             )}
 
+    if sections.get("cover", {}).get("uploaded"):
+        sections["cover"]["compliance"] = _mark_export_fixes(p, "full_wrap", cover_meta, sections["cover"]["compliance"])
+    if sections.get("interior", {}).get("uploaded"):
+        sections["interior"]["compliance"] = _mark_export_fixes(p, "interior", interior_meta, sections["interior"]["compliance"])
     all_checks = [c for s in sections.values() for c in s["compliance"]]
     any_missing = any(not s["uploaded"] for s in sections.values())
     any_fail = any(c["status"] == "fail" for c in all_checks)
-    any_warning = any(c["status"] == "warning" for c in all_checks)
+    any_warning = any(c["status"] == "warning" and not c.get("fixed_on_export") for c in all_checks)
 
     if any_missing:
         status, message = "red", "Not every required file has been uploaded yet."
