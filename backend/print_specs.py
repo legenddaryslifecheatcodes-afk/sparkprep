@@ -203,11 +203,13 @@ LULU_HARDCOVER_SPINE_TABLE = [
 # IngramSpark hardcover spine (case laminate AND dust jacket -- the jacket's spine equals the case's on every
 # template), worked out from IngramSpark's own generated cover templates rather than a published formula:
 #     spine = round UP to the next 1/16" of ( even page count / PPI + board allowance )
-# Creme (444 PPI, IngramSpark's paper sheet) reproduces all 7 real templates exactly (6x9; 74, 108, 122, 198,
-# 300, 500 pages; 0.313 ... 1.250), for any allowance from 0.117 to 0.123 -- 0.12 is the middle. Keyed by the
-# PPI paper_ppi() returns for IngramSpark (444 = Creme only). White is NOT here yet: its 3 templates (74, 108,
-# 200) fit two different explanations; White 400/500 templates will settle it. Owner's data, 2026-09-30.
-INGRAMSPARK_HARDCOVER_ALLOWANCE_BY_PPI = {444: 0.12}
+# PPIs are IngramSpark's own paper sheet (Paper_Specs: Creme 50# = 444, White 50# = 512); allowances are the
+# middle of the range that reproduces EVERY real template exactly (6x9, owner's data 2026-09-30 / 10-05):
+#   Creme 444: 74, 76, 86, 108, 122, 198, 300, 500 pages (0.313 ... 1.250) -> allowance 0.117-0.123, use 0.12
+#   White 512: 74, 76, 108, 200, 400, 500 pages (0.250 ... 1.063)        -> allowance 0.047-0.085, use 0.066
+# White 76 decided between two rules that fitted the first five (it said 0.250; the other rule said 0.313).
+# Groundwood (400 PPI) has no templates yet, so it still asks for the template's number.
+INGRAMSPARK_HARDCOVER_ALLOWANCE_BY_PPI = {444: 0.12, 512: 0.066}
 
 
 def _round_up_to_sixteenth(v: float) -> float:

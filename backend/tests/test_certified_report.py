@@ -154,3 +154,24 @@ def test_export_runs_as_a_background_job_and_hands_back_the_same_result(client):
     assert st["status"] == "done", st
     assert st["result"]["certified"] is True and st["result"]["download_url"]
     assert client.get("/api/export-jobs/not-a-real-job").status_code == 404
+
+
+def test_each_file_downloads_on_its_own_with_a_plain_name(client):
+    """Owner, 2026-10-05: "I can't find the downloaded files… they need to be easy to find" -- a distributor's upload
+    box can't see inside a ZIP, so every finished file is also its own download with a name that says what it is."""
+    data, zf = export_book(client, cover_dpi=300)
+    files = data["files"]
+    assert [f["kind"] for f in files] == ["interior", "cover", "report"]
+    assert [f["filename"] for f in files] == ["Cert Book 300 - Interior.pdf", "Cert Book 300 - Cover.pdf",
+                                              "Cert Book 300 - SparkPrep Certified Report.pdf"]
+    assert all("IngramSpark" in f["where"] for f in files if f["kind"] != "report")
+    token = client.headers["Authorization"].split(" ", 1)[1]
+    for f in files:
+        r = client.get(f["download_url"], params={"token": token})
+        assert r.status_code == 200 and r.headers["content-type"] == "application/pdf"
+        assert r.content.startswith(b"%PDF")
+        member = next(n for n in zf.namelist() if n.endswith({"interior": "_interior.pdf", "cover": "_cover.pdf",
+                                                             "report": "Report.pdf"}[f["kind"]]))
+        assert r.content == zf.read(member), "each download is exactly the file inside the bundle"
+    assert client.get(files[0]["download_url"]).status_code == 401                       # signed in only
+    assert client.get(files[0]["download_url"].rsplit("/", 1)[0] + "/99", params={"token": token}).status_code == 404

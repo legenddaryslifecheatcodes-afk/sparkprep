@@ -2319,6 +2319,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     return {
         "export_name": export_name,
         "download_url": f"/api/projects/{project_id}/download/{export_name}",
+        "files": _export_files(project_id, export_name, export_path, title, binding, plat.get("name", platform_key)),
         "exports_this_month": new_used,
         "exports_limit": export_limit,
         "books_this_month": new_books_used,
@@ -2383,6 +2384,84 @@ async def export_job_status(job_id: str, user: dict = Depends(get_current_user))
     elif job["status"] == "error":
         out.update(status_code=job["status_code"], detail=job["detail"])
     return out
+
+
+# Each finished file is its own download (owner, 2026-10-05: "I can't find the downloaded files… I need them to be
+# easy to find because SparkPrep isn't just for me"). A ZIP hid them -- a distributor's upload box can't see inside
+# one. The ZIP stays (one bundle, same storage); each file inside it is also served alone under a plain name.
+def _export_file_kind(member: str):
+    if member.endswith("Report.pdf"):
+        return "report"
+    for kind in ("interior", "case", "cover"):
+        if member.endswith(f"_{kind}.pdf"):
+            return kind
+    return None
+
+
+def _export_files(project_id: str, export_name: str, export_path, title: str, binding: str, platform_name: str) -> list:
+    import zipfile
+    cover_name = {"hardcover_jacket": "Dust Jacket", "hardcover_case": "Case Cover"}.get(binding, "Cover")
+    info = {
+        "interior": ("Interior", f"Upload where {platform_name} asks for your interior (text) file."),
+        "cover": (cover_name, f"Upload where {platform_name} asks for your cover file."),
+        "case": ("Case Cover", f"The hard cover under the jacket. Upload where {platform_name} asks for your case cover file."),
+        "report": ("SparkPrep Report", "Your SparkPrep report. Keep it for your records -- it isn't uploaded anywhere."),
+    }
+    order = {"interior": 0, "cover": 1, "case": 2, "report": 3}
+    try:
+        with zipfile.ZipFile(export_path) as zf:
+            members = zf.namelist()
+    except Exception:
+        return []
+    safe_title = re.sub(r'[\\/:*?"<>|]', "", title).strip() or "My book"
+    files = []
+    for i, member in enumerate(members):
+        kind = _export_file_kind(member)
+        if not kind:
+            continue
+        label, where = info[kind]
+        if kind == "report" and "Certified" in member:
+            label = "SparkPrep Certified Report"
+        files.append({"kind": kind, "label": label, "where": where, "filename": f"{safe_title} - {label}.pdf",
+                      "download_url": f"/api/projects/{project_id}/download/{export_name}/{i}"})
+    return sorted(files, key=lambda f: order[f["kind"]])
+
+
+@api_router.get("/projects/{project_id}/download/{export_name}/{member_index}")
+async def download_export_file(project_id: str, export_name: str, member_index: int, request: Request):
+    """One file out of an export, under its plain name -- same sign-in and ownership checks as the whole bundle."""
+    import urllib.parse
+    import zipfile
+    fp = await _owned_export_path(project_id, export_name, request)
+    if fp.suffix.lower() != ".zip":
+        raise HTTPException(404, "Export not found")
+    with zipfile.ZipFile(fp) as zf:
+        members = zf.namelist()
+        if member_index < 0 or member_index >= len(members) or not _export_file_kind(members[member_index]):
+            raise HTTPException(404, "File not found")
+        data = zf.read(members[member_index])
+    return Response(content=data, media_type="application/pdf",
+                    headers={"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(members[member_index])})
+
+
+async def _owned_export_path(project_id: str, export_name: str, request: Request):
+    token = request.cookies.get("access_token") or request.query_params.get("token")
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        user_id = payload["sub"]
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+    if not export_name.startswith(project_id) or "/" in export_name or "\\" in export_name or ".." in export_name:
+        raise HTTPException(403, "Forbidden")
+    project = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user_id})
+    if not project:
+        raise HTTPException(403, "Forbidden")
+    fp = EXPORT_DIR / export_name
+    if not fp.exists():
+        raise HTTPException(404, "Export not found")
+    return fp
 
 
 @api_router.get("/projects/{project_id}/download/{export_name}")

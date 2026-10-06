@@ -106,9 +106,9 @@ def test_changing_a_spec_rechecks_the_covers(client):
 
 
 def test_an_ingramspark_hardcover_needs_the_real_spine_number(client):
-    # White: its formula isn't settled yet, so the template's number is still required (White 108 = 0.313")
-    pid = project(client, binding="hardcover_case", paper_type="white_50lb", page_count=108)
-    upload(client, pid, "full_wrap", pdf(14.194, 10.5))                    # IngramSpark's White 108 case template size
+    # Groundwood: no IngramSpark templates collected yet, so the template's number is still required
+    pid = project(client, binding="hardcover_case", paper_type="groundwood_38lb", page_count=108)
+    upload(client, pid, "full_wrap", pdf(14.194, 10.5))                    # a case sized for a 0.313" spine
     assert status(pid, "full_wrap", "spine_width_needed") == "fail"
     assert status(pid, "full_wrap", "cover_size") is None                  # no size verdict built on a guess
 
@@ -117,14 +117,23 @@ def test_an_ingramspark_hardcover_needs_the_real_spine_number(client):
     r = client.post(f"/api/projects/{pid}/export", json={})
     assert r.status_code == 400 and "Spine Width" in r.json()["detail"]
 
-    client.patch(f"/api/projects/{pid}", json={"spine_width_override": 0.313})   # from IngramSpark's White 108 template
+    client.patch(f"/api/projects/{pid}", json={"spine_width_override": 0.313})   # typed from the template
     assert status(pid, "full_wrap", "spine_width_needed") is None
-    assert status(pid, "full_wrap", "cover_size") == "pass"                # 14.194" x 10.5" -- matches the template
+    assert status(pid, "full_wrap", "cover_size") == "pass"                # 14.194" x 10.5" -- matches that spine
+
+
+def test_a_white_ingramspark_hardcover_sizes_itself_from_the_template_formula(client):
+    # White is solved too (matches all 6 IngramSpark White templates, 2026-10-05): White 108 = 0.313" spine,
+    # case 14.194" x 10.5" -- no number to type.
+    pid = project(client, binding="hardcover_case", paper_type="white_50lb", page_count=108)
+    upload(client, pid, "full_wrap", pdf(14.194, 10.5))
+    assert status(pid, "full_wrap", "spine_width_needed") is None
+    assert status(pid, "full_wrap", "cover_size") == "pass"
 
 
 def test_the_no_account_audit_asks_for_a_hardcover_spine(client):
     base = {"platform": "ingramspark", "trim_size": "6x9", "file_type": "cover", "binding": "hardcover_case",
-            "page_count": 108, "paper_type": "white_50lb"}
+            "page_count": 108, "paper_type": "groundwood_38lb"}                  # no templates for groundwood yet
     r = client.post("/api/audit/start", json=base)
     assert r.status_code == 400 and "Spine Width" in r.json()["detail"]
     assert client.post("/api/audit/start", json={**base, "spine_width": 0.313}).status_code == 200

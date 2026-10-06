@@ -49,5 +49,5 @@ def test_hardcover_spines_that_are_not_published_are_not_guessed():
     # gives both, so SparkPrep must flag its number as unconfirmed (and ask the user for the real one).
     for platform in ("ingramspark", "kdp", "barnes_noble"):
         for binding in ("hardcover_case", "hardcover_jacket"):
-            ppi = 512 if platform == "ingramspark" else 444   # IngramSpark Creme (444) is solved -- see test_ingramspark_hardcover_spine
+            ppi = 400 if platform == "ingramspark" else 444   # IngramSpark Creme/White are solved; groundwood (400) isn't
             assert calculate_spine_width_for_platform(74, ppi, platform, binding)[1] is False
