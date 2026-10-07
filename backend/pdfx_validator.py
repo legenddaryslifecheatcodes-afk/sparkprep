@@ -1023,3 +1023,180 @@ def check_cover_safety_margins(
         ))
 
     return findings
+
+
+# ---- Lessons from the owner's real IngramSpark rejections (2026-10-07) ----
+# 6/29/2026 "COVER: TEMPLATE BOXES VISIBLE ON COVER FILE ... PDF DOCUMENT SIZE IS INCORRECT" and
+# 6/24/2026 "ISBN ON JACKET FILE DOES NOT MATCH METADATA". SparkPrep flagged the template file only indirectly (as "text
+# too close to the edge" on the template's own labels) and never compared the cover's ISBN with the book's.
+
+# IngramSpark / Lightning Source template guide colors, measured from their real generated templates
+# (Case101010 / Jacket505050): the pink safe area and the blue bleed area. Exact values, small tolerance.
+_TEMPLATE_PINK = (252, 232, 241)
+_TEMPLATE_BLUE = (170, 224, 249)
+_TEMPLATE_COLOR_TOL = 7
+# Words printed on IngramSpark's own templates (labels, instructions, info block). An ordinary cover essentially never
+# carries several of these; OCR spellings vary ("iocument"), so matching is fuzzy and needs several distinct hits.
+_TEMPLATE_WORDS = ("dimensions", "artwork", "template", "instructions", "lightning", "document", "laminate",
+                   "barcode", "placement", "request", "flap", "wrap", "bleed", "safe", "content")
+
+
+def _cover_words(file_path: str, is_pdf: bool, total_w_in: Optional[float]) -> List[str]:
+    """Every word SparkPrep can read on a cover: the PDF's own text layer (exact) plus the cached OCR words."""
+    words: List[str] = []
+    if is_pdf:
+        try:
+            import fitz
+            doc = fitz.open(file_path)
+            try:
+                words += [w[4] for w in doc[0].get_text("words")]
+            finally:
+                doc.close()
+        except Exception:
+            pass
+    try:
+        ocr = cover_ocr(file_path, is_pdf, total_w_in)
+        data = ocr["data"]
+        for i, t in enumerate(data.get("text", [])):
+            t = (t or "").strip()
+            try:
+                conf = float(data["conf"][i])
+            except (TypeError, ValueError):
+                continue
+            if t and conf >= _COVER_OCR_MIN_CONFIDENCE:
+                words.append(t)
+    except Exception:
+        pass
+    return words
+
+
+def _template_box_share(file_path: str, is_pdf: bool) -> tuple:
+    """(pink share, blue share) of the cover's area painted in IngramSpark's exact template guide colors."""
+    try:
+        import numpy as np
+        from PIL import Image
+        if is_pdf:
+            import fitz
+            doc = fitz.open(file_path)
+            try:
+                page = doc[0]
+                zoom = min(1.0, 900 / max(page.rect.width, page.rect.height))
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB, alpha=False)
+                arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).astype(np.int16)
+            finally:
+                doc.close()
+        else:
+            with Image.open(file_path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((900, 900))
+                arr = np.asarray(im).astype(np.int16)
+    except Exception:
+        return 0.0, 0.0
+    total = max(arr.shape[0] * arr.shape[1], 1)
+
+    def share(rgb):
+        return float((np.abs(arr - np.array(rgb, dtype=np.int16)).max(axis=-1) <= _TEMPLATE_COLOR_TOL).sum()) / total
+    return share(_TEMPLATE_PINK), share(_TEMPLATE_BLUE)
+
+
+def check_cover_template_leftovers(file_path: str, is_pdf: bool, total_w_in: Optional[float],
+                                   platform_name: str) -> List[dict]:
+    """A cover that still shows parts of the distributor's template: its pink/blue guide boxes, or its printed labels
+    left inside the artwork (the template cropped down instead of hidden)."""
+    import difflib
+    pink, blue = _template_box_share(file_path, is_pdf)
+    boxes = pink >= 0.004 or blue >= 0.004 or (pink >= 0.0015 and blue >= 0.0015)
+    hits = set()
+    for w in _cover_words(file_path, is_pdf, total_w_in):
+        w = "".join(ch for ch in w.lower() if ch.isalpha())
+        if len(w) < 4:
+            continue
+        for key in _TEMPLATE_WORDS:
+            if w == key or (len(w) >= 6 and difflib.SequenceMatcher(None, w, key).ratio() >= 0.82):
+                hits.add(key)
+    labels = len(hits) >= 4
+    if not boxes and not labels:
+        return []
+    found = []
+    if boxes:
+        found.append("the template's pink and blue guide boxes")
+    if labels:
+        found.append("the template's own printed labels (" + ", ".join(sorted(hits)[:4]) + ")")
+    return [_finding(
+        id="cover_template_leftovers",
+        severity="fail",
+        title="Your cover still shows parts of the cover template",
+        why_it_fails=(
+            f"SparkPrep found {' and '.join(found)} in your cover file. {platform_name} rejects covers like this: the "
+            "pink and blue boxes must be completely covered by your artwork, and a cover built on the template must be "
+            "submitted at the template's full page size with its labels untouched -- not cropped down with the labels "
+            "left inside the artwork."
+        ),
+        publisher_rule=f"{platform_name} — pink and blue template boxes must be covered; a template-built cover keeps the template's document size",
+        pinpoint={"pink_share": round(pink, 4), "blue_share": round(blue, 4), "template_words": sorted(hits)},
+        fix_steps=[
+            "In your design file, hide or delete the template layer, so only your artwork is exported.",
+            "Export just the artwork at the exact size SparkPrep shows under the upload box (bleed size), and upload that.",
+            "Or, to keep the template: cover every pink and blue box with your artwork and export at the template's "
+            "full page size (printed in its lower-left corner).",
+        ],
+        fix_tools=["Adobe Photoshop", "Adobe InDesign", "Affinity Publisher", "Canva"],
+        one_click_fix=False,
+    )]
+
+
+def _isbn13_ok(d: str) -> bool:
+    if len(d) != 13 or not d.isdigit():
+        return False
+    total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(d[:12]))
+    return (10 - total % 10) % 10 == int(d[12])
+
+
+def cover_isbns(file_path: str, is_pdf: bool, total_w_in: Optional[float]) -> List[str]:
+    """Valid ISBN-13s printed on a cover (the 'ISBN 978-...' line and the digits under the barcode)."""
+    import re
+    text = " ".join(_cover_words(file_path, is_pdf, total_w_in))
+    found: List[str] = []
+    for m in re.finditer(r"97[89][\d\s\-]{10,22}", text):
+        digits = re.sub(r"\D", "", m.group(0))
+        for start in range(0, max(len(digits) - 12, 1)):
+            cand = digits[start:start + 13]
+            if cand.startswith(("978", "979")) and _isbn13_ok(cand):
+                if cand not in found:
+                    found.append(cand)
+                break
+    return found
+
+
+def check_cover_isbn(file_path: str, is_pdf: bool, total_w_in: Optional[float], expected_isbn: Optional[str],
+                     platform_name: str) -> List[dict]:
+    """The ISBN printed on the cover must be this book's ISBN. Only reports a mismatch it can actually read."""
+    import re
+    expected = re.sub(r"\D", "", expected_isbn or "")
+    if len(expected) != 13:
+        return []
+    found = cover_isbns(file_path, is_pdf, total_w_in)
+    if not found or expected in found:
+        return []
+
+    def fmt(d):
+        return f"{d[:3]}-{d[3]}-{d[4:8]}-{d[8:12]}-{d[12]}"
+    return [_finding(
+        id="cover_isbn_mismatch",
+        severity="fail",
+        title=f"The ISBN on your cover ({fmt(found[0])}) isn't this book's ISBN ({fmt(expected)})",
+        why_it_fails=(
+            f"The ISBN printed on your cover doesn't match the ISBN this book is set up under. {platform_name} rejects a "
+            "cover whose ISBN doesn't match the title's records. Usually the barcode came from an older edition, a "
+            "different format (paperback vs hardcover), or a sample template."
+        ),
+        publisher_rule=f"{platform_name} — the ISBN on the cover must match the title's ISBN",
+        pinpoint={"found_on_cover": found, "expected": expected},
+        fix_steps=[
+            "Check which ISBN is right for THIS edition (each format -- paperback, hardcover, ebook -- has its own).",
+            "If the book's ISBN in SparkPrep is wrong, correct it in the ISBN box. SparkPrep can add the right barcode for you.",
+            "If the cover's barcode is wrong, replace it in your design file (or remove it and let SparkPrep add one), then re-upload.",
+        ],
+        fix_tools=["Your distributor's cover template", "SparkPrep's ISBN barcode"],
+        one_click_fix=False,
+    )]

@@ -1831,6 +1831,7 @@ async def final_review(project_id: str, user: dict = Depends(get_current_user)):
                 platform_name=plat.get("name"), final_w=final_w, final_h=final_h,
                 spine_x_in=geom["spine_x"], spine_w_in=geom["spine_width"],
                 page_count=p.get("page_count"), binding=p.get("binding", "paperback"),
+                expected_isbn=p.get("isbn"),
             )}
     if needs_interior:
         interior_meta = (p.get("slots") or {}).get("interior")
@@ -3765,8 +3766,10 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
 # replaced by the final file's own result (e.g. an RGB upload is CMYK after export, and that's measured).
 _REVERIFIED_ON_FINAL = ("colorspace", "transparency", "pdfx1a", "bleed", "pdf_dpi", "total_ink_coverage",
                         "cover_size", "interior_page_size_mismatch", "interior_safety_margin",
-                        "cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden")
-_COVER_TEXT_CHECKS = ("cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden")
+                        "cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden",
+                        "cover_template_leftovers", "cover_isbn_mismatch")
+_COVER_TEXT_CHECKS = ("cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden",
+                      "cover_template_leftovers", "cover_isbn_mismatch")
 _CERT_CHECKS = (   # (label, finding ids that fail it)
     ("PDF/X-1a:2001 print standard", ("pdfx1a_not_declared", "pdfx1a_missing_output_intent", "icc_profile_missing")),
     ("All fonts embedded and licensed for print", ("fonts_not_embedded", "font_license_restricted")),
@@ -3864,7 +3867,8 @@ def _certify_final_files(p: dict, parts: list, plat: dict, platform_key: str, tr
             safety = [{"title": c.get("label") or c.get("id"), "why_it_fails": c.get("message", ""), "id": c.get("id")}
                       for sl in slots_here for c in ((p.get("slots") or {}).get(sl) or {}).get("compliance") or []
                       if c.get("id") in _COVER_TEXT_CHECKS and c.get("status") != "pass"]
-            record("Text inside the safe area, spine text clear of the folds (checked on your cover file; export keeps your art in place)",
+            record("Text inside the safe area, spine text clear of the folds, no template parts left, ISBN matches "
+                   "(checked on your cover file; export keeps your art in place)",
                    safety, where)
 
     carried = [c for c in (source_compliance or [])
@@ -3938,6 +3942,7 @@ def _slot_compliance(p: dict, slot: str, file_path: str, metadata: dict) -> list
         metadata, trim["w"], trim["h"], plat["bleed"], p["platform"],
         file_path=file_path, slot=slot, platform_name=plat.get("name"), max_pages=BASIC_CHECK_MAX_PAGES,
         final_w=final_w, final_h=final_h, cover_bleed_in=_cover_bleed_for_slot(p, slot), **spine_kwargs,
+        expected_isbn=p.get("isbn"),
     )
     if slot in ("full_wrap", "case_wrap") and _project_needs_spine_number(p):
         compliance = [{"id": "spine_width_needed", "label": "Spine width needed", "status": "fail",

@@ -1309,7 +1309,7 @@ def run_compliance_checks(
     file_path: str = None, slot: str = None, platform_name: str = None, max_pages: int = None,
     final_w: float = None, final_h: float = None,
     spine_x_in: float = None, spine_w_in: float = None, page_count: int = None, binding: str = None,
-    cover_bleed_in: float = None,
+    cover_bleed_in: float = None, expected_isbn: str = None,
 ) -> list:
     """Return a list of compliance issues with severity and auto-fix availability.
 
@@ -1519,5 +1519,17 @@ def run_compliance_checks(
                 "auto_fix": f.get("one_click_fix", False),
                 "fix_action": "scale_safe_margin" if f["id"] == "cover_safety_margin" else None,
             })
+
+    # Two lessons from the owner's real IngramSpark rejections: template parts left in the cover (6/29/2026) and an
+    # ISBN on the cover that isn't the book's (6/24/2026). Both reuse the cover's cached OCR -- no extra read.
+    if slot in ("full_wrap", "case_wrap", "front_cover", "back_cover") and file_path:
+        from pdfx_validator import check_cover_template_leftovers, check_cover_isbn
+        is_pdf = file_metadata.get("is_pdf", False)
+        extra = check_cover_template_leftovers(file_path, is_pdf, final_w, platform_name or platform)
+        if slot != "front_cover":                    # the ISBN/barcode lives on the back
+            extra += check_cover_isbn(file_path, is_pdf, final_w, expected_isbn, platform_name or platform)
+        for f in extra:
+            checks.append({"id": f["id"], "label": f["title"], "status": f["severity"], "message": f["why_it_fails"],
+                           "auto_fix": False, "fix_action": None})
 
     return checks
