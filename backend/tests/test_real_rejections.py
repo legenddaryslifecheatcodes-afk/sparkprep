@@ -193,3 +193,39 @@ def test_1007_rejected_jacket_spine_is_caught():
         pytest.skip("owner's real file not on this machine")
     found = _spine_findings(str(f))
     assert [x["id"] for x in found] == ["cover_spine_text_margin"] and found[0]["severity"] == "fail"
+
+
+
+def _fold_findings(f, is_pdf=True):
+    from pdfx_validator import check_jacket_folds
+    return check_jacket_folds(f, is_pdf, 20.4375, 9.5, [(3.375, 3.625), (16.8125, 17.0625)], "IngramSpark")
+
+
+def test_text_on_a_flap_fold_is_caught_and_clear_text_passes(tmp_path):
+    def jacket(path, x_in, text="About the author and the book"):
+        c = canvas.Canvas(str(path), pagesize=(20.4375 * inch, 9.5 * inch))
+        c.setFillColorRGB(0.08, 0.07, 0.06)
+        c.rect(0, 0, 20.4375 * inch, 9.5 * inch, fill=1, stroke=0)
+        c.setFillColorRGB(0.95, 0.9, 0.8)
+        c.setFont("Helvetica", 16)
+        c.drawString(x_in * inch, 5 * inch, text)
+        c.setStrokeColorRGB(0.85, 0.7, 0.2)                     # a gold rule right at the fold: artwork, not text
+        c.line(16.8 * inch, 0.5 * inch, 16.8 * inch, 9.0 * inch)
+        c.showPage()
+        c.save()
+        return str(path)
+    assert [f["id"] for f in _fold_findings(jacket(tmp_path / "on_fold.pdf", 1.6))] == ["cover_jacket_fold"]
+    assert _fold_findings(jacket(tmp_path / "clear.pdf", 0.5, "About the author")) == []   # ends ~2.1", fold at 3.375"
+
+
+def test_1007_both_old_jackets_fail_the_fold_check_and_the_rebuilt_one_passes():
+    home = Path(os.path.expanduser("~"))
+    old = home / "Downloads" / "Legenddary_Mindset_Awakening_Ingram_Jacket_FINAL_74pp.pdf"
+    sent = home / "OneDrive" / "Desktop" / "BOOK FILES - Legenddary Mindset" / "2 - DUST JACKET - Legenddary Mindset.pdf"
+    rebuilt = home / "Downloads" / "Legenddary Mindset - FIXED JACKET" / "Legenddary Mindset - Dust Jacket - REBUILT 78pp.pdf"
+    if not (old.exists() and sent.exists() and rebuilt.exists()):
+        pytest.skip("owner's real files not on this machine")
+    assert [f["id"] for f in _fold_findings(str(old))] == ["cover_jacket_fold"]
+    assert [f["id"] for f in _fold_findings(str(sent))] == ["cover_jacket_fold"]
+    assert _fold_findings(str(rebuilt)) == []
+    assert _spine_findings(str(rebuilt)) == []

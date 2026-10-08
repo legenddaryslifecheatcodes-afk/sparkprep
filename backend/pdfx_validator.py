@@ -1248,6 +1248,123 @@ def check_cover_template_leftovers(file_path: str, is_pdf: bool, total_w_in: Opt
     )]
 
 
+JACKET_FOLD_CLEARANCE_IN = 0.125     # IngramSpark's pink safe area sits 0.125" inside every fold line
+
+
+def _confirm_fold_hits(file_path: str, is_pdf: bool, ocr: dict, img_w_in: float, data: dict, folds: List[tuple]) -> List[tuple]:
+    """OCR boxes around big display lettering can stretch to the next thing beside them (on the owner's rebuilt
+    jacket, 'MINDSET' got a box reaching the front panel's gold border, 0.75" past the last letter). Re-measure each
+    candidate word from its actual letter pixels before calling it a fold problem."""
+    try:
+        import numpy as np
+        from PIL import Image
+        if is_pdf:
+            import fitz
+            doc = fitz.open(file_path)
+            try:
+                pix = doc[0].get_pixmap(dpi=_COVER_OCR_DPI, colorspace=fitz.csRGB, alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            finally:
+                doc.close()
+        else:
+            image = Image.open(file_path).convert("RGB")
+        if image.size != (ocr["width"], ocr["height"]):
+            image = image.resize((ocr["width"], ocr["height"]), Image.LANCZOS)
+        lum = np.asarray(image.convert("L")).astype(np.int16)
+    except Exception:
+        return []
+    sx = ocr["width"] / img_w_in
+    out = []
+    for i, t in enumerate(data.get("text", [])):
+        t = (t or "").strip()
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            continue
+        if sum(ch.isalpha() for ch in t) < 3 or conf < 60:
+            continue
+        l, tp, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        box = lum[tp:tp + h, l:l + w]
+        if box.size == 0:
+            continue
+        ink = np.abs(box - np.median(box)) > 60          # strokes that stand out from the word's own background
+        cols = np.where(ink.mean(axis=0) > 0.06)[0]
+        if len(cols) == 0:
+            continue
+        # Split into runs; a lone hairline (a border or fold rule, < 0.04" wide and 0.12" clear of the letters) is
+        # artwork, not part of the word.
+        gap, thin = max(1, round(0.12 * sx)), max(1, round(0.04 * sx))
+        runs, start = [], cols[0]
+        for a, b in zip(cols, cols[1:]):
+            if b - a > gap:
+                runs.append((start, a))
+                start = b
+        runs.append((start, cols[-1]))
+        letters = [r for r in runs if r[1] - r[0] + 1 > thin] or runs
+        left = (l + letters[0][0]) / sx
+        right = (l + letters[-1][1] + 1) / sx
+        for f0, f1 in folds:
+            if right > f0 - JACKET_FOLD_CLEARANCE_IN and left < f1 + JACKET_FOLD_CLEARANCE_IN:
+                out.append((t, left, right, f0, f1))
+    return out
+
+
+def check_jacket_folds(file_path: str, is_pdf: bool, total_w_in: float, total_h_in: float, folds: List[tuple],
+                       platform_name: str) -> List[dict]:
+    """Text on a dust jacket must stay clear of the two flap folds (each fold is a band, e.g. 3.375"-3.625"): words on
+    or within JACKET_FOLD_CLEARANCE_IN of a fold wrap around the board edge or sit in the crease."""
+    try:
+        ocr = cover_ocr(file_path, is_pdf, total_w_in)
+    except Exception:
+        return []
+    img_w_in = ocr["pdf_w_in"] if is_pdf and ocr.get("pdf_w_in") else total_w_in
+    if not img_w_in:
+        return []
+    sx = ocr["width"] / img_w_in
+    data = ocr["data"]
+    hits = []
+    for i, t in enumerate(data.get("text", [])):
+        t = (t or "").strip()
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            continue
+        if sum(ch.isalpha() for ch in t) < 3 or conf < 60:
+            continue
+        left = data["left"][i] / sx
+        right = (data["left"][i] + data["width"][i]) / sx
+        for f0, f1 in folds:
+            if right > f0 - JACKET_FOLD_CLEARANCE_IN and left < f1 + JACKET_FOLD_CLEARANCE_IN:
+                hits.append((t, left, right, f0, f1))
+    if hits:
+        hits = _confirm_fold_hits(file_path, is_pdf, ocr, img_w_in, data, folds)
+    if not hits:
+        return []
+    word, left, right, f0, f1 = hits[0]
+    words = ", ".join(dict.fromkeys(h[0] for h in hits[:6]))
+    return [_finding(
+        id="cover_jacket_fold",
+        severity="fail",
+        title=f"Text runs over a flap fold on your jacket (\"{word}\", near the fold at {f0:.3f}\"-{f1:.3f}\")",
+        why_it_fails=(
+            f"The jacket's flaps fold around the covers at {', '.join(f'{a:.3f}\"-{b:.3f}\"' for a, b in folds)} from the "
+            f"left edge. SparkPrep found text on or right next to a fold ({words}) -- it would wrap around the fold or "
+            f"sit in the crease. {platform_name} rejects jackets whose layout doesn't match their template "
+            "(\"jacket layout not built to the correct specifications\")."
+        ),
+        publisher_rule=f"{platform_name} — jacket text stays {JACKET_FOLD_CLEARANCE_IN}\" clear of the flap folds",
+        pinpoint={"words": [h[0] for h in hits[:10]], "folds_in": [list(f) for f in folds]},
+        fix_steps=[
+            "Lay your jacket out on your distributor's jacket template: flap, fold, back cover, spine, front cover, "
+            "fold, flap -- each part inside its own box.",
+            f"Keep all flap and cover text at least {JACKET_FOLD_CLEARANCE_IN}\" away from the fold lines.",
+            "Re-export at the same overall size and upload again.",
+        ],
+        fix_tools=["Your distributor's jacket template", "Adobe InDesign", "Canva"],
+        one_click_fix=False,
+    )]
+
+
 def _isbn13_ok(d: str) -> bool:
     if len(d) != 13 or not d.isdigit():
         return False

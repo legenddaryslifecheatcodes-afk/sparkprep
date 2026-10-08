@@ -3767,9 +3767,9 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
 _REVERIFIED_ON_FINAL = ("colorspace", "transparency", "pdfx1a", "bleed", "pdf_dpi", "total_ink_coverage",
                         "cover_size", "interior_page_size_mismatch", "interior_safety_margin",
                         "cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden",
-                        "cover_template_leftovers", "cover_isbn_mismatch")
+                        "cover_template_leftovers", "cover_isbn_mismatch", "cover_jacket_fold")
 _COVER_TEXT_CHECKS = ("cover_safety_margin", "cover_spine_text_margin", "cover_spine_text_forbidden",
-                      "cover_template_leftovers", "cover_isbn_mismatch")
+                      "cover_template_leftovers", "cover_isbn_mismatch", "cover_jacket_fold")
 _CERT_CHECKS = (   # (label, finding ids that fail it)
     ("PDF/X-1a:2001 print standard", ("pdfx1a_not_declared", "pdfx1a_missing_output_intent", "icc_profile_missing")),
     ("All fonts embedded and licensed for print", ("fonts_not_embedded", "font_license_restricted")),

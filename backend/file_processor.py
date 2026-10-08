@@ -1528,6 +1528,18 @@ def run_compliance_checks(
         extra = check_cover_template_leftovers(file_path, is_pdf, final_w, platform_name or platform)
         if slot != "front_cover":                    # the ISBN/barcode lives on the back
             extra += check_cover_isbn(file_path, is_pdf, final_w, expected_isbn, platform_name or platform)
+        # A dust jacket's flaps fold around the boards: text on or next to a fold line wraps around it. IngramSpark
+        # rejected the owner's jacket (10/7/2026, "JACKET LAYOUT SUBMITTED IS NOT BUILT TO THE CORRECT SPECIFICATIONS")
+        # whose flap text ran ~0.8" past the fold -- the overall size was right, so nothing caught it.
+        if slot == "full_wrap" and binding == "hardcover_jacket" and spine_w_in and final_w and final_h:
+            from pdfx_validator import check_jacket_folds
+            geo = calculate_full_cover_dimensions(target_w, target_h, spine_w_in,
+                                                  cover_bleed_in if cover_bleed_in is not None else bleed,
+                                                  "hardcover_jacket", platform)
+            if abs(geo["total_width"] - final_w) < 0.05:
+                folds = [(geo["back_x"] - geo["wrap_fold"], geo["back_x"]),
+                         (geo["front_x"] + geo["panel_width"], geo["front_flap_x"])]
+                extra += check_jacket_folds(file_path, is_pdf, final_w, final_h, folds, platform_name or platform)
         for f in extra:
             checks.append({"id": f["id"], "label": f["title"], "status": f["severity"], "message": f["why_it_fails"],
                            "auto_fix": False, "fix_action": None})
