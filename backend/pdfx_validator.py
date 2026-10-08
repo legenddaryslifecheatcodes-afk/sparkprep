@@ -1022,7 +1022,110 @@ def check_cover_safety_margins(
             one_click_fix=False,
         ))
 
+    # Spine titles run SIDEWAYS, and the upright read above can't see them. IngramSpark rejected the owner's jacket
+    # (10/7/2026: "INCORRECT SPINE WIDTH - SPINE SHOULD BE 0.313" FOR 78 PAGES. REDUCE SPINE TEXT TO FIT") whose
+    # spine lettering spanned ~1.2" of a 0.313" spine -- SparkPrep had passed it because it never saw those words.
+    # So the spine band is also read rotated both ways, and the lettering's real width is compared with the spine.
+    if has_spine_geometry and not any(f["id"] in ("cover_spine_text_margin", "cover_spine_text_forbidden") for f in findings):
+        side = _sideways_spine_words(file_path, is_pdf, img_w_in, img_h_in, spine_left_in, spine_right_in)
+        if side and spine_text_forbidden:
+            findings.append(_finding(
+                id="cover_spine_text_forbidden", severity="fail",
+                title=f"Spine text found, but this book is too thin to carry spine text ({page_count} pages)",
+                why_it_fails=(f"SparkPrep found \"{side[0][0]}\" on the spine. {platform_name} does not allow spine text on a "
+                              f"Perfect Bound book under {SPINE_TEXT_MIN_PAGES_PERFECT_BOUND} pages."),
+                publisher_rule=f"{platform_name} — no spine text allowed on Perfect Bound books under {SPINE_TEXT_MIN_PAGES_PERFECT_BOUND} pages",
+                pinpoint={"detected_text": side[0][0], "page_count": page_count},
+                fix_steps=["Remove all text from the spine panel of your cover design.", "Re-export and re-upload."],
+                fix_tools=["Adobe Photoshop", "Adobe Illustrator", "Canva"], one_click_fix=False,
+            ))
+        elif side:
+            lo = min(s[1] for s in side)
+            hi = max(s[2] for s in side)
+            over = max(spine_left_in + spine_margin_required - lo, hi - (spine_right_in - spine_margin_required))
+            if over > 0.02:
+                text_w = hi - lo
+                words = ", ".join(dict.fromkeys(s[0] for s in side))
+                findings.append(_finding(
+                    id="cover_spine_text_margin", severity="fail",
+                    title=f"Spine text is too wide for your {spine_w_in:.3f}\" spine (it spans about {text_w:.2f}\")",
+                    why_it_fails=(
+                        f"Your spine lettering ({words}) spans about {text_w:.2f}\" across, from {lo:.2f}\" to {hi:.2f}\" on "
+                        f"the cover, but this book's spine is only {spine_w_in:.3f}\" wide ({spine_left_in:.3f}\" to "
+                        f"{spine_right_in:.3f}\"). The text would wrap onto the front and back covers. {platform_name} "
+                        f"needs spine text to stay {spine_margin_required}\" inside the spine's edges -- the cover art "
+                        "was most likely built for a thicker book."
+                    ),
+                    publisher_rule=f"{platform_name} — spine text must fit inside the spine, {spine_margin_required}\" from its edges",
+                    pinpoint={"spine_text_from_in": round(lo, 3), "spine_text_to_in": round(hi, 3),
+                              "spine_from_in": round(spine_left_in, 3), "spine_to_in": round(spine_right_in, 3)},
+                    fix_steps=[
+                        f"In your cover design, make the spine panel exactly {spine_w_in:.3f}\" wide, starting "
+                        f"{spine_left_in:.3f}\" from the left edge of the file (your distributor's template shows it).",
+                        f"Shrink the spine text so its letters are no taller than {max(spine_w_in - 2 * spine_margin_required, 0):.3f}\" "
+                        "across the spine, and center it in the spine panel.",
+                        "Re-export at the same overall size and upload again.",
+                    ],
+                    fix_tools=["Your distributor's cover template", "Adobe Photoshop", "Adobe InDesign", "Canva"],
+                    one_click_fix=False,
+                ))
+
     return findings
+
+
+def _sideways_spine_words(file_path: str, is_pdf: bool, img_w_in: float, img_h_in: float,
+                          spine_left_in: float, spine_right_in: float) -> List[tuple]:
+    """Words printed sideways along the spine: (text, left_in, right_in) across the cover's width, for every rotated
+    word that overlaps the spine column. Reads a band 1.5" either side of the spine, turned 90 degrees both ways."""
+    try:
+        import pytesseract
+        from PIL import Image
+        if is_pdf:
+            import fitz
+            doc = fitz.open(file_path)
+            try:
+                pix = doc[0].get_pixmap(dpi=_COVER_OCR_DPI, colorspace=fitz.csRGB, alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            finally:
+                doc.close()
+        else:
+            image = Image.open(file_path).convert("RGB")
+    except Exception:
+        return []
+    px = image.width / img_w_in
+    x0 = max(0, int((spine_left_in - 1.5) * px))
+    x1 = min(image.width, int((spine_right_in + 1.5) * px))
+    band = image.crop((x0, 0, x1, image.height))
+    if band.height > 2200:                       # plenty for spine-size lettering; keeps OCR quick
+        s = 2200 / band.height
+        band = band.resize((max(1, round(band.width * s)), 2200), Image.LANCZOS)
+        px_band = px * s
+    else:
+        px_band = px
+    out = []
+    for angle in (90, 270):
+        rot = band.rotate(angle, expand=True)
+        try:
+            d = pytesseract.image_to_data(rot, config="--psm 11", output_type=pytesseract.Output.DICT)
+        except Exception:
+            return []
+        for i, t in enumerate(d.get("text", [])):
+            t = (t or "").strip()
+            letters = sum(ch.isalpha() for ch in t)
+            try:
+                conf = float(d["conf"][i])
+            except (TypeError, ValueError):
+                continue
+            if letters < 4 or conf < 55:
+                continue
+            top, h = d["top"][i], d["height"][i]
+            # rotate(90) turns the band counter-clockwise: a rotated row y maps back to x = width - y (and vice versa)
+            a, b = (band.width - (top + h), band.width - top) if angle == 90 else (top, top + h)
+            left_in = x0 / px + a / px_band
+            right_in = x0 / px + b / px_band
+            if right_in > spine_left_in and left_in < spine_right_in:
+                out.append((t, left_in, right_in))
+    return out
 
 
 # ---- Lessons from the owner's real IngramSpark rejections (2026-10-07) ----

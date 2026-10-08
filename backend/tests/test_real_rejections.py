@@ -5,6 +5,8 @@ Each rejection reason must be caught -- and fixed where SparkPrep can fix it:
   6/26  BOOKBLOCK: interior content outside the safety area, not centered        (letter-size file for a 6x9 book)
   6/29  COVER: template boxes visible on cover file, PDF document size incorrect   (template cropped, labels left in)
   6/29  BOOKBLOCK: RGB colors in interior file -- text may print gray, not 100% black
+  10/7  JACKET: incorrect spine width, 0.313" for 78 pages -- REDUCE SPINE TEXT TO FIT (a SparkPrep-certified export:
+        its spine lettering ran sideways and SparkPrep's upright text read never saw it)
 
 The always-run tests use small made-up files. The real-file tests use the owner's own rejected files, which stay on
 his computer (they're his book): they run there and skip anywhere the files aren't present.
@@ -148,3 +150,46 @@ def test_629_rgb_interior_comes_out_black_ink_only(tmp_path):
     with pikepdf.open(str(out)) as pdf:
         assert check_rgb_color(pdf, max_pages=None) is None
     assert fp.print_conversion_reasons(str(out), grayscale=True) == []                  # 100% black ink only
+
+
+def _jacket_with_spine_text(path, letter_height_in):
+    """6x9 IngramSpark jacket for 78pp (20.4375 x 9.5, spine 10.0625-10.375) with the title set sideways on the spine."""
+    c = canvas.Canvas(str(path), pagesize=(20.4375 * inch, 9.5 * inch))
+    c.setFillColorRGB(0.08, 0.07, 0.06)
+    c.rect(0, 0, 20.4375 * inch, 9.5 * inch, fill=1, stroke=0)
+    c.setFillColorRGB(0.95, 0.85, 0.4)
+    c.saveState()
+    c.translate((10.21875 + letter_height_in / 2) * inch, 1.2 * inch)     # letters centred on the spine
+    c.rotate(90)
+    c.setFont("Helvetica-Bold", letter_height_in * 72 / 0.72)              # Helvetica caps are ~0.72 of the font size
+    c.drawString(0, 0, "LEGENDDARY MINDSET")
+    c.restoreState()
+    c.showPage()
+    c.save()
+    return str(path)
+
+
+def _spine_findings(f):
+    from pdfx_validator import check_cover_safety_margins
+    return [x for x in check_cover_safety_margins(f, True, 20.4375, 9.5, "IngramSpark", spine_x_in=10.0625,
+                                                  spine_w_in=0.3125, page_count=78, binding="hardcover_jacket",
+                                                  bleed_in=0.125)
+            if x["id"].startswith("cover_spine_text")]
+
+
+def test_sideways_spine_text_too_wide_is_caught(tmp_path):
+    wide = _spine_findings(_jacket_with_spine_text(tmp_path / "wide.pdf", 0.8))
+    assert [x["id"] for x in wide] == ["cover_spine_text_margin"] and wide[0]["severity"] == "fail"
+    assert "too wide" in wide[0]["title"]
+
+
+def test_sideways_spine_text_that_fits_passes(tmp_path):
+    assert _spine_findings(_jacket_with_spine_text(tmp_path / "fits.pdf", 0.2)) == []
+
+
+def test_1007_rejected_jacket_spine_is_caught():
+    f = Path(os.path.expanduser("~")) / "OneDrive" / "Desktop" / "BOOK FILES - Legenddary Mindset" / "2 - DUST JACKET - Legenddary Mindset.pdf"
+    if not f.exists():
+        pytest.skip("owner's real file not on this machine")
+    found = _spine_findings(str(f))
+    assert [x["id"] for x in found] == ["cover_spine_text_margin"] and found[0]["severity"] == "fail"
