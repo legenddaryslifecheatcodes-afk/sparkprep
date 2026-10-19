@@ -64,6 +64,7 @@ from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverErr
 from image_upscale_engine import upscale_to_size
 import autofix_agents
 import book_pass
+import open_house
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -517,11 +518,26 @@ async def get_current_user(request: Request) -> dict:
             # features unlocked; everyone else is "free". Admins and beta testers keep what they have.
             exempt = bool(user.get("beta_active")) or is_admin_user(user)
             user["tier"] = await book_pass.entitlements.effective_tier(db, user, exempt=exempt)
+        await _apply_open_house(user)
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def _apply_open_house(user: dict) -> None:
+    """During the Open House everyone gets what a beta tester gets (see open_house.py). Request-only: nothing
+    here is saved to the account, so it all goes back to normal the moment the window closes."""
+    if await open_house.is_active(db):
+        user["open_house"] = True
+        if user.get("tier", "free") == "free":
+            user["tier"] = book_pass.config.PAID_EFFECTIVE_TIER
+
+
+def _free_pass(*users: dict) -> bool:
+    """Beta testers, and everyone during the Open House, skip the paid gates."""
+    return any(u.get("beta_active") or u.get("open_house") for u in users)
 
 
 def set_auth_cookie(response: Response, token: str):
@@ -580,6 +596,7 @@ async def get_billing_user(user: dict) -> dict:
     if book_pass.book_pass_on():
         owner["tier"] = await book_pass.entitlements.effective_tier(
             db, owner, exempt=bool(owner.get("beta_active")) or is_admin_user(owner))
+    await _apply_open_house(owner)
     return owner
 
 
@@ -748,6 +765,101 @@ async def logout(response: Response):
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     return {"user": enrich_user(user)}
+
+
+# ---- Open House (see open_house.py) ----
+GUEST_EMAIL_DOMAIN = "guest.sparkprep.invalid"
+GUEST_MAX_PER_IP = 10            # guest accounts one address can start per hour -- stops a script filling the database
+GUEST_IP_WINDOW_S = 60 * 60
+
+
+class OpenHouseModeIn(BaseModel):
+    mode: Literal["auto", "on", "off"]
+
+
+class GuestClaimIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    name: Optional[str] = None
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() if fwd else "") or (request.client.host if request.client else "unknown")
+
+
+@api_router.get("/open-house")
+async def open_house_status():
+    return await open_house.status(db)
+
+
+@api_router.post("/admin/open-house")
+async def admin_set_open_house(payload: OpenHouseModeIn, admin: dict = Depends(require_admin)):
+    """The manual switch: "off" ends the Open House now, "on" starts it now, "auto" goes back to the clock."""
+    await open_house.set_admin_mode(db, payload.mode, admin.get("email", "admin"))
+    return await open_house.status(db)
+
+
+@api_router.post("/auth/guest")
+async def guest_start(request: Request, response: Response):
+    """No sign-up during the Open House: a guest account is made on the spot so every project still has an owner.
+    The guest can keep their work afterwards by adding an email and password (/auth/guest/claim)."""
+    if not await open_house.is_active(db):
+        raise HTTPException(403, "The free open house isn't on right now -- please create an account or log in.")
+    ip = _client_ip(request)
+    cutoff = datetime.now(timezone.utc).timestamp() - GUEST_IP_WINDOW_S
+    guard = await db.guest_guard.find_one({"ip": ip}) or {}
+    recent = [t for t in (guard.get("times") or []) if t > cutoff]
+    if len(recent) >= GUEST_MAX_PER_IP:
+        raise HTTPException(429, "Lots of guest sessions from this connection already -- please wait a bit, or create a free account.")
+    recent.append(datetime.now(timezone.utc).timestamp())
+    if guard:
+        await db.guest_guard.update_one({"ip": ip}, {"$set": {"times": recent}})
+    else:
+        await db.guest_guard.insert_one({"ip": ip, "times": recent})
+    now = datetime.now(timezone.utc)
+    email = f"guest-{uuid.uuid4().hex[:12]}@{GUEST_EMAIL_DOMAIN}"
+    doc = {
+        "email": email,
+        "password_hash": hash_password(secrets.token_urlsafe(24)),   # unguessable; the guest never logs in by password
+        "name": "Guest",
+        "tier": "free",
+        "is_guest": True,
+        "stripe_customer_id": None,
+        "subscription_status": None,
+        "exports_this_month": 0,
+        "books_this_month": 0,
+        "billing_period_start": now.isoformat(),
+        "created_at": now.isoformat(),
+        "source": "open_house",
+    }
+    result = await db.users.insert_one(doc)
+    uid = str(result.inserted_id)
+    token = create_access_token(uid, email)
+    set_auth_cookie(response, token)
+    doc.pop("password_hash")
+    doc.pop("_id", None)
+    doc["id"] = uid
+    await _apply_open_house(doc)
+    return {"user": enrich_user(doc), "token": token}
+
+
+@api_router.post("/auth/guest/claim")
+async def guest_claim(payload: GuestClaimIn, response: Response, user: dict = Depends(get_current_user)):
+    """Turns a guest into a normal account (same projects), so their work survives the end of the Open House."""
+    if not user.get("is_guest"):
+        raise HTTPException(400, "This account already has an email and password.")
+    email = payload.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(400, "Email already registered -- log in with it instead.")
+    await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {
+        "email": email, "password_hash": hash_password(payload.password),
+        "name": payload.name or email.split("@")[0], "is_guest": False,
+        "claimed_at": datetime.now(timezone.utc).isoformat()}})
+    token = create_access_token(user["id"], email)
+    set_auth_cookie(response, token)
+    user.update(email=email, name=payload.name or email.split("@")[0], is_guest=False)
+    return {"user": enrich_user(user), "token": token}
 
 
 # ---- Team seats ----
@@ -951,7 +1063,7 @@ async def _owns_product(p: dict, user: dict) -> bool:
     if not book_pass.book_pass_on() or is_admin_user(user):
         return True
     billing_user = await get_billing_user(user)
-    if user.get("beta_active") or billing_user.get("beta_active"):
+    if _free_pass(user, billing_user):
         return True
     if p.get("promo_access") in ("full_access", "interior_only_access"):
         return True
@@ -1203,7 +1315,7 @@ async def upload_file(project_id: str, file: UploadFile = File(...), user: dict 
     billing_user = await get_billing_user(user)
     tier = billing_user.get("tier", "free")
     max_mb = TIERS.get(tier, TIERS["free"])["max_file_mb"]
-    if user.get("beta_active") or billing_user.get("beta_active"):
+    if _free_pass(user, billing_user):
         max_mb = 1024  # beta = full 1GB uploads
 
     ext = Path(file.filename).suffix.lower()
@@ -2041,7 +2153,7 @@ async def _export_project_core(project_id: str, user: dict) -> dict:
     export_limit = tier_info["monthly_exports"]
     used = billing_user.get("exports_this_month", 0)
     promo_bypass = p.get("promo_access") in ("full_access", "interior_only_access")
-    beta_bypass = bool(user.get("beta_active") or billing_user.get("beta_active") or promo_bypass)
+    beta_bypass = bool(_free_pass(user, billing_user) or promo_bypass)
     book_model = book_pass.book_pass_on() and not is_admin_user(user)
     if book_model and not beta_bypass:
         # Book model: exports are unlimited while THIS book's 7-day window is open, and only then.
@@ -2946,7 +3058,13 @@ async def interior_check_run(project_id: str, user: dict = Depends(get_current_u
     if not interior_meta.get("is_pdf"):
         raise HTTPException(400, "The SparkPrep Standard Check needs a PDF interior.")
 
-    if book_pass.book_pass_on() and not is_admin_user(user):
+    if user.get("open_house") and not await db.interior_checks.find_one(
+            {"project_id": project_id, "user_id": user["id"], "paid": True}):
+        await db.interior_checks.insert_one({
+            "project_id": project_id, "user_id": user["id"], "session_id": "open_house",
+            "price_cents": 0, "tier_at_purchase": "open_house", "paid": True, "runs_used": 0, "last_run": None,
+            "created_at": datetime.now(timezone.utc).isoformat()})
+    elif book_pass.book_pass_on() and not is_admin_user(user):
         window = await book_pass.entitlements.project_window(db, user["id"], project_id)
         if not window:
             raise HTTPException(402, {"code": "book_required", "msg": "Start this book to use the SparkPrep Standard Check -- it's included."})
@@ -3401,7 +3519,7 @@ async def manuscript_compose(payload: ComposeIn, user: dict = Depends(get_curren
     # Free tier gets audit/testing only -- composing a full interior PDF is a
     # production deliverable, so it must not be free (matches the same rule
     # already enforced on /export).
-    if user.get("tier", "free") == "free" and not user.get("beta_active"):
+    if user.get("tier", "free") == "free" and not _free_pass(user):
         raise HTTPException(402, _paid_msg("Interior composition isn't included in the Free plan. Upgrade to Author or higher.", "Interior composition"))
     if payload.template not in MANUSCRIPT_TEMPLATES:
         raise HTTPException(400, "Unknown template")
@@ -3619,7 +3737,7 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
     billing_user = await get_billing_user(user)
     tier = billing_user.get("tier", "free")
     max_mb = TIERS.get(tier, TIERS["free"])["max_file_mb"]
-    if user.get("beta_active") or billing_user.get("beta_active"):
+    if _free_pass(user, billing_user):
         max_mb = 1024
 
     ext = Path(file.filename).suffix.lower()
@@ -3640,7 +3758,7 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
     # than becoming a free backdoor around that paywall.
     if slot == "interior" and ext in convertible_manuscript_exts:
         promo_bypass = p.get("promo_access") in ("full_access", "interior_only_access")
-        if tier == "free" and not (user.get("beta_active") or billing_user.get("beta_active") or promo_bypass):
+        if tier == "free" and not (_free_pass(user, billing_user) or promo_bypass):
             raise HTTPException(402, _paid_msg("Converting a Word/text manuscript into a print-ready interior isn't included in the Free plan. Upgrade to Author or higher, or upload a PDF directly.", "Converting a Word/text manuscript into a print-ready interior"))
 
     file_id = f"{project_id}_{slot}_{uuid.uuid4().hex[:6]}{ext}"
@@ -4592,6 +4710,13 @@ def _slot_audit_issue_count(p: dict, slot: str, path: str, metadata: dict) -> Op
         return None
 
 
+async def _open_house_audit(a: Optional[dict]) -> Optional[dict]:
+    """During the Open House a no-account audit shows like a paid one. Not saved: it locks again afterwards."""
+    if a and not a.get("paid") and await open_house.is_active(db):
+        return {**a, "paid": True}
+    return a
+
+
 async def _ensure_audit_built(a: dict) -> dict:
     """Builds a paid audit's findings at the level that was paid for, the first time they're opened: an Editor
     audit from the project's files, an Advanced (every-page) upgrade of a no-account audit from its stored upload.
@@ -4688,7 +4813,7 @@ async def audit_download_report(audit_id: str):
     the preview stays free, but the downloadable report is a paid unlock,
     not a free bypass of it.
     """
-    a = await db.audits.find_one({"audit_id": audit_id})
+    a = await _open_house_audit(await db.audits.find_one({"audit_id": audit_id}))
     if a:
         a = await _ensure_audit_built(a)
     if not a or a.get("full_findings") is None:
@@ -4762,7 +4887,7 @@ def _audit_unpaid_summary(summary: Optional[dict]) -> Optional[dict]:
 
 @api_router.get("/audit/{audit_id}")
 async def audit_get(audit_id: str):
-    a = await db.audits.find_one({"audit_id": audit_id})
+    a = await _open_house_audit(await db.audits.find_one({"audit_id": audit_id}))
     if not a:
         raise HTTPException(404, "Audit not found")
     a = await _ensure_audit_built(a)
