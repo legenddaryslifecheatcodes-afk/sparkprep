@@ -168,3 +168,27 @@ def test_no_account_audit_shows_full_results_during_the_open_house_only(client, 
     page = client.get(f"/api/audit/{aid}").json()
     assert page["paid"] is True and page["full_report"] is not None
     assert asyncio.run(server.db.audits.find_one({"audit_id": aid})).get("paid") is False   # not saved as bought
+
+
+def test_after_the_window_unkept_guests_and_window_audit_files_are_deleted_but_kept_work_stays(client, monkeypatch):
+    window_now(monkeypatch)
+    server.db.settings._docs.clear()
+    g = {"Authorization": "Bearer " + client.post("/api/auth/guest", headers={"x-forwarded-for": "198.51.100.1"}).json()["token"]}
+    gone_pid = make_project(client, g)
+    k = {"Authorization": "Bearer " + client.post("/api/auth/guest", headers={"x-forwarded-for": "198.51.100.2"}).json()["token"]}
+    kept_pid = make_project(client, k)
+    client.post("/api/auth/guest/claim", headers=k, json={"email": "kept-after-cleanup@example.com", "password": "LongEnough1"})
+    aid = client.post("/api/audit/start", json={"platform": "kdp", "trim_size": "6x9", "file_type": "interior"}).json()["audit_id"]
+    from reportlab.pdfgen import canvas
+    buf = io.BytesIO(); c = canvas.Canvas(buf); c.drawString(72, 500, "Body text."); c.showPage(); c.save()
+    client.post(f"/api/audit/{aid}/upload", files={"file": ("b.pdf", buf.getvalue(), "application/pdf")})
+    assert list(server.UPLOAD_DIR.glob(f"audit_{aid}_*")) and list(server.UPLOAD_DIR.glob(f"{gone_pid}_*"))
+
+    assert asyncio.run(server.run_open_house_cleanup()) is None                  # still on: nothing touched
+    after = datetime.now(timezone.utc) + timedelta(hours=24)                   # the clock past noon Tuesday
+    r = asyncio.run(server.run_open_house_cleanup(after))
+    assert r and r["guests"] >= 1 and r["audits"] >= 1
+    assert asyncio.run(server.db.projects.find_one({"_id": server.ObjectId(gone_pid)})) is None
+    assert list(server.UPLOAD_DIR.glob(f"{gone_pid}_*")) == [] and list(server.UPLOAD_DIR.glob(f"audit_{aid}_*")) == []
+    assert asyncio.run(server.db.projects.find_one({"_id": server.ObjectId(kept_pid)})) is not None
+    assert asyncio.run(server.run_open_house_cleanup(after)) is None             # runs once per window
