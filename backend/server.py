@@ -5462,6 +5462,66 @@ async def admin_download_nightly_backup(name: str, _: dict = Depends(require_adm
     return FileResponse(str(path), filename=name, media_type="application/gzip")
 
 
+OPEN_HOUSE_CLEANUP_ID = "open_house_cleanup"
+
+
+async def run_open_house_cleanup(now: Optional[datetime] = None) -> Optional[dict]:
+    """Once the Open House window has closed: deletes every guest account that wasn't kept (no email added),
+    with its projects and files, and the files of no-account audits uploaded during the window. Runs once per
+    window (recorded in db.settings); people who added an email with "Keep my work" keep everything."""
+    now = now or datetime.now(timezone.utc)
+    start, end = open_house.window()
+    if now < end or await open_house.is_active(db, now):
+        return None
+    key = end.isoformat()
+    done = await db.settings.find_one({"_id": OPEN_HOUSE_CLEANUP_ID})
+    if done and done.get("window_end") == key:
+        return None
+    guests = projects = audits = 0
+    async for u in db.users.find({"is_guest": True}):
+        if u.get("source") != "open_house":
+            continue
+        uid = str(u["_id"])
+        async for p in db.projects.find({"user_id": uid}):
+            await run_with_timeout(_delete_project_files, str(p["_id"]), p)
+            await db.projects.delete_one({"_id": p["_id"]})
+            projects += 1
+        await db.users.delete_one({"_id": u["_id"]})
+        guests += 1
+    async for a in db.audits.find({}):
+        made = book_pass.entitlements.parse(a.get("created_at")) if isinstance(a.get("created_at"), str) else None
+        if a.get("source") == "editor" or a.get("files_deleted_at") or not made or not (start <= made < end):
+            continue
+        _delete_audit_files(a["audit_id"], EXPORT_DIR / f"{a['audit_id']}_report.pdf")
+        await db.audits.update_one({"audit_id": a["audit_id"]}, {"$set": {"files_deleted_at": now.isoformat()}})
+        audits += 1
+    result = {"window_end": key, "done_at": now.isoformat(), "guests": guests, "projects": projects, "audits": audits}
+    if done:
+        await db.settings.update_one({"_id": OPEN_HOUSE_CLEANUP_ID}, {"$set": result})
+    else:
+        await db.settings.insert_one({"_id": OPEN_HOUSE_CLEANUP_ID, **result})
+    logger.info("Open House cleanup: %s", result)
+    return result
+
+
+async def _open_house_cleanup_loop():
+    while True:
+        try:
+            await run_open_house_cleanup()
+        except Exception as e:                      # a failed cleanup must never take the site down
+            await log_failure(db, "open_house_cleanup", e)
+        await asyncio.sleep(10 * 60)
+
+
+@app.on_event("startup")
+async def start_open_house_cleanup():
+    if client is None:
+        return
+    task = asyncio.create_task(_open_house_cleanup_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 @app.on_event("startup")
 async def start_nightly_backups():
     if client is None:                              # local in-memory runs have nothing worth backing up
