@@ -4,6 +4,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 import os
+import base64
 import io
 import re
 import copy
@@ -1040,6 +1041,9 @@ async def spine_calc(payload: dict):
         "paper_ppi": paper_ppi(paper_info, plat),
         "bleed": bleed,
         "spine_text_allowed": page_count >= PLATFORMS.get(plat, PLATFORMS["kdp"])["spine_text_min_pages"],
+        # The Cover Studio draws its safe-area and barcode guides from these, so they match the checks.
+        "safe_margin": resolve_binding_spec(binding, plat).get("safe_margin"),
+        "barcode_zone": PLATFORMS.get(plat, PLATFORMS["kdp"]).get("barcode_zone"),
     }
 
 
@@ -4193,6 +4197,147 @@ async def ai_generate_cover(project_id: str, payload: AICoverIn, user: dict = De
     )
     await _replace_slot(project_id, p, payload.slot, metadata, compliance)
     return await _present_upload(p, user, {"slot": payload.slot, "file_metadata": metadata, "compliance": compliance})
+
+
+# ---- Cover Studio AI ----
+# The Cover Studio (frontend /cover-studio) designs a cover before there's necessarily a book. Its AI designer
+# plans the whole cover, then paints artwork for the full wrap. Neither saves anything: the studio places the
+# result on its canvas, and the author sends the finished cover to a book through slot-upload like any upload.
+# Same gate as the AI Blurb Writer and AI Cover: included with a book.
+
+_STUDIO_KEY = re.compile(r"^[a-z0-9_-]{1,40}$")
+
+
+class CoverPlanIn(BaseModel):
+    title: str
+    author: Optional[str] = None
+    subtitle: Optional[str] = None
+    genre: Optional[str] = None
+    about: Optional[str] = None
+    layouts: list[str] = []
+    styles: list[str] = []
+
+
+class CoverArtIn(BaseModel):
+    prompt: str
+    genre: Optional[str] = None
+    width_in: float = 12.7
+    height_in: float = 9.25
+
+
+async def _require_ai_access(user: dict, feature: str):
+    billing_user = await get_billing_user(user)
+    if billing_user.get("tier", "free") == "free":
+        raise HTTPException(402, _paid_msg(f"{feature} requires the Author plan or higher.", feature))
+
+
+async def _claude_json(prompt: str, max_tokens: int = 1200) -> dict:
+    """One Claude call that must answer with a JSON object. Raises HTTPException with a plain message."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": ANTHROPIC_BLURB_MODEL, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
+            )
+    except Exception as e:
+        logger.warning("Claude request errored: %s", e)
+        raise HTTPException(502, "Couldn't reach the AI designer's model provider. Try again shortly.")
+    if resp.status_code != 200:
+        logger.warning("Claude request failed: %s %s", resp.status_code, resp.text[:500])
+        raise HTTPException(502, "The AI designer's model provider returned an error. Try again shortly.")
+    raw = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    try:
+        parsed = _json.loads(raw)
+    except (_json.JSONDecodeError, ValueError):
+        raise HTTPException(502, "The AI designer gave an unexpected answer. Try again.")
+    if not isinstance(parsed, dict):
+        raise HTTPException(502, "The AI designer gave an unexpected answer. Try again.")
+    return parsed
+
+
+@api_router.post("/ai/cover-plan")
+async def ai_cover_plan(payload: CoverPlanIn, user: dict = Depends(get_current_user)):
+    await _require_ai_access(user, "AI Cover Designer")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "The AI Cover Designer isn't configured yet — add ANTHROPIC_API_KEY to backend/.env")
+    if not payload.title.strip():
+        raise HTTPException(400, "Type your book's title first.")
+    layouts = [k for k in payload.layouts if _STUDIO_KEY.match(k)][:40]
+    styles = [k for k in payload.styles if _STUDIO_KEY.match(k)][:40]
+    if not layouts or not styles:
+        raise HTTPException(400, "No cover layouts to choose from.")
+
+    brief = [f"Title: {payload.title.strip()[:200]}"]
+    if payload.subtitle:
+        brief.append(f"Subtitle: {payload.subtitle.strip()[:200]}")
+    if payload.author:
+        brief.append(f"Author: {payload.author.strip()[:120]}")
+    if payload.genre:
+        brief.append(f"Genre: {payload.genre.strip()[:80]}")
+    if payload.about:
+        brief.append(f"What the book is about (from the author): {payload.about.strip()[:1500]}")
+    prompt = (
+        "You are a professional book cover designer for self-published print books. Plan a full cover "
+        "(front, spine and back) for this book.\n\n" + "\n".join(brief) + "\n\n"
+        f"Pick ONE layout from: {', '.join(layouts)}.\n"
+        "Layouts: classic = centered title with a rule; block = big colour block on top; frame = framed border; "
+        "diagonal = diagonal colour slice; bigtype = huge stacked capitals; band = colour band across the middle; "
+        "emblem = circle emblem above the title; glow = soft light behind the title; stripe = vertical side stripe; "
+        "bottom = title at the bottom; script = large script title; stack = title top-left with an author bar; "
+        "bubbles = playful circles (children's); window = picture window above the title.\n"
+        f"Pick ONE colour-and-font style from: {', '.join(styles)}.\n"
+        "Styles: noir = black/red condensed type (thriller); ember = dark orange, Cinzel (epic); royal = purple/gold "
+        "decorative (fantasy); blush = pink script (romance); neon = dark with cyan/pink tech type (sci-fi); crimson = "
+        "blood red horror type; sand = cream literary serif; mono = black on white bold sans (business); ocean = deep "
+        "blue elegant serif; forest = green warm serif (memoir); meadow = bright playful (children's); gold = black and "
+        "gold prestige; sunset = warm gradient bold sans (self-help); ice = pale blue clean sans; dust = western; "
+        "plum = plum and pink elegant.\n\n"
+        "Also write: a subtitle only if the book clearly needs one (else empty), a back-cover headline (under 12 words), "
+        "a back-cover description (90-140 words, hooky, no spoilers, written for this specific book), and an art "
+        "brief for an image generator: one wide illustration that spans the back cover, spine and front cover, with "
+        "the main subject on the right half (the front cover), calm space on the left half for the description, "
+        "described in concrete visual terms (subject, setting, lighting, palette, art style). The art must contain no "
+        "words or letters.\n\n"
+        "Respond with ONLY a JSON object, no markdown fences, in exactly this shape:\n"
+        '{"layout": "...", "style": "...", "subtitle": "...", "tagline": "...", "blurb": "...", "art_prompt": "..."}'
+    )
+    plan = await _claude_json(prompt)
+    return {
+        "layout": plan.get("layout") if plan.get("layout") in layouts else layouts[0],
+        "style": plan.get("style") if plan.get("style") in styles else styles[0],
+        "subtitle": str(plan.get("subtitle") or "")[:200],
+        "tagline": str(plan.get("tagline") or "")[:200],
+        "blurb": str(plan.get("blurb") or "")[:2000],
+        "art_prompt": str(plan.get("art_prompt") or "")[:1500],
+    }
+
+
+@api_router.post("/ai/cover-art")
+async def ai_cover_art(payload: CoverArtIn, user: dict = Depends(get_current_user)):
+    await _require_ai_access(user, "AI Cover Art")
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, "AI Cover Art isn't configured yet — add OPENAI_API_KEY to backend/.env")
+    if not payload.prompt.strip():
+        raise HTTPException(400, "Describe the picture you want first.")
+    wide = payload.width_in > 0 and payload.height_in > 0 and payload.width_in / payload.height_in > 1.15
+    prompt = build_cover_prompt(payload.prompt[:1500], None, payload.genre, True)
+    if wide:
+        prompt += (" Wide composition that wraps around a printed book: the left half is the back cover, the right half "
+                   "is the front cover, and a narrow spine sits in the middle. Put the main subject in the right half.")
+    try:
+        image_bytes = await generate_cover_image(prompt, OPENAI_API_KEY, aspect_ratio="3:2" if wide else "2:3")
+    except AICoverError as e:
+        raise HTTPException(e.status_code, str(e))
+    from PIL import Image
+    with Image.open(io.BytesIO(image_bytes)) as art:
+        w, h = art.size
+    return {"image_b64": base64.b64encode(image_bytes).decode("ascii"), "mime": "image/png", "width_px": w, "height_px": h}
 
 
 def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:

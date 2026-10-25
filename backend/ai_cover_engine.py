@@ -34,6 +34,8 @@ _SIZE_BY_ASPECT = {
     "1:1": "1024x1024",
     "3:4": "1024x1536",
     "2:3": "1024x1536",
+    # A full wrap (back + spine + front) is landscape -- the Cover Studio's art spans all three panels.
+    "3:2": "1536x1024",
 }
 DEFAULT_SIZE = "1024x1536"
 
