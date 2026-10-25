@@ -1367,8 +1367,15 @@ async def upload_file(project_id: str, file: UploadFile = File(...), user: dict 
 
 _WEB_SAFE_PREVIEW_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
+# A cover made in the free Cover Studio is only previewed at screen size; the print-size file is part of the book.
+STUDIO_PREVIEW_MAX_PX = 1600
 
-def _render_web_preview(fp: Path) -> Response:
+
+def _studio_made(slot_data: Optional[dict]) -> bool:
+    return bool((slot_data or {}).get("made_in_cover_studio"))
+
+
+def _render_web_preview(fp: Path, max_px: Optional[int] = None) -> Response:
     """Renders any uploaded cover/interior file as a browser-safe RGB image
     -- a PNG of page 1 for a PDF, otherwise a JPEG.
 
@@ -1388,7 +1395,7 @@ def _render_web_preview(fp: Path) -> Response:
             png_bytes = pix.tobytes("png")
         return Response(content=png_bytes, media_type="image/png")
 
-    if fp.suffix.lower() in _WEB_SAFE_PREVIEW_EXTS:
+    if fp.suffix.lower() in _WEB_SAFE_PREVIEW_EXTS and not max_px:
         try:
             from PIL import Image
             with Image.open(fp) as img:
@@ -1407,6 +1414,8 @@ def _render_web_preview(fp: Path) -> Response:
             img = bg
         elif img.mode != "RGB":
             img = img.convert("RGB")
+        if max_px:
+            img.thumbnail((max_px, max_px))
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=90)
     return Response(content=buf.getvalue(), media_type="image/jpeg")
@@ -1430,7 +1439,8 @@ async def preview_file(project_id: str, request: Request):
     if not file_path.exists():
         raise HTTPException(404, "File missing")
     try:
-        return _render_web_preview(file_path)
+        max_px = STUDIO_PREVIEW_MAX_PX if _studio_made(p.get("file_metadata")) else None
+        return _render_web_preview(file_path, max_px)
     except Exception as e:
         await log_failure(db, "preview_render", e, project_id=project_id, user_id=user_id,
                            context={"filename": p["uploaded_file"]})
@@ -3729,7 +3739,8 @@ ALLOWED_SLOTS = {"front_cover", "back_cover", "spine", "interior", "full_wrap", 
 
 
 @api_router.post("/projects/{project_id}/slot-upload/{slot}")
-async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), source: Optional[str] = Form(None),
+                      user: dict = Depends(get_current_user)):
     if slot not in ALLOWED_SLOTS:
         raise HTTPException(400, f"Unknown slot: {slot}")
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
@@ -3826,6 +3837,8 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
         # is the raw manuscript preserved above instead of the PDF it
         # produced.
         metadata["original_stored_filename"] = raw_manuscript_stored_filename or file_id
+        if source == "cover_studio":
+            metadata["made_in_cover_studio"] = True
         if compose_warnings:
             metadata["compose_warnings"] = compose_warnings
 
@@ -4595,7 +4608,7 @@ async def slot_preview(project_id: str, slot: str, request: Request):
     if not fp.exists():
         raise HTTPException(404, "File missing")
     try:
-        return _render_web_preview(fp)
+        return _render_web_preview(fp, STUDIO_PREVIEW_MAX_PX if _studio_made(slot_data) else None)
     except Exception as e:
         await log_failure(db, "slot_preview_render", e, project_id=project_id, user_id=user_id,
                            context={"slot": slot, "filename": slot_data["stored_filename"]})
@@ -4629,6 +4642,9 @@ async def slot_original_download(project_id: str, slot: str, user: dict = Depend
     fp = UPLOAD_DIR / original_stored_filename
     if not fp.exists():
         raise HTTPException(404, "Original file missing on disk")
+    if _studio_made(slot_data):
+        # Designing in the Cover Studio is free; the print-size file is what the book pays for.
+        await _require_product(p, user, "Downloading your print-size cover")
     download_name = slot_data.get("original_filename") or original_stored_filename
     return FileResponse(str(fp), filename=download_name)
 
