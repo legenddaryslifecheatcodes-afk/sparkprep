@@ -1184,7 +1184,31 @@ def _mark_project_export_fixes(p: dict, pd: dict) -> dict:
     return pd
 
 
+def _cover_refit(p: dict) -> Optional[dict]:
+    """A Cover Studio cover whose spine no longer matches the book (the interior changed the page count)."""
+    meta = (p.get("slots") or {}).get("full_wrap") or {}
+    made_for = meta.get("made_for_spine_width")
+    if not meta.get("made_in_cover_studio") or made_for is None:
+        return None
+    try:
+        now = _full_wrap_geometry(p)["spine_width"]
+    except Exception:  # noqa: BLE001 -- an odd spec must never break loading the book
+        return None
+    if abs(now - float(made_for)) < 0.005:
+        return None
+    return {"from_spine_width": round(float(made_for), 4), "to_spine_width": round(now, 4),
+            "from_page_count": meta.get("made_for_page_count"), "to_page_count": p.get("page_count"),
+            "has_design": _cover_design_path(str(p["_id"])).exists()}
+
+
 async def _present_project(p: dict, user: dict) -> dict:
+    pd = await _present_project_inner(p, user)
+    pd["cover_refit"] = _cover_refit(p)
+    pd["has_cover_design"] = _cover_design_path(str(p["_id"])).exists()
+    return pd
+
+
+async def _present_project_inner(p: dict, user: dict) -> dict:
     pd = project_to_dict(p)
     if await _results_unlocked(p, user):
         pd = _mark_project_export_fixes(p, pd)
@@ -3727,6 +3751,54 @@ async def interior_studio_send(project_id: str, body: InteriorDocIn, request: Re
     return result
 
 
+# ---- Cover Studio design kept with the book ----
+# The Cover Studio's editable design (its canvas, words and settings) is saved with the book when the cover is
+# sent, so the author can reopen it on any device and SparkPrep can re-fit it when the page count changes the
+# spine. Stored as a file named for the project, so deleting the book deletes it too.
+COVER_DESIGN_MAX_BYTES = 30 * 1024 * 1024   # painted AI artwork rides inside the design as an image
+
+
+def _cover_design_path(project_id: str) -> Path:
+    return UPLOAD_DIR / f"{project_id}_cover_design.json"
+
+
+@api_router.get("/projects/{project_id}/cover-studio")
+async def cover_studio_get(project_id: str, user: dict = Depends(get_current_user)):
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    path = _cover_design_path(project_id)
+    design = None
+    if path.exists():
+        try:
+            design = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            design = None
+    return {"design": design, "cover_refit": _cover_refit(p)}
+
+
+@api_router.put("/projects/{project_id}/cover-studio")
+async def cover_studio_save(project_id: str, request: Request, user: dict = Depends(get_current_user)):
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    raw = await request.body()
+    if len(raw) > COVER_DESIGN_MAX_BYTES:
+        raise HTTPException(413, "This cover design is too large to save with the book.")
+    try:
+        design = _json.loads(raw)
+    except ValueError:
+        raise HTTPException(400, "That cover design couldn't be read.")
+    if not isinstance(design, dict) or not isinstance(design.get("snap"), dict):
+        raise HTTPException(400, "That cover design couldn't be read.")
+    design["saved_at"] = datetime.now(timezone.utc).isoformat()
+    path = _cover_design_path(project_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(_json.dumps(design), encoding="utf-8")
+    os.replace(tmp, path)
+    return {"ok": True, "saved_at": design["saved_at"]}
+
+
 @api_router.get("/manuscript/preview/{file_id}")
 async def manuscript_preview(file_id: str, request: Request):
     token = request.cookies.get("access_token") or request.query_params.get("token")
@@ -3925,6 +3997,11 @@ async def _store_slot_file(p: dict, user: dict, project_id: str, slot: str, file
         metadata["original_stored_filename"] = raw_manuscript_stored_filename or file_id
         if source == "cover_studio":
             metadata["made_in_cover_studio"] = True
+            if slot == "full_wrap":
+                # The spine it was designed for: if the interior later changes the page count, the Editor offers
+                # to re-fit this cover in the Cover Studio instead of stretching the artwork.
+                metadata["made_for_spine_width"] = _full_wrap_geometry(p)["spine_width"]
+                metadata["made_for_page_count"] = p.get("page_count")
         elif source == "interior_studio":
             metadata["made_in_interior_studio"] = True
         if compose_warnings:
