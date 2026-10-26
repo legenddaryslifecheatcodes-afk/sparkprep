@@ -56,6 +56,7 @@ from report_export import generate_audit_brief_pdf, generate_preflight_report_pd
 from docx_reader import extract_manuscript_text, extract_embedded_images
 from failure_log import log_failure
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
+import interior_studio
 from manuscript_composer import compose_manuscript_pdf, list_templates as list_manuscript_templates, TEMPLATES as MANUSCRIPT_TEMPLATES
 from beta_engine import (
     generate_pass_code, new_pass_doc, new_feedback_doc, DEFAULT_CHECKLIST_FEATURES,
@@ -1372,7 +1373,9 @@ STUDIO_PREVIEW_MAX_PX = 1600
 
 
 def _studio_made(slot_data: Optional[dict]) -> bool:
-    return bool((slot_data or {}).get("made_in_cover_studio"))
+    """Made in SparkPrep's free Cover Studio or Interior Studio: designing is free, the print file is the book's."""
+    d = slot_data or {}
+    return bool(d.get("made_in_cover_studio") or d.get("made_in_interior_studio"))
 
 
 def _render_web_preview(fp: Path, max_px: Optional[int] = None) -> Response:
@@ -3559,6 +3562,170 @@ async def manuscript_compose(payload: ComposeIn, user: dict = Depends(get_curren
     }
 
 
+# ---- Interior Studio: the Word-style editor for a book's inside pages ----
+# Writing and previewing are free (screen-size page pictures). The typeset print PDF goes into the author's book,
+# where the normal checks run, and its download is part of the book (see _studio_made).
+INTERIOR_PREVIEW_DIR = DATA_DIR / "interior_previews"
+INTERIOR_PREVIEW_DIR.mkdir(exist_ok=True)
+INTERIOR_PREVIEW_KEEP_S = 2 * 3600
+INTERIOR_MAX_JSON_BYTES = 6 * 1024 * 1024        # ~ a 400,000-word manuscript
+_interior_lock = asyncio.Semaphore(1)            # one typesetting job at a time on the 1-CPU server
+
+
+class InteriorDocIn(BaseModel):
+    style: str = "classic_novel"
+    platform: str = "kdp"
+    trim_size: str = "6x9"
+    details: dict = Field(default_factory=dict)
+    content: dict = Field(default_factory=dict)
+    page_hint: Optional[int] = None
+
+
+async def _optional_user(request: Request) -> Optional[dict]:
+    try:
+        return await get_current_user(request)
+    except HTTPException:
+        return None
+
+
+def _interior_payload(body: InteriorDocIn, platform: str, trim_size: str) -> dict:
+    if body.style not in interior_studio.BOOK_STYLES:
+        raise HTTPException(400, "Unknown book style")
+    if platform not in PLATFORMS:
+        raise HTTPException(400, "Unknown distributor")
+    if trim_size not in TRIM_SIZES:
+        raise HTTPException(400, "Unknown trim size")
+    details = {k: body.details.get(k) for k in ("title", "subtitle", "author", "copyright", "dedication", "isbn", "toc")
+               if body.details.get(k) not in (None, "")}
+    for k, v in details.items():
+        if isinstance(v, str) and len(v) > 2000:
+            raise HTTPException(400, f"The {k} is too long.")
+    trim = TRIM_SIZES[trim_size]
+    return {"style": body.style, "setup": {"platform": platform, "trim_w": trim["w"], "trim_h": trim["h"]},
+            "details": details, "content": body.content, "page_hint": body.page_hint}
+
+
+def _interior_safe_margin(platform: str) -> float:
+    # Never below the distributor's own preflight number, nor the 0.5" SparkPrep's margin check measures against.
+    from pdfx_validator import SAFETY_MARGIN_IN
+    return max(PLATFORMS[platform].get("safe_margin_interior", 0.5), SAFETY_MARGIN_IN)
+
+
+def _interior_notes(meta: dict, platform: str) -> list:
+    notes = list(meta.get("warnings") or [])
+    plat = PLATFORMS[platform]
+    if meta["page_count"] < plat.get("min_page_count", 0):
+        notes.append({"id": "too_few_pages", "message": f"{plat['name']} prints books of at least "
+                      f"{plat['min_page_count']} pages. This one is {meta['page_count']} so far."})
+    if meta["page_count"] > plat.get("max_page_count", 10 ** 6):
+        notes.append({"id": "too_many_pages", "message": f"{plat['name']} prints books of up to "
+                      f"{plat['max_page_count']} pages in this format. This one is {meta['page_count']}."})
+    return notes
+
+
+def _sweep_interior_previews():
+    cutoff = time.time() - INTERIOR_PREVIEW_KEEP_S
+    for f in INTERIOR_PREVIEW_DIR.glob("*"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+@api_router.get("/interior/styles")
+async def interior_styles():
+    return {"styles": interior_studio.list_styles(), "fonts": list(interior_studio.FONT_FAMILIES),
+            "margin_sources": interior_studio.MARGIN_SOURCES}
+
+
+@api_router.post("/interior/preview")
+async def interior_preview(body: InteriorDocIn, request: Request):
+    """Typesets the book and returns its page count, margins and a key for fetching page pictures. Free, no
+    sign-in needed (the pictures are screen resolution; the print PDF only goes into a book)."""
+    raw = int(request.headers.get("content-length") or 0)
+    if raw > INTERIOR_MAX_JSON_BYTES:
+        raise HTTPException(413, "This manuscript is too large to preview in one go.")
+    payload = _interior_payload(body, body.platform, body.trim_size)
+    key = interior_studio.payload_key(payload)
+    pdf = INTERIOR_PREVIEW_DIR / f"{key}.pdf"
+    meta_f = INTERIOR_PREVIEW_DIR / f"{key}.json"
+    if pdf.exists() and meta_f.exists():
+        meta = _json.loads(meta_f.read_text())
+        os.utime(pdf)
+    else:
+        async with _interior_lock:
+            try:
+                meta = await run_with_timeout(interior_studio.compose, str(pdf), payload,
+                                              _interior_safe_margin(body.platform))
+            except HTTPException:
+                raise
+            except Exception as e:
+                await log_failure(db, "interior_preview", e, context={"style": body.style})
+                raise HTTPException(400, f"Couldn't lay out these pages: {e}")
+        meta_f.write_text(_json.dumps(meta))
+        _sweep_interior_previews()
+    return {**meta, "key": key, "notes": _interior_notes(meta, body.platform),
+            "platform_name": PLATFORMS[body.platform]["name"]}
+
+
+@api_router.get("/interior/preview/{key}/page/{page}")
+async def interior_preview_page(key: str, page: int):
+    if not re.fullmatch(r"[0-9a-f]{32}", key):
+        raise HTTPException(404, "Not found")
+    pdf = INTERIOR_PREVIEW_DIR / f"{key}.pdf"
+    if not pdf.exists():
+        raise HTTPException(404, "This preview has expired. Edit anything to refresh it.")
+    try:
+        jpg = await asyncio.to_thread(interior_studio.render_page_jpeg, str(pdf), page)
+    except IndexError:
+        raise HTTPException(404, "No such page")
+    return Response(jpg, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
+
+
+@api_router.get("/projects/{project_id}/interior-studio")
+async def interior_studio_get(project_id: str, user: dict = Depends(get_current_user)):
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    return {"doc": p.get("interior_studio_doc"), "project": {"id": project_id, "name": p.get("name"),
+            "platform": p.get("platform"), "trim_size": p.get("trim_size"), "binding": p.get("binding")}}
+
+
+@api_router.post("/projects/{project_id}/interior-studio")
+async def interior_studio_send(project_id: str, body: InteriorDocIn, request: Request,
+                               user: dict = Depends(get_current_user)):
+    """Typesets the book at print quality with the book's own distributor and trim size, keeps the author's
+    document so they can come back and edit it, and makes the PDF the book's interior (the usual checks run)."""
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    if int(request.headers.get("content-length") or 0) > INTERIOR_MAX_JSON_BYTES:
+        raise HTTPException(413, "This manuscript is too large to send in one go.")
+    platform = p.get("platform") or body.platform
+    payload = _interior_payload(body, platform, p.get("trim_size") or body.trim_size)
+    file_id = f"{project_id}_interior_studio_{uuid.uuid4().hex[:6]}.pdf"
+    file_path = UPLOAD_DIR / file_id
+    async with _interior_lock:
+        try:
+            meta = await run_with_timeout(interior_studio.compose, str(file_path), payload,
+                                          _interior_safe_margin(platform))
+        except HTTPException:
+            raise
+        except Exception as e:
+            await log_failure(db, "interior_studio_send", e, project_id=project_id, user_id=user["id"])
+            raise HTTPException(400, f"Couldn't typeset this book: {e}")
+    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {
+        "interior_studio_doc": body.model_dump(),
+        "updated_at": datetime.now(timezone.utc).isoformat()}})
+    title = (body.details.get("title") or p.get("name") or "Book").strip()
+    result = await _store_slot_file(p, user, project_id, "interior", file_path, file_id,
+                                    f"{re.sub(r'[^A-Za-z0-9 _-]+', '', title)[:60] or 'Book'} interior.pdf",
+                                    "interior_studio")
+    result["interior_studio"] = {**meta, "notes": _interior_notes(meta, platform)}
+    return result
+
+
 @api_router.get("/manuscript/preview/{file_id}")
 async def manuscript_preview(file_id: str, request: Request):
     token = request.cookies.get("access_token") or request.query_params.get("token")
@@ -3738,6 +3905,85 @@ async def upload_publisher_template(project_id: str, file: UploadFile = File(...
 ALLOWED_SLOTS = {"front_cover", "back_cover", "spine", "interior", "full_wrap", "case_wrap"}
 
 
+async def _store_slot_file(p: dict, user: dict, project_id: str, slot: str, file_path: Path, file_id: str,
+                           original_filename: str, source: Optional[str] = None,
+                           raw_manuscript_stored_filename: Optional[str] = None,
+                           compose_warnings: Optional[list] = None) -> dict:
+    """Analyzes a file already saved in UPLOAD_DIR, runs the slot's checks and makes it the slot's current file
+    (used by a direct upload and by the Interior Studio's typeset book)."""
+    ext = Path(original_filename).suffix.lower()
+    try:
+        metadata = analyze_file(str(file_path))
+        metadata["original_filename"] = original_filename
+        metadata["stored_filename"] = file_id
+        metadata["slot"] = slot
+        # A direct (non-composed) upload is its own original -- the first
+        # file in this slot's new lineage; a composed interior's original
+        # is the raw manuscript preserved above instead of the PDF it
+        # produced.
+        metadata["original_stored_filename"] = raw_manuscript_stored_filename or file_id
+        if source == "cover_studio":
+            metadata["made_in_cover_studio"] = True
+        elif source == "interior_studio":
+            metadata["made_in_interior_studio"] = True
+        if compose_warnings:
+            metadata["compose_warnings"] = compose_warnings
+
+        # The page count decides the spine, and so every cover size -- so it comes from the interior itself
+        # rather than trusting a typed number (which starts at 200 for a new project).
+        page_count_set = None
+        if slot == "interior" and metadata.get("pdf_pages") and metadata["pdf_pages"] != p.get("page_count"):
+            page_count_set = {"from": p.get("page_count"), "to": metadata["pdf_pages"]}
+            p["page_count"] = metadata["pdf_pages"]
+        compliance = await run_with_timeout(_slot_compliance, p, slot, str(file_path), metadata)
+    except HTTPException:
+        raise
+    except Exception as e:
+        await log_failure(db, "slot_upload_analyze", e, project_id=project_id, user_id=user["id"],
+                           context={"filename": original_filename, "ext": ext, "slot": slot})
+        raise HTTPException(500, f"Couldn't analyze this file: {e}. It may be corrupted or an unsupported variant of {ext}.")
+
+    slots = p.get("slots") or {}
+    # The customer is directly replacing this slot's content with a new
+    # upload -- unlike a repair/regeneration, this genuinely starts a new
+    # lineage, so both the prior working file AND its preserved original
+    # (if one had survived past repairs) are cleaned up here rather than
+    # kept around orphaned forever.
+    prior = slots.get(slot)
+    if prior:
+        for stale in {prior.get("stored_filename"), prior.get("original_stored_filename")}:
+            if stale:
+                try: os.remove(UPLOAD_DIR / stale)
+                except OSError: pass
+    if book_pass.book_pass_on():
+        # The free scan's "found N issues" must match what the paid audit will show (one defined audit), so
+        # count with the audit itself rather than the Editor's own quicker check list.
+        count = await run_with_timeout(_slot_audit_issue_count, p, slot, str(file_path), metadata)
+        if count is not None:
+            metadata["audit_issue_count"] = count
+    slots[slot] = {**metadata, "compliance": compliance}
+
+    # If uploading full_wrap, also mirror into legacy uploaded_file for existing flows
+    update = {
+        "slots": slots,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if slot == "full_wrap":
+        update["uploaded_file"] = file_id
+        update["file_metadata"] = metadata
+        update["compliance"] = compliance
+    if page_count_set:
+        update["page_count"] = p["page_count"]
+        p["slots"] = slots
+        update.update(await run_with_timeout(_rescan_cover_slots, p))   # covers were sized for the old count
+
+    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
+    body = {"slot": slot, "file_metadata": metadata, "compliance": compliance}
+    if page_count_set:
+        body["page_count_set"] = page_count_set
+    return await _present_upload(p, user, body)
+
+
 @api_router.post("/projects/{project_id}/slot-upload/{slot}")
 async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), source: Optional[str] = Form(None),
                       user: dict = Depends(get_current_user)):
@@ -3827,74 +4073,8 @@ async def slot_upload(project_id: str, slot: str, file: UploadFile = File(...), 
     else:
         raw_manuscript_stored_filename = None
 
-    try:
-        metadata = analyze_file(str(file_path))
-        metadata["original_filename"] = file.filename
-        metadata["stored_filename"] = file_id
-        metadata["slot"] = slot
-        # A direct (non-composed) upload is its own original -- the first
-        # file in this slot's new lineage; a composed interior's original
-        # is the raw manuscript preserved above instead of the PDF it
-        # produced.
-        metadata["original_stored_filename"] = raw_manuscript_stored_filename or file_id
-        if source == "cover_studio":
-            metadata["made_in_cover_studio"] = True
-        if compose_warnings:
-            metadata["compose_warnings"] = compose_warnings
-
-        # The page count decides the spine, and so every cover size -- so it comes from the interior itself
-        # rather than trusting a typed number (which starts at 200 for a new project).
-        page_count_set = None
-        if slot == "interior" and metadata.get("pdf_pages") and metadata["pdf_pages"] != p.get("page_count"):
-            page_count_set = {"from": p.get("page_count"), "to": metadata["pdf_pages"]}
-            p["page_count"] = metadata["pdf_pages"]
-        compliance = await run_with_timeout(_slot_compliance, p, slot, str(file_path), metadata)
-    except HTTPException:
-        raise
-    except Exception as e:
-        await log_failure(db, "slot_upload_analyze", e, project_id=project_id, user_id=user["id"],
-                           context={"filename": file.filename, "ext": ext, "slot": slot})
-        raise HTTPException(500, f"Couldn't analyze this file: {e}. It may be corrupted or an unsupported variant of {ext}.")
-
-    slots = p.get("slots") or {}
-    # The customer is directly replacing this slot's content with a new
-    # upload -- unlike a repair/regeneration, this genuinely starts a new
-    # lineage, so both the prior working file AND its preserved original
-    # (if one had survived past repairs) are cleaned up here rather than
-    # kept around orphaned forever.
-    prior = slots.get(slot)
-    if prior:
-        for stale in {prior.get("stored_filename"), prior.get("original_stored_filename")}:
-            if stale:
-                try: os.remove(UPLOAD_DIR / stale)
-                except OSError: pass
-    if book_pass.book_pass_on():
-        # The free scan's "found N issues" must match what the paid audit will show (one defined audit), so
-        # count with the audit itself rather than the Editor's own quicker check list.
-        count = await run_with_timeout(_slot_audit_issue_count, p, slot, str(file_path), metadata)
-        if count is not None:
-            metadata["audit_issue_count"] = count
-    slots[slot] = {**metadata, "compliance": compliance}
-
-    # If uploading full_wrap, also mirror into legacy uploaded_file for existing flows
-    update = {
-        "slots": slots,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    if slot == "full_wrap":
-        update["uploaded_file"] = file_id
-        update["file_metadata"] = metadata
-        update["compliance"] = compliance
-    if page_count_set:
-        update["page_count"] = p["page_count"]
-        p["slots"] = slots
-        update.update(await run_with_timeout(_rescan_cover_slots, p))   # covers were sized for the old count
-
-    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
-    body = {"slot": slot, "file_metadata": metadata, "compliance": compliance}
-    if page_count_set:
-        body["page_count_set"] = page_count_set
-    return await _present_upload(p, user, body)
+    return await _store_slot_file(p, user, project_id, slot, file_path, file_id, file.filename, source,
+                                  raw_manuscript_stored_filename, compose_warnings)
 
 
 # Checks the export re-verifies on the final files -- a source-file warning in one of these areas is
@@ -4643,8 +4823,9 @@ async def slot_original_download(project_id: str, slot: str, user: dict = Depend
     if not fp.exists():
         raise HTTPException(404, "Original file missing on disk")
     if _studio_made(slot_data):
-        # Designing in the Cover Studio is free; the print-size file is what the book pays for.
-        await _require_product(p, user, "Downloading your print-size cover")
+        # Designing in the Cover/Interior Studio is free; the print-size file is what the book pays for.
+        await _require_product(p, user, "Downloading your print-ready interior" if slot == "interior"
+                               else "Downloading your print-size cover")
     download_name = slot_data.get("original_filename") or original_stored_filename
     return FileResponse(str(fp), filename=download_name)
 

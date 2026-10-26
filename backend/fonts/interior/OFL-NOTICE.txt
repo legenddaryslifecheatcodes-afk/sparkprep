@@ -1,0 +1,5 @@
+Every font in this folder is open source under the SIL Open Font License 1.1 (https://openfontlicense.org),
+downloaded from Google Fonts: EB Garamond, Libre Baskerville, Crimson Pro, Lora, Merriweather, Source Serif 4,
+Cormorant Garamond, Lato, Playfair Display, Atkinson Hyperlegible, Cinzel.
+The OFL allows embedding these fonts in printed and sold books. SparkPrep's Interior Studio embeds them in
+the interior PDFs it typesets.
