@@ -53,10 +53,10 @@ _KDP_INSIDE = ((150, 0.375), (300, 0.5), (500, 0.625), (700, 0.75), (10 ** 6, 0.
 _LULU_INSIDE = ((60, 0.5), (150, 0.625), (400, 1.0), (600, 1.125), (10 ** 6, 1.25))
 
 MARGIN_SOURCES = {
-    "kdp": "Amazon KDP's margin table (inside margin grows with page count)",
-    "ingramspark": "IngramSpark's 0.5\" minimum on every side",
-    "lulu": "Lulu's safety margin and its recommended gutter for your page count",
-    "barnes_noble": "Barnes & Noble Press's interior margin settings",
+    "kdp": "Amazon KDP's own margin table",
+    "ingramspark": "IngramSpark's own minimum",
+    "lulu": "Lulu's own safety margin and gutter table",
+    "barnes_noble": "Barnes & Noble Press's own margin settings",
 }
 
 
@@ -589,7 +589,7 @@ def _compose_once(buf, payload: dict, safe_margin: float, page_guess: int) -> di
             if lab and st["numbering"] == "numerals" and mm and mm.group(1).isdigit():
                 lab = mm.group(1)
             story += [_Mark("opener_pages"), Spacer(1, fh * st["sink"])]
-            toc_text = (f"{lab}: {ttl}" if lab and ttl else (lab or ttl))
+            toc_text = f"{lab}: {ttl}" if lab and ttl else (ttl or (f"Chapter {lab}" if lab.isdigit() else lab))
             story.append(_TocEntry(toc_text))
             if lab:
                 ltxt = escape(lab.upper() if st["label_upper"] else lab)
@@ -662,6 +662,8 @@ def _compose_once(buf, payload: dict, safe_margin: float, page_guess: int) -> di
         "min_margins_for": page_guess,
         "margins": {k: round(v, 4) for k, v in m.items()},
         "distributor_minimums": mins,
+        "distributor_own": distributor_min_margins(platform, pages, 0),
+        "safe_margin": safe_margin,
         "margin_source": MARGIN_SOURCES.get(platform, ""),
         "trim": [trim_w, trim_h],
         "style": payload.get("style") or "classic_novel",
