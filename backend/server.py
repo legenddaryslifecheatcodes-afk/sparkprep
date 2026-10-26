@@ -57,6 +57,7 @@ from docx_reader import extract_manuscript_text, extract_embedded_images
 from failure_log import log_failure
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
 import interior_studio
+import writing_help
 from manuscript_composer import compose_manuscript_pdf, list_templates as list_manuscript_templates, TEMPLATES as MANUSCRIPT_TEMPLATES
 from beta_engine import (
     generate_pass_code, new_pass_doc, new_feedback_doc, DEFAULT_CHECKLIST_FEATURES,
@@ -4424,7 +4425,7 @@ async def _require_ai_access(user: dict, feature: str):
         raise HTTPException(402, _paid_msg(f"{feature} requires the Author plan or higher.", feature))
 
 
-async def _claude_json(prompt: str, max_tokens: int = 1200) -> dict:
+async def _claude_json(prompt: str, max_tokens: int = 1200, who: str = "the AI designer") -> dict:
     """One Claude call that must answer with a JSON object. Raises HTTPException with a plain message."""
     try:
         import httpx
@@ -4436,10 +4437,10 @@ async def _claude_json(prompt: str, max_tokens: int = 1200) -> dict:
             )
     except Exception as e:
         logger.warning("Claude request errored: %s", e)
-        raise HTTPException(502, "Couldn't reach the AI designer's model provider. Try again shortly.")
+        raise HTTPException(502, f"Couldn't reach {who}'s model provider. Try again shortly.")
     if resp.status_code != 200:
         logger.warning("Claude request failed: %s %s", resp.status_code, resp.text[:500])
-        raise HTTPException(502, "The AI designer's model provider returned an error. Try again shortly.")
+        raise HTTPException(502, f"{who[0].upper() + who[1:]}'s model provider returned an error. Try again shortly.")
     raw = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
     if raw.startswith("```"):
         raw = raw.strip("`")
@@ -4448,9 +4449,9 @@ async def _claude_json(prompt: str, max_tokens: int = 1200) -> dict:
     try:
         parsed = _json.loads(raw)
     except (_json.JSONDecodeError, ValueError):
-        raise HTTPException(502, "The AI designer gave an unexpected answer. Try again.")
+        raise HTTPException(502, f"{who[0].upper() + who[1:]} gave an unexpected answer. Try again.")
     if not isinstance(parsed, dict):
-        raise HTTPException(502, "The AI designer gave an unexpected answer. Try again.")
+        raise HTTPException(502, f"{who[0].upper() + who[1:]} gave an unexpected answer. Try again.")
     return parsed
 
 
@@ -4531,6 +4532,57 @@ async def ai_cover_art(payload: CoverArtIn, user: dict = Depends(get_current_use
     with Image.open(io.BytesIO(image_bytes)) as art:
         w, h = art.size
     return {"image_b64": base64.b64encode(image_bytes).decode("ascii"), "mime": "image/png", "width_px": w, "height_px": h}
+
+
+# ---- Interior Studio AI Writing Help ----
+# Spelling/grammar checks and wording suggestions for the writing in the Interior Studio. The editor sends the
+# paragraphs in scope; the answer is a list of exact find-and-replace suggestions the author accepts or skips one
+# by one. Nothing is saved or changed here. Same gate as the other AI tools (included with a book), plus a daily
+# allowance per account so one runaway loop can't run up the model bill.
+
+class WritingParagraph(BaseModel):
+    id: int
+    text: str
+
+
+class WritingHelpIn(BaseModel):
+    mode: str = "spelling"
+    paragraphs: list[WritingParagraph] = []
+    genre: Optional[str] = None
+    title: Optional[str] = None
+
+
+async def _spend_writing_allowance(user: dict, n: int) -> int:
+    """Counts n characters against today's allowance; returns what's left. 429 when today's is used up."""
+    billing = await get_billing_user(user)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    used = billing.get("ai_writing_chars", 0) if billing.get("ai_writing_day") == today else 0
+    if used + n > writing_help.DAILY_CHARS:
+        raise HTTPException(429, "You've used today's AI writing help for this account (about a whole book's worth). "
+                                 "It resets at midnight UTC. Your writing and the free spell check still work.")
+    await db.users.update_one({"_id": ObjectId(billing["id"])}, {"$set": {"ai_writing_day": today, "ai_writing_chars": used + n}})
+    return writing_help.DAILY_CHARS - used - n
+
+
+@api_router.post("/ai/writing-help")
+async def ai_writing_help(payload: WritingHelpIn, user: dict = Depends(get_current_user)):
+    await _require_ai_access(user, "AI Writing Help")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI Writing Help isn't configured yet — add ANTHROPIC_API_KEY to backend/.env")
+    if payload.mode not in writing_help.MODES:
+        raise HTTPException(400, "Pick spelling or wording.")
+    paragraphs = writing_help.clean_paragraphs([p.model_dump() for p in payload.paragraphs])
+    if not paragraphs:
+        raise HTTPException(400, "There's no writing here to check yet.")
+    left = await _spend_writing_allowance(user, writing_help.chars(paragraphs))
+    prompt = writing_help.build_prompt(payload.mode, paragraphs, payload.genre, payload.title)
+    raw = await _claude_json(prompt, max_tokens=4000, who="the AI writing helper")
+    return {
+        "mode": payload.mode,
+        "checked": [p["id"] for p in paragraphs],
+        "suggestions": writing_help.clean_suggestions(raw, paragraphs),
+        "allowance_left": left,
+    }
 
 
 def _target_pixels_for_slot(p: dict, slot: str) -> tuple[int, int]:
