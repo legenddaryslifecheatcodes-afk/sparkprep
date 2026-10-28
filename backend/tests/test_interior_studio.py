@@ -8,6 +8,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -191,3 +192,91 @@ def test_send_to_book_makes_the_interior_and_keeps_the_print_file_for_the_book(c
     asyncio.run(server.db.projects.update_one({"_id": server.ObjectId(pid)}, {"$set": {"promo_access": "full_access"}}))
     r = client.get(f"/api/projects/{pid}/slot/interior/original", headers=h)
     assert r.status_code == 200 and r.content[:5] == b"%PDF-"
+
+
+# ---------- pictures ----------
+def _png(w, h, color=(200, 30, 30)):
+    from PIL import Image
+    b = io.BytesIO()
+    Image.new("RGB", (w, h), color).save(b, "PNG")
+    return b.getvalue()
+
+
+def _with_picture(pid, width=100, caption=""):
+    return {"type": "doc", "content": [
+        {"type": "heading", "attrs": {"level": 1}, "content": [{"type": "text", "text": "Pictures"}]},
+        {"type": "paragraph", "content": [{"type": "text", "text": TEXT}]},
+        {"type": "image", "attrs": {"id": pid, "width": width, "caption": caption}},
+        {"type": "paragraph", "content": [{"type": "text", "text": "After the picture."}]},
+    ]}
+
+
+def test_a_picture_prints_in_black_ink_only_inside_the_margins(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "IMAGE_DIR", tmp_path)
+    info = S.save_image(_png(1800, 1200), tmp_path)
+    assert (tmp_path / f"{info['id']}.jpg").exists() and (tmp_path / f"{info['id']}.view.jpg").exists()
+    assert S.save_image(_png(1800, 1200), tmp_path)["id"] == info["id"]          # same picture stored once
+    assert S.image_ids(_with_picture(info["id"])) == [info["id"]]
+    meta, pdf = compose(doc=_with_picture(info["id"], 100, "The old lighthouse"))
+    assert meta["pictures"] == 1
+    assert not [w for w in meta["warnings"] if w["id"] == "low_res_pictures"]   # 1800 px over ~4.5" > 300 DPI
+    d = pymupdf.open(stream=pdf, filetype="pdf")
+    pages = [p for p in d if p.get_images()]
+    assert len(pages) == 1 and "The old lighthouse" in pages[0].get_text()
+    xref = pages[0].get_images()[0][0]
+    pix = pymupdf.Pixmap(d, xref)
+    assert pix.n == 4                                                             # CMYK
+    c, m, y, k = pix.pixel(pix.width // 2, pix.height // 2)
+    assert c == m == y == 0 and k > 0                                             # black ink only
+    f = tmp_path / "b.pdf"
+    f.write_bytes(pdf)
+    assert check_interior_safety_margins(str(f), "kdp", 6, 9) == []
+
+
+def test_a_small_picture_gets_a_blurry_warning_with_its_page(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "IMAGE_DIR", tmp_path)
+    pid = S.save_image(_png(400, 300), tmp_path)["id"]
+    meta, _ = compose(doc=_with_picture(pid))
+    w = [w for w in meta["warnings"] if w["id"] == "low_res_pictures"]
+    assert w and "picture 1 (page" in w[0]["message"] and "DPI" in w[0]["message"]
+    smaller, _ = compose(doc=_with_picture(pid, 25))                             # a quarter of the column
+    assert not [w for w in smaller["warnings"] if w["id"] == "low_res_pictures"]
+
+
+def test_a_missing_or_bad_picture_is_skipped_and_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "IMAGE_DIR", tmp_path)
+    meta, _ = compose(doc=_with_picture("0" * 32))
+    assert meta["pictures"] == 0 and any(w["id"] == "missing_pictures" for w in meta["warnings"])
+    with pytest.raises(ValueError):
+        S.save_image(b"not a picture", tmp_path)
+
+
+def test_picture_upload_api_and_book_keeps_its_pictures(client):
+    r = client.post("/api/interior/images", files={"file": ("p.png", _png(1500, 1000), "image/png")})
+    assert r.status_code == 200, r.text
+    pic = r.json()
+    assert pic["width"] == 1500 and pic["url"] == f"/api/interior/images/{pic['id']}"
+    got = client.get(pic["url"])
+    assert got.status_code == 200 and got.headers["content-type"] == "image/jpeg"
+    assert client.get("/api/interior/images/nothere").status_code == 404
+    assert client.post("/api/interior/images", files={"file": ("x.png", b"nope", "image/png")}).status_code == 400
+    prev = client.post("/api/interior/preview", json={"style": "classic_novel", "details": {"title": "T"},
+                                                       "content": _with_picture(pic["id"])})
+    assert prev.status_code == 200 and prev.json()["pictures"] == 1
+    h = auth(client)
+    pid = client.post("/api/projects", headers=h, json={"name": "Pic Book", "platform": "kdp", "trim_size": "6x9",
+                                                         "paper_type": "white_50lb", "binding": "paperback",
+                                                         "page_count": 100, "project_type": "interior"}).json()["id"]
+    r = client.post(f"/api/projects/{pid}/interior-studio", headers=h,
+                    json={"style": "classic_novel", "details": {"title": "Pic Book"}, "content": _with_picture(pic["id"])})
+    assert r.status_code == 200, r.text
+    p = asyncio.run(server.db.projects.find_one({"_id": server.ObjectId(pid)}))
+    assert p["interior_images"] == [pic["id"]]
+    # an old picture a book uses is kept; an old unused one is removed
+    spare = client.post("/api/interior/images", files={"file": ("s.png", _png(300, 300, (1, 2, 3)), "image/png")}).json()
+    old = time.time() - server.INTERIOR_IMAGE_KEEP_S - 60
+    for i in (pic["id"], spare["id"]):
+        os.utime(server.INTERIOR_IMAGE_DIR / f"{i}.jpg", (old, old))
+    asyncio.run(server._sweep_interior_images())
+    assert (server.INTERIOR_IMAGE_DIR / f"{pic['id']}.jpg").exists()
+    assert not (server.INTERIOR_IMAGE_DIR / f"{spare['id']}.jpg").exists()
