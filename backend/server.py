@@ -5693,6 +5693,86 @@ async def beta_submit_feedback(payload: BetaFeedbackIn, user: dict = Depends(get
     return {"ok": True, "feedback_id": str(result.inserted_id)}
 
 
+# ---- Free tool emails ----
+# The free calculators on the static pages (KDP cover calculator, spine width calculator) ask for an email
+# before they open. No account, no password: the email is just saved here so the owner can download the list.
+LEAD_MAX_PER_IP = 20            # per hour, so a bot can't flood the list
+LEAD_IP_WINDOW_S = 60 * 60
+
+
+class LeadIn(BaseModel):
+    email: EmailStr
+    source: str = Field("", max_length=80)
+
+
+@api_router.post("/leads")
+async def save_lead(payload: LeadIn, request: Request):
+    """Public. Saves (or refreshes) one email from a free tool. Same email twice = one row, with a visit count."""
+    ip = _client_ip(request)
+    cutoff = datetime.now(timezone.utc).timestamp() - LEAD_IP_WINDOW_S
+    guard = await db.lead_guard.find_one({"ip": ip}) or {}
+    recent = [t for t in (guard.get("times") or []) if t > cutoff]
+    if len(recent) >= LEAD_MAX_PER_IP:
+        raise HTTPException(429, "Too many tries from this connection -- please wait a bit.")
+    recent.append(datetime.now(timezone.utc).timestamp())
+    if guard:
+        await db.lead_guard.update_one({"ip": ip}, {"$set": {"times": recent}})
+    else:
+        await db.lead_guard.insert_one({"ip": ip, "times": recent})
+
+    email = payload.email.strip().lower()
+    source = re.sub(r"[^a-z0-9/_-]", "", payload.source.strip().lower())[:80] or "unknown"
+    now = datetime.now(timezone.utc).isoformat()
+    existing = await db.leads.find_one({"email": email})
+    if existing:
+        sources = list(existing.get("sources") or [])
+        if source not in sources:
+            sources.append(source)
+        await db.leads.update_one({"email": email}, {"$set": {"last_seen": now, "sources": sources},
+                                                     "$inc": {"times_used": 1}})
+    else:
+        await db.leads.insert_one({"email": email, "sources": [source], "first_seen": now,
+                                   "last_seen": now, "times_used": 1})
+    return {"ok": True}
+
+
+async def _all_emails() -> list:
+    """Free tool emails plus everyone who made a real account (guests have no real email), one row per email."""
+    rows = {}
+    async for lead in db.leads.find({}):
+        rows[lead["email"]] = {"email": lead["email"], "where_from": " ".join(lead.get("sources") or []),
+                               "first_seen": lead.get("first_seen", ""), "last_seen": lead.get("last_seen", ""),
+                               "times_used": lead.get("times_used", 1), "has_account": "no"}
+    async for user in db.users.find({}):
+        email = (user.get("email") or "").lower()
+        if not email or user.get("is_guest") or email.endswith("@" + GUEST_EMAIL_DOMAIN):
+            continue
+        row = rows.setdefault(email, {"email": email, "where_from": "account", "first_seen": user.get("created_at", ""),
+                                      "last_seen": "", "times_used": "", "has_account": "yes"})
+        row["has_account"] = "yes"
+    return sorted(rows.values(), key=lambda r: r["first_seen"] or "", reverse=True)
+
+
+@api_router.get("/admin/leads")
+async def admin_list_leads(_: dict = Depends(require_admin)):
+    rows = await _all_emails()
+    return {"count": len(rows), "from_free_tools": sum(1 for r in rows if r["where_from"] != "account"),
+            "emails": rows[:200]}
+
+
+@api_router.get("/admin/leads.csv")
+async def admin_download_leads(_: dict = Depends(require_admin)):
+    import csv
+    rows = await _all_emails()
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["email", "where_from", "first_seen", "last_seen", "times_used", "has_account"])
+    w.writeheader()
+    w.writerows(rows)
+    name = f"sparkprep-emails-{datetime.now(timezone.utc):%Y-%m-%d}.csv"
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 # ---- Admin-only ----
 @api_router.get("/admin/failures")
 async def admin_list_failures(stage: str = None, limit: int = 100, _: dict = Depends(require_admin)):
@@ -6032,6 +6112,7 @@ async def on_startup():
     await db.payment_transactions.create_index("session_id", unique=True)
     await db.beta_passes.create_index("code", unique=True)
     await db.beta_feedback.create_index("user_id")
+    await db.leads.create_index("email")
 
     # Seed admin account if configured and missing
     if ADMIN_EMAIL:
