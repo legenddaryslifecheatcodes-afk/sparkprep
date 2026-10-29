@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +27,9 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import BaseDocTemplate, Frame, PageBreak, PageTemplate, Paragraph, Spacer, TableStyle
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import (BaseDocTemplate, Frame, KeepTogether, PageBreak, PageTemplate, Paragraph, Spacer,
+                                TableStyle)
 from reportlab.platypus.doctemplate import DocIf
 from reportlab.platypus.flowables import Flowable, ImageAndFlowables
 from reportlab.platypus.tableofcontents import TableOfContents
@@ -257,7 +260,7 @@ def _plain(nodes) -> str:
 
 
 def parse_document(doc: dict, poetry=False) -> list:
-    """Flattens the editor document into blocks: chapter, sub, para, quote, bullet, scene, pagebreak."""
+    """Flattens the editor document into blocks: chapter, sub, para, quote, bullet, scene, pagebreak, image."""
     blocks = []
 
     def walk(nodes, quote=False, list_kind=None):
@@ -293,11 +296,123 @@ def parse_document(doc: dict, poetry=False) -> list:
                 blocks.append({"t": "scene"})
             elif t == "pageBreak":
                 blocks.append({"t": "pagebreak"})
+            elif t == "image":
+                pid = str(attrs.get("id") or "")
+                if IMAGE_ID.match(pid):
+                    try:
+                        width = min(100, max(25, int(attrs.get("width") or 100)))
+                    except (TypeError, ValueError):
+                        width = 100
+                    blocks.append({"t": "image", "id": pid, "width": width,
+                                   "caption": str(attrs.get("caption") or "").strip()[:300]})
             elif n.get("content"):
                 walk(n.get("content"), quote, list_kind)
 
     walk((doc or {}).get("content"))
     return blocks
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Pictures. The author uploads a picture once (POST /api/interior/images); the editor keeps only its id, so the
+# manuscript stays small and every preview doesn't resend the pictures. Ids are the file's own fingerprint, so the
+# same picture uploaded twice is stored once. The studio prints black ink only, so pictures print in black and
+# white: one ink (K), never a mix of four, which keeps them inside every printer's ink limit.
+# ---------------------------------------------------------------------------------------------------------------
+IMAGE_DIR: Path | None = None            # set by the server
+IMAGE_ID = re.compile(r"^[0-9a-f]{32}$")
+IMAGE_MAX_SIDE = 6000                    # px; 20" at 300 DPI, far more than any page needs
+IMAGE_VIEW_SIDE = 1400                   # px; the copy shown in the editor
+PRINT_DPI = 300                          # what KDP, IngramSpark, Lulu and B&N all ask pictures to be
+MAX_EMBED_DPI = 450                      # bigger pictures are scaled down to this: sharper prints nothing more
+
+
+def save_image(raw: bytes, folder: Path) -> dict:
+    """Stores an uploaded picture (any common format) as {id}.jpg plus a smaller {id}.view.jpg for the editor.
+    Raises ValueError when it isn't a picture."""
+    from PIL import Image, ImageOps
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.load()
+    except Exception as e:                       # noqa: BLE001 - PIL raises many kinds for a non-picture
+        raise ValueError("That file isn't a picture SparkPrep can read. Use a JPG or PNG.") from e
+    im = ImageOps.exif_transpose(im)
+    if im.mode in ("RGBA", "LA", "P", "PA"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[3])
+        im = bg
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    if max(im.size) > IMAGE_MAX_SIDE:
+        im.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE), Image.LANCZOS)
+    pid = hashlib.sha256(raw).hexdigest()[:32]
+    folder.mkdir(parents=True, exist_ok=True)
+    full = folder / f"{pid}.jpg"
+    if not full.exists():
+        im.save(full, "JPEG", quality=92, subsampling=0)
+        view = im.copy()
+        view.thumbnail((IMAGE_VIEW_SIDE, IMAGE_VIEW_SIDE), Image.LANCZOS)
+        view.save(folder / f"{pid}.view.jpg", "JPEG", quality=82)
+    return {"id": pid, "width": im.size[0], "height": im.size[1]}
+
+
+def image_ids(doc: dict) -> list:
+    """Every picture id used in an editor document, in order, without repeats."""
+    seen = []
+
+    def walk(nodes):
+        for n in nodes or []:
+            if n.get("type") == "image":
+                pid = str((n.get("attrs") or {}).get("id") or "")
+                if IMAGE_ID.match(pid) and pid not in seen:
+                    seen.append(pid)
+            walk(n.get("content"))
+    walk((doc or {}).get("content"))
+    return seen
+
+
+def _image_path(pid: str) -> Path | None:
+    if not IMAGE_DIR or not IMAGE_ID.match(pid or ""):
+        return None
+    f = IMAGE_DIR / f"{pid}.jpg"
+    if not f.exists():
+        return None
+    try:
+        os.utime(f)                              # in use: keep it
+        os.utime(IMAGE_DIR / f"{pid}.view.jpg")
+    except OSError:
+        pass
+    return f
+
+
+class _Picture(Flowable):
+    """A picture printed at a fixed size, in black ink only, centred in the text column."""
+    def __init__(self, path: Path, width_in: float, max_h_in: float, number: int):
+        super().__init__()
+        from PIL import Image
+        with Image.open(path) as im:
+            px_w, px_h = im.size
+            w = width_in
+            h = w * px_h / px_w
+            if h > max_h_in:
+                h, w = max_h_in, max_h_in * px_w / px_h
+            self.dpi = round(px_w / w)
+            gray = im.convert("L")
+        target = (round(w * MAX_EMBED_DPI), round(h * MAX_EMBED_DPI))
+        if gray.size[0] > target[0]:
+            gray = gray.resize(target, Image.LANCZOS)
+        k = gray.point(lambda v: 255 - v)
+        zero = Image.new("L", gray.size, 0)
+        self.img = ImageReader(Image.merge("CMYK", (zero, zero, zero, k)))
+        self.w, self.h, self.number = w * inch, h * inch, number
+
+    def wrap(self, aw, ah):
+        self.aw = aw
+        return self.aw, self.h
+
+    def draw(self):
+        self.canv._doctemplate.picture_pages[self.number] = self.canv._doctemplate.page
+        self.canv.drawImage(self.img, (self.aw - self.w) / 2, 0, self.w, self.h)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -473,6 +588,9 @@ def _compose_once(buf, payload: dict, safe_margin: float, page_guess: int) -> di
     t_author = center("TAuthor", head_r, st["title_size"] * 0.75)
     copy_style = ParagraphStyle("Copy", fontName=body_r, fontSize=8.5, leading=12, textColor=BLACK, alignment=TA_LEFT)
     dedic = center("Dedication", body_i, st["body_size"] * 1.05)
+    caption = ParagraphStyle("Caption", fontName=body_i, fontSize=st["body_size"] * 0.85,
+                             leading=st["leading"] * 0.85, alignment=TA_CENTER, textColor=BLACK,
+                             spaceBefore=4, spaceAfter=0)
 
     # -- the document --------------------------------------------------------------------------------------------
     doc = BaseDocTemplate(buf, pagesize=(pw, ph), title=title, author=author,
@@ -480,6 +598,7 @@ def _compose_once(buf, payload: dict, safe_margin: float, page_guess: int) -> di
                           leftMargin=0, rightMargin=0, topMargin=0, bottomMargin=0,
                           initialFontName=body_r, initialFontSize=st["body_size"])   # no stray unembedded Helvetica
     doc.blank_pages, doc.opener_pages, doc.front_pages = set(), set(), set()
+    doc.picture_pages = {}
     doc.body_started = False
     doc.chapter_title = ""
 
@@ -568,8 +687,24 @@ def _compose_once(buf, payload: dict, safe_margin: float, page_guess: int) -> di
     chapter_no = 0
     first_in_section = True
     first_chapter = True
+    pictures, missing_pictures = [], 0
     for b in blocks:
         t = b["t"]
+        if t == "image":
+            path = _image_path(b["id"])
+            if not path:
+                missing_pictures += 1
+                continue
+            cap = Paragraph(escape(b["caption"]), caption) if b["caption"] else None
+            cap_h = cap.wrap(fw, fh)[1] + 4 if cap else 0
+            pic = _Picture(path, fw / inch * b["width"] / 100, (fh * 0.92 - cap_h - st["leading"]) / inch,
+                           len(pictures) + 1)
+            pictures.append(pic)
+            story.append(Spacer(1, st["leading"] * 0.5))
+            story.append(KeepTogether([pic] + ([cap] if cap else [])))
+            story.append(Spacer(1, st["leading"] * 0.5))
+            first_in_section = True
+            continue
         if t == "chapter":
             if not first_chapter:
                 if st["recto_chapters"]:
@@ -654,6 +789,20 @@ def _compose_once(buf, payload: dict, safe_margin: float, page_guess: int) -> di
     pages = doc.page
     warnings = []
     missing = _missing_chars(blocks, details, [body_r, head_r])
+    soft = [(p.number, p.dpi) for p in pictures if p.dpi < PRINT_DPI]
+    if soft:
+        where = ", ".join(f"picture {n} (page {doc.picture_pages.get(n, '?')}, about {dpi} DPI)" for n, dpi in soft[:6])
+        more = f" and {len(soft) - 6} more" if len(soft) > 6 else ""
+        warnings.append({"id": "low_res_pictures", "message": f"Printers ask for pictures at {PRINT_DPI} DPI. "
+                         f"These are lower and may print blurry: {where}{more}. Use a bigger copy of the picture, "
+                         f"or make it smaller on the page."})
+    if missing_pictures:
+        warnings.append({"id": "missing_pictures", "message": f"{missing_pictures} picture"
+                         f"{'s are' if missing_pictures != 1 else ' is'} missing from SparkPrep and left out. "
+                         f"Delete {'them' if missing_pictures != 1 else 'it'} and add the picture again."})
+    if pictures:
+        warnings.append({"id": "pictures_black_and_white", "message": "Pictures print in black and white (black "
+                         "ink only), the same as your text."})
     if missing:
         warnings.append({"id": "missing_glyphs", "message": f"These characters aren't in the {st['body_font']} font and "
                          f"would print as empty boxes: {missing}. Try another book style, or replace them."})
@@ -668,6 +817,7 @@ def _compose_once(buf, payload: dict, safe_margin: float, page_guess: int) -> di
         "trim": [trim_w, trim_h],
         "style": payload.get("style") or "classic_novel",
         "chapters": len(chapters),
+        "pictures": len(pictures),
         "words": sum(len((bl.get("plain") or "").split()) for bl in blocks),
         "warnings": warnings,
     }

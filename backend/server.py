@@ -110,6 +110,15 @@ class MemoryCollection:
     async def create_index(self, *args, **kwargs):
         return None
 
+    async def distinct(self, key):
+        out = []
+        for doc in self._docs:
+            vals = doc.get(key)
+            for v in vals if isinstance(vals, list) else [vals]:
+                if v is not None and v not in out:
+                    out.append(v)
+        return out
+
     async def find_one(self, filter=None, sort=None):
         docs = self._docs
         if sort:  # real Mongo honours sort=[(field, direction)]; mirror it so local runs match
@@ -3649,6 +3658,12 @@ INTERIOR_PREVIEW_DIR.mkdir(exist_ok=True)
 INTERIOR_PREVIEW_KEEP_S = 2 * 3600
 INTERIOR_MAX_JSON_BYTES = 6 * 1024 * 1024        # ~ a 400,000-word manuscript
 _interior_lock = asyncio.Semaphore(1)            # one typesetting job at a time on the 1-CPU server
+INTERIOR_IMAGE_DIR = DATA_DIR / "interior_images"
+INTERIOR_IMAGE_DIR.mkdir(exist_ok=True)
+interior_studio.IMAGE_DIR = INTERIOR_IMAGE_DIR
+INTERIOR_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+INTERIOR_IMAGE_MAX_PER_IP = 120                  # per hour; an illustrated book can have dozens of pictures
+INTERIOR_IMAGE_KEEP_S = 30 * 24 * 3600           # unused for 30 days and not in any book: removed
 
 
 class InteriorDocIn(BaseModel):
@@ -3762,6 +3777,61 @@ async def interior_preview_page(key: str, page: int):
     return Response(jpg, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
 
 
+async def _sweep_interior_images():
+    """Removes pictures nobody has used for INTERIOR_IMAGE_KEEP_S, unless a book's saved pages use them."""
+    cutoff = time.time() - INTERIOR_IMAGE_KEEP_S
+    old = [f for f in INTERIOR_IMAGE_DIR.glob("*.jpg") if not f.name.endswith(".view.jpg")]
+    old = [f for f in old if f.stat().st_mtime < cutoff]
+    if not old:
+        return
+    keep = set(await db.projects.distinct("interior_images"))
+    for f in old:
+        if f.stem not in keep:
+            for g in (f, INTERIOR_IMAGE_DIR / f"{f.stem}.view.jpg"):
+                try:
+                    g.unlink()
+                except OSError:
+                    pass
+
+
+@api_router.post("/interior/images")
+async def interior_image_upload(request: Request, file: UploadFile = File(...)):
+    """A picture for the inside pages. Free like the rest of the studio (no sign-in), limited per connection."""
+    ip = _client_ip(request)
+    now = datetime.now(timezone.utc).timestamp()
+    guard = await db.interior_image_guard.find_one({"ip": ip}) or {}
+    recent = [t for t in (guard.get("times") or []) if t > now - 3600]
+    if len(recent) >= INTERIOR_IMAGE_MAX_PER_IP:
+        raise HTTPException(429, "Too many pictures from this connection in the last hour -- please wait a bit.")
+    recent.append(now)
+    if guard:
+        await db.interior_image_guard.update_one({"ip": ip}, {"$set": {"times": recent}})
+    else:
+        await db.interior_image_guard.insert_one({"ip": ip, "times": recent})
+    raw = await file.read(INTERIOR_IMAGE_MAX_BYTES + 1)
+    if len(raw) > INTERIOR_IMAGE_MAX_BYTES:
+        raise HTTPException(413, "This picture is over 25 MB. Save a smaller copy and try again.")
+    try:
+        info = await asyncio.to_thread(interior_studio.save_image, raw, INTERIOR_IMAGE_DIR)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    try:
+        await _sweep_interior_images()
+    except Exception as e:  # noqa: BLE001 - housekeeping must never fail an upload
+        logger.warning("interior image sweep failed: %s", e)
+    return {**info, "url": f"/api/interior/images/{info['id']}"}
+
+
+@api_router.get("/interior/images/{image_id}")
+async def interior_image_get(image_id: str):
+    if not interior_studio.IMAGE_ID.match(image_id):
+        raise HTTPException(404, "Not found")
+    f = INTERIOR_IMAGE_DIR / f"{image_id}.view.jpg"
+    if not f.exists():
+        raise HTTPException(404, "This picture is no longer on SparkPrep. Delete it and add it again.")
+    return FileResponse(str(f), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800, immutable"})
+
+
 @api_router.get("/projects/{project_id}/interior-studio")
 async def interior_studio_get(project_id: str, user: dict = Depends(get_current_user)):
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
@@ -3796,6 +3866,7 @@ async def interior_studio_send(project_id: str, body: InteriorDocIn, request: Re
             raise HTTPException(400, f"Couldn't typeset this book: {e}")
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {
         "interior_studio_doc": body.model_dump(),
+        "interior_images": interior_studio.image_ids(body.content),
         "updated_at": datetime.now(timezone.utc).isoformat()}})
     title = (body.details.get("title") or p.get("name") or "Book").strip()
     result = await _store_slot_file(p, user, project_id, "interior", file_path, file_id,
