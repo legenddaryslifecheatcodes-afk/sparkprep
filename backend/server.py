@@ -615,6 +615,7 @@ class LoginIn(BaseModel):
 
 class ProjectCreate(BaseModel):
     name: str
+    author_name: Optional[str] = None
     platform: str = "kdp"  # kdp, ingramspark, barnes_noble, lulu
     trim_size: str = "6x9"
     paper_type: str = "white_50lb"
@@ -625,6 +626,7 @@ class ProjectCreate(BaseModel):
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
+    author_name: Optional[str] = None
     platform: Optional[str] = None
     trim_size: Optional[str] = None
     paper_type: Optional[str] = None
@@ -1201,7 +1203,32 @@ def _cover_refit(p: dict) -> Optional[dict]:
             "has_design": _cover_design_path(str(p["_id"])).exists()}
 
 
+# ---- Locked title and author name (owner's rule, 2026-10-28) ----
+# Once a book is started (a book credit is spent on it, or a full-access promo is redeemed on it), its title and
+# author name are locked: the customer was warned before starting, and the Editor shows them locked. The owner can
+# still correct them from Admin. Export also checks the cover still carries them (see _enforce_same_book).
+
+def _same_name(a: Optional[str], b: Optional[str]) -> bool:
+    return " ".join((a or "").lower().split()) == " ".join((b or "").lower().split())
+
+
+async def _title_lock(p: dict) -> Optional[dict]:
+    """The project's lock, recording it the first time the book turns out to be started."""
+    if p.get("title_lock"):
+        return p["title_lock"]
+    started = p.get("promo_access") in ("full_access", "interior_only_access") or \
+        await db.book_credits.find_one({"project_id": str(p["_id"])})
+    if not started:
+        return None
+    lock = {"title": p.get("name") or "", "author": p.get("author_name") or "",
+            "locked_at": datetime.now(timezone.utc).isoformat()}
+    await db.projects.update_one({"_id": p["_id"]}, {"$set": {"title_lock": lock}})
+    p["title_lock"] = lock
+    return lock
+
+
 async def _present_project(p: dict, user: dict) -> dict:
+    await _title_lock(p)
     pd = await _present_project_inner(p, user)
     pd["cover_refit"] = _cover_refit(p)
     pd["has_cover_design"] = _cover_design_path(str(p["_id"])).exists()
@@ -1249,6 +1276,7 @@ async def create_project(payload: ProjectCreate, user: dict = Depends(get_curren
     doc = {
         "user_id": user["id"],
         "name": payload.name,
+        "author_name": (payload.author_name or "").strip() or None,
         "platform": payload.platform,
         "trim_size": payload.trim_size,
         "paper_type": payload.paper_type,
@@ -1283,6 +1311,14 @@ async def update_project(project_id: str, payload: ProjectUpdate, user: dict = D
     before = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
     if not before:
         raise HTTPException(404, "Project not found")
+    if "author_name" in updates:
+        updates["author_name"] = updates["author_name"].strip() or None
+    lock = await _title_lock(before)
+    if lock and (("name" in updates and not _same_name(updates["name"], lock["title"])) or
+                 ("author_name" in updates and not _same_name(updates["author_name"], lock["author"]))):
+        raise HTTPException(409, {"code": "title_locked", "msg": (
+            "Your title and author name are locked because this book has been started. "
+            f"If there's a typo, email {SUPPORT_EMAIL} with your book link and we'll correct it.")})
     await db.projects.update_one({"_id": ObjectId(project_id), "user_id": user["id"]}, {"$set": updates})
     p = await db.projects.find_one({"_id": ObjectId(project_id)})
     if any(k in updates and updates[k] != before.get(k) for k in _GEOMETRY_FIELDS):
@@ -2090,6 +2126,24 @@ async def _enforce_same_book(window: dict, p: dict, user_id: str) -> None:
         await log_failure(db, "book_fingerprint", e, project_id=str(p["_id"]), user_id=user_id)
         return
     stored = window.get("fingerprint")
+    lock = await _title_lock(p)
+    if lock:
+        name_verdict, name_details = book_pass.fingerprint.locked_name_verdict(
+            lock, (stored or {}).get("cover"), current.get("cover"))
+        if name_verdict != "ok":
+            await db.book_flags.insert_one({
+                "credit_id": window["credit_id"], "user_id": user_id, "project_id": str(p["_id"]),
+                "project_name": p.get("name"), "verdict": f"title_{name_verdict}", "details": name_details,
+                "blocked": name_verdict == "changed", "reviewed": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+        if name_verdict == "changed":
+            which = " and ".join(k if k == "title" else "author name" for k in name_details)
+            raise HTTPException(409, {"code": "title_changed", "msg": (
+                f"The {which} on this cover doesn't match the one locked when you started this book "
+                f"(\"{lock['title']}\"{' by ' + lock['author'] if lock.get('author') else ''}). "
+                "Put the locked title and author name back on the cover to export. "
+                f"If you need to correct them, email {SUPPORT_EMAIL} with your book link.")})
     if not stored:
         await db.book_credits.update_one({"credit_id": window["credit_id"]}, {"$set": {"fingerprint": current}})
         return
@@ -5865,6 +5919,30 @@ async def admin_book_flags(limit: int = 100, _: dict = Depends(require_admin)):
 
 class RebaselineIn(BaseModel):
     project_id: str
+
+
+class TitleFixIn(BaseModel):
+    project_id: str
+    name: str = Field(..., min_length=1, max_length=300)
+    author_name: Optional[str] = Field(None, max_length=300)
+
+
+@api_router.post("/admin/projects/title")
+async def admin_fix_locked_title(payload: TitleFixIn, _: dict = Depends(require_admin)):
+    """Owner's override for a locked title or author name (a real typo). Sets both and re-locks them, and makes
+    the book's next export the new same-book baseline so the corrected cover isn't flagged."""
+    m = re.search(r"[0-9a-f]{24}", payload.project_id.lower())
+    if not m:
+        raise HTTPException(400, "Paste the book's Editor link or its id")
+    p = await db.projects.find_one({"_id": ObjectId(m.group(0))})
+    if not p:
+        raise HTTPException(404, "Book not found")
+    name, author = payload.name.strip(), (payload.author_name or "").strip()
+    lock = {"title": name, "author": author, "locked_at": datetime.now(timezone.utc).isoformat(), "corrected_by_owner": True}
+    await db.projects.update_one({"_id": p["_id"]}, {"$set": {"name": name, "author_name": author or None, "title_lock": lock}})
+    await db.book_credits.update_many({"project_id": str(p["_id"])}, {"$set": {"fingerprint": None}})
+    await db.book_flags.update_many({"project_id": str(p["_id"])}, {"$set": {"reviewed": True}})
+    return {"ok": True, "project_id": str(p["_id"]), "name": name, "author_name": author or None}
 
 
 @api_router.post("/admin/book-flags/rebaseline")

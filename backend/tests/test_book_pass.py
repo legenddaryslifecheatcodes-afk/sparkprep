@@ -656,3 +656,65 @@ def test_audit_files_are_deleted_as_soon_as_the_customer_downloads_the_report(cl
     assert again.status_code == 200 and again.content[:5] == b"%PDF-"
     page = client.get(f"/api/audit/{aid}").json()                                  # and the on-screen report is intact
     assert page["paid"] is True and page["full_report"]
+
+
+# ---------------------------------------------------------------- locked title and author name (2026-10-28)
+def _cover_words(text):
+    return {"words": sorted(set(book_pass.fingerprint.words_of(text)))}
+
+
+def test_title_and_author_lock_once_the_book_is_started(client, monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_EMAIL", "root-admin@example.com")
+    pid = make_project(client)
+    assert client.patch(f"/api/projects/{pid}", json={"name": "The Long Road", "author_name": "Jo Davis"}).status_code == 200
+    assert client.patch(f"/api/projects/{pid}", json={"name": "The Longer Road"}).status_code == 200   # free to change before
+    assert client.get(f"/api/projects/{pid}").json().get("title_lock") is None
+
+    give_credit(1)
+    assert client.post(f"/api/projects/{pid}/activate-book").status_code == 200
+    p = client.get(f"/api/projects/{pid}").json()
+    assert p["title_lock"]["title"] == "The Longer Road" and p["title_lock"]["author"] == "Jo Davis"
+
+    for change in ({"name": "A Different Book"}, {"author_name": "Someone Else"}):
+        r = client.patch(f"/api/projects/{pid}", json=change)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "title_locked", r.text
+    assert client.patch(f"/api/projects/{pid}", json={"name": "the  longer road", "page_count": 120}).status_code == 200  # same name
+
+    # the owner can correct a real typo from Admin; customers can't
+    fix = {"project_id": f"https://sparkprep.legenddary.com/editor/{pid}", "name": "The Longest Road", "author_name": "Jo Davies"}
+    assert client.post("/api/admin/projects/title", json=fix).status_code == 403
+    assert _admin_client().post("/api/admin/projects/title", json=fix).status_code == 200
+    p = client.get(f"/api/projects/{pid}").json()
+    assert p["name"] == "The Longest Road" and p["title_lock"]["author"] == "Jo Davies"
+
+
+def test_export_is_blocked_when_the_cover_shows_a_different_title(client, monkeypatch):
+    pid = make_project(client)
+    client.patch(f"/api/projects/{pid}", json={"name": "Legenddary Mindset", "author_name": "Joshua Davis"})
+    give_credit(1)
+    assert client.post(f"/api/projects/{pid}/activate-book").status_code == 200
+
+    interior = {"sketch": list(range(256))}
+    cover = {"now": _cover_words("Legenddary Mindset The Awakening Joshua Davis a story of grit and second chances")}
+    monkeypatch.setattr(book_pass.fingerprint, "project_fingerprint",
+                        lambda p, d: {"title": "", "parts": ["cover", "interior"], "interior": interior, "cover": cover["now"]})
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200                       # baseline
+
+    cover["now"] = _cover_words("Legenddary Mindset The Awakening Joshua Davis new art new colors and a fresh back cover")
+    assert client.post(f"/api/projects/{pid}/export").status_code == 200                       # a redesigned cover is fine
+
+    cover["now"] = _cover_words("Sunset Recipes for Busy Families by Maria Lopez a cookbook full of quick dinners")
+    r = client.post(f"/api/projects/{pid}/export")                                             # same manuscript, new name
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "title_changed", r.text
+    assert "Legenddary Mindset" in r.json()["detail"]["msg"]
+    assert any(f["project_id"] == pid and f["verdict"] == "title_changed" and f["blocked"] for f in server.db.book_flags._docs)
+
+
+def test_a_title_ocr_never_read_is_only_flagged_never_blocked():
+    fpm = book_pass.fingerprint
+    lock = {"title": "Legenddary Mindset", "author": "Joshua Davis"}
+    unreadable_at_start = _cover_words("swirly art only some words here and there nothing else to read")
+    other = _cover_words("Sunset Recipes for Busy Families by Maria Lopez quick dinners for every night")
+    assert fpm.locked_name_verdict(lock, unreadable_at_start, other)[0] == "unclear"
+    assert fpm.locked_name_verdict(lock, None, None)[0] == "ok"                                 # no cover text at all
+    assert fpm.locked_name_verdict(lock, other, _cover_words("tiny"))[0] == "ok"              # too little read to judge

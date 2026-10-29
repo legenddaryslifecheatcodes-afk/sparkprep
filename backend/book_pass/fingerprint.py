@@ -172,3 +172,49 @@ def merge(stored: dict, current: dict) -> dict:
     if stored.get("parts") or current.get("parts"):
         out["parts"] = sorted(set(stored.get("parts") or []) | set(current.get("parts") or []))
     return out
+
+
+# ---- Locked title and author name ----
+# Once a book is started, its title and author name are locked (owner's rule, 2026-10-28). The interior decides
+# "same book" above, so without this a customer could keep one manuscript and export it under a new title or
+# author. These read the cover's words (the same OCR as above) for the locked name.
+
+NAME_ON_COVER = 0.8          # the cover clearly shows the locked name
+NAME_OFF_COVER = 0.2         # the cover clearly doesn't
+MIN_WORDS_TO_JUDGE = 8       # a cover OCR found fewer words on is too thin to say a name is missing
+_SKIP_WORDS = {"a", "an", "the", "of", "and", "or", "in", "on", "to", "for", "by", "with", "at", "from"}
+
+
+def name_words(name: str) -> list[str]:
+    words = [w for w in words_of(name) if w not in _SKIP_WORDS and len(w) > 1]
+    return words or [w for w in words_of(name) if len(w) > 1]
+
+
+def name_on_cover(name: str, cover: Optional[dict]) -> Optional[float]:
+    """Share of the name's words found on the cover, or None when it can't be judged (no name, or too few cover
+    words read)."""
+    words = name_words(name)
+    found = set((cover or {}).get("words") or [])
+    if not words or len(found) < MIN_WORDS_TO_JUDGE:
+        return None
+    return sum(1 for w in words if w in found) / len(words)
+
+
+def locked_name_verdict(lock: dict, stored_cover: Optional[dict], current_cover: Optional[dict]) -> tuple[str, dict]:
+    """-> ("ok" | "changed" | "unclear", details) for the locked title and author on the cover being exported.
+    "changed" only when the cover clearly showed the locked name at first export and clearly doesn't now --
+    OCR misses stylized lettering, so a name that was never read is only ever "unclear"."""
+    verdict, details = "ok", {}
+    for field in ("title", "author"):
+        name = (lock or {}).get(field) or ""
+        now = name_on_cover(name, current_cover)
+        if now is None or now >= NAME_OFF_COVER:
+            continue
+        before = name_on_cover(name, stored_cover)
+        details[field] = {"locked": name, "on_cover_now": round(now, 2),
+                          "on_cover_at_start": None if before is None else round(before, 2)}
+        if before is not None and before >= NAME_ON_COVER:
+            verdict = "changed"
+        elif verdict == "ok":
+            verdict = "unclear"
+    return verdict, details
