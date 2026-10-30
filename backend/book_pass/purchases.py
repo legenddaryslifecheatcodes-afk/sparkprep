@@ -13,6 +13,8 @@ from typing import Optional
 
 from fastapi import HTTPException
 
+import payments
+
 from .config import (AUDIT_SPECIAL_CENTS, BOOK_PASS_PRICE_CENTS, PASS_WINDOW_DAYS, PLANS)
 from .entitlements import (_get, grant_credit, grant_for_invoice, register_subscription, iso, now_utc)
 
@@ -28,7 +30,7 @@ def safe_origin(origin: str) -> str:
 
 
 def _stripe_ready(stripe):
-    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
+    if not payments.ready():
         raise HTTPException(503, "Payments not configured yet.")
 
 
@@ -45,11 +47,11 @@ async def audit_credit_cents(db, stripe, audit_id: str) -> int:
     reserved = a.get("credit_reserved_session")
     if reserved:
         try:
-            old = await asyncio.to_thread(stripe.checkout.Session.retrieve, reserved)
+            old = await asyncio.to_thread(payments.retrieve_session, reserved)
             if old.payment_status == "paid":
                 raise HTTPException(409, "This audit's credit is already being used by a purchase in progress.")
             if old.status == "open":
-                await asyncio.to_thread(stripe.checkout.Session.expire, reserved)
+                await asyncio.to_thread(payments.expire_session, reserved)
         except HTTPException:
             raise
         except Exception:  # noqa: BLE001 - a stale reservation we can't inspect must not block the customer
@@ -83,6 +85,8 @@ async def start_checkout(*, db, stripe, user: dict, product: str, origin_url: st
                          audit_id: Optional[str] = None) -> dict:
     _stripe_ready(stripe)
     origin = safe_origin(origin_url)
+    if product != "book_pass" and payments.using_square():
+        audit_id = None   # Square can't take a one-time discount off a subscription; the credit stays for a book
     credit = await audit_credit_cents(db, stripe, audit_id) if audit_id else 0
 
     if product == "book_pass":
@@ -107,18 +111,15 @@ async def start_checkout(*, db, stripe, user: dict, product: str, origin_url: st
                   cancel_url=f"{origin}/pricing", customer_email=user["email"], metadata=metadata, **sub_kwargs)
     if credit:
         metadata["audit_id"] = audit_id
-        coupon = await asyncio.to_thread(stripe.Coupon.create, amount_off=credit, currency="usd", duration="once",
-                                         max_redemptions=1, name="SparkPrep audit credit")
-        kwargs["discounts"] = [{"coupon": coupon.id}]
     try:
-        session = await asyncio.to_thread(stripe.checkout.Session.create, **kwargs)
-    except stripe.error.StripeError as e:
+        session = await asyncio.to_thread(payments.create_session, credit_cents=credit, **kwargs)
+    except payments.ERRORS as e:
         raise HTTPException(500, f"Stripe error: {e}")
 
     if audit_id:
         await db.audits.update_one({"audit_id": audit_id}, {"$set": {"credit_reserved_session": session.id}})
     await db.payment_transactions.insert_one({
-        "session_id": session.id, "user_id": user["id"], "product": product, "plan": plan, "audit_id": audit_id,
+        "session_id": session.id, "provider_order_id": getattr(session, "order_id", None), "user_id": user["id"], "product": product, "plan": plan, "audit_id": audit_id,
         "amount": list_price - credit, "list_price": list_price, "audit_credit": credit, "currency": "usd",
         "status": "initiated", "payment_status": "pending", "created_at": iso(now_utc()),
     })
@@ -149,7 +150,7 @@ async def on_session_paid(db, stripe, record: dict, session) -> None:
             inv_id = _get(session, "invoice")
             inv_id = inv_id if isinstance(inv_id, str) or inv_id is None else _get(inv_id, "id")
             if inv_id:
-                inv = await asyncio.to_thread(stripe.Invoice.retrieve, inv_id)
+                inv = await asyncio.to_thread(payments.retrieve_invoice, inv_id)
                 if _get(inv, "status") == "paid" or _get(inv, "paid"):
                     await grant_for_invoice(db, inv, user_id=user_id, subscription_id=sub_id, plan=record.get("plan"))
     await consume_audit_credit(db, record)
@@ -163,8 +164,7 @@ async def on_invoice_paid(db, stripe, invoice) -> int:
     sub = await db.book_subscriptions.find_one({"subscription_id": sub_id})
     if not sub:                                     # invoice.paid can beat checkout.session.completed
         try:
-            s = await asyncio.to_thread(stripe.Subscription.retrieve, sub_id)
-            md = _get(s, "metadata") or {}
+            md = await asyncio.to_thread(payments.retrieve_subscription_metadata, sub_id)
             user_id, plan = _get(md, "user_id"), _get(md, "plan")
         except Exception:  # noqa: BLE001
             return 0

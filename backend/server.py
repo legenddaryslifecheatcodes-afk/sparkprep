@@ -58,6 +58,7 @@ from failure_log import log_failure
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
 import interior_studio
 import writing_help
+import payments
 from manuscript_composer import compose_manuscript_pdf, list_templates as list_manuscript_templates, TEMPLATES as MANUSCRIPT_TEMPLATES
 from beta_engine import (
     generate_pass_code, new_pass_doc, new_feedback_doc, DEFAULT_CHECKLIST_FEATURES,
@@ -3023,11 +3024,11 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
     billing_user = await get_billing_user(user)
     tier = billing_user.get("tier", "free")
     price_cents = ADVANCED_INTERIOR_PRICE_CENTS.get(tier, ADVANCED_INTERIOR_PRICE_CENTS["free"])
-    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
-        raise HTTPException(503, "Payments not configured — Stripe key missing")
+    if not payments.ready():
+        raise HTTPException(503, "Payments not configured yet.")
     origin = payload.origin_url.rstrip("/")
     try:
-        session = stripe.checkout.Session.create(
+        session = payments.create_session(
             mode="payment",
             line_items=[{
                 "price_data": {
@@ -3044,8 +3045,8 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
             cancel_url=f"{origin}/editor/{project_id}",
             metadata={"project_id": project_id, "user_id": user["id"], "purpose": "advanced_interior_check"},
         )
-    except stripe.error.StripeError as e:
-        raise HTTPException(500, f"Stripe error: {e}")
+    except payments.ERRORS as e:
+        raise HTTPException(500, f"Payment error: {e}")
 
     await db.interior_checks.insert_one({
         "project_id": project_id,
@@ -3060,6 +3061,7 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
     })
     await db.payment_transactions.insert_one({
         "session_id": session.id,
+        "provider_order_id": getattr(session, "order_id", None),
         "project_id": project_id,
         "user_id": user["id"],
         "amount": price_cents,
@@ -3123,9 +3125,9 @@ async def interior_check_verify(project_id: str, session_id: str, user: dict = D
         raise HTTPException(404, "Interior check purchase not found")
     if not check.get("paid"):
         try:
-            session = stripe.checkout.Session.retrieve(session_id)
-        except stripe.error.StripeError as e:
-            raise HTTPException(500, f"Stripe error: {e}")
+            session = payments.retrieve_session(session_id)
+        except payments.ERRORS as e:
+            raise HTTPException(500, f"Payment error: {e}")
         if session.payment_status == "paid":
             await db.interior_checks.update_one({"_id": check["_id"]}, {"$set": {"paid": True}})
             check["paid"] = True
@@ -3330,13 +3332,13 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
         raise HTTPException(400, "Invalid tier")
     tier_info = TIERS[tier]
     origin = payload.origin_url.rstrip("/")
-    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
+    if not payments.ready():
         raise HTTPException(
             status_code=503,
             detail="Payments not configured yet. Add a valid STRIPE_API_KEY to backend/.env to enable checkout.",
         )
     try:
-        session = stripe.checkout.Session.create(
+        session = payments.create_session(
             mode="subscription",
             line_items=[{
                 "price_data": {
@@ -3352,11 +3354,12 @@ async def create_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
             customer_email=user["email"],
             metadata={"user_id": user["id"], "tier": tier},
         )
-    except stripe.error.StripeError as e:
-        raise HTTPException(500, f"Stripe error: {str(e)}")
+    except payments.ERRORS as e:
+        raise HTTPException(500, f"Payment error: {e}")
 
     await db.payment_transactions.insert_one({
         "session_id": session.id,
+        "provider_order_id": getattr(session, "order_id", None),
         "user_id": user["id"],
         "tier": tier,
         "amount": tier_info["price_cents"],
@@ -3398,7 +3401,7 @@ async def payment_status(session_id: str):
         raise HTTPException(404, "Transaction not found")
     if record.get("payment_status") != "paid" and record.get("product") in book_pass.NEW_PRODUCTS:
         try:
-            s = stripe.checkout.Session.retrieve(session_id)
+            s = payments.retrieve_session(session_id)
             if s.payment_status == "paid" or s.status == "complete":
                 await db.payment_transactions.update_one(          # safe to repeat: crediting below is idempotent
                     {"session_id": session_id},
@@ -3406,11 +3409,11 @@ async def payment_status(session_id: str):
                               "updated_at": datetime.now(timezone.utc).isoformat()}})
                 record = await db.payment_transactions.find_one({"session_id": session_id})
                 await book_pass.purchases.on_session_paid(db, stripe, record, s)
-        except stripe.error.StripeError:
+        except payments.ERRORS:
             pass
     elif record.get("payment_status") != "paid":
         try:
-            s = stripe.checkout.Session.retrieve(session_id)
+            s = payments.retrieve_session(session_id)
             if s.payment_status == "paid" or s.status == "complete":
                 await db.payment_transactions.update_one(
                     {"session_id": session_id, "payment_status": {"$ne": "paid"}},
@@ -3431,7 +3434,7 @@ async def payment_status(session_id: str):
                         }},
                     )
                 record = await db.payment_transactions.find_one({"session_id": session_id})
-        except stripe.error.StripeError:
+        except payments.ERRORS:
             pass
     return {
         "session_id": record["session_id"],
@@ -3439,6 +3442,41 @@ async def payment_status(session_id: str):
         "payment_status": record["payment_status"],
         "tier": record.get("tier"),
     }
+
+
+async def _on_checkout_paid(session_id: str, obj) -> None:
+    """A checkout is confirmed paid (Stripe's checkout.session.completed or Square's payment.updated).
+    Idempotent: a record already marked paid is left alone."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    obj_get = (lambda k: obj[k] if isinstance(obj, dict) else getattr(obj, k, None))
+    record = await db.payment_transactions.find_one({"session_id": session_id})
+    if record and record.get("payment_status") != "paid":
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {"status": "completed", "payment_status": "paid", "updated_at": now_iso}},
+        )
+        # Route based on product
+        if record.get("product") in book_pass.NEW_PRODUCTS:
+            await book_pass.purchases.on_session_paid(db, stripe, record, obj)
+        elif record.get("product") == "audit_099" and record.get("audit_id"):
+            await _mark_audit_paid(record["audit_id"], record.get("level"))
+        elif record.get("product") == "advanced_interior_check":
+            # Unlock from Stripe's own confirmation, not only when the customer's
+            # browser returns to the success page (interior_check_verify) -- someone
+            # who pays and closes the tab must not be charged and left locked out.
+            await db.interior_checks.update_one(
+                {"session_id": session_id},
+                {"$set": {"paid": True, "paid_at": now_iso}},
+            )
+        elif record.get("user_id") and record.get("tier"):
+            await db.users.update_one(
+                {"_id": ObjectId(record["user_id"])},
+                {"$set": {
+                    "tier": record["tier"],
+                    "subscription_status": "active",
+                    "stripe_subscription_id": obj_get("subscription"),
+                }},
+            )
 
 
 @api_router.post("/stripe/webhook")
@@ -3461,35 +3499,7 @@ async def stripe_webhook(request: Request):
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if t == "checkout.session.completed":
-        session_id = obj_get("id")
-        record = await db.payment_transactions.find_one({"session_id": session_id})
-        if record and record.get("payment_status") != "paid":
-            await db.payment_transactions.update_one(
-                {"session_id": session_id},
-                {"$set": {"status": "completed", "payment_status": "paid", "updated_at": now_iso}},
-            )
-            # Route based on product
-            if record.get("product") in book_pass.NEW_PRODUCTS:
-                await book_pass.purchases.on_session_paid(db, stripe, record, obj)
-            elif record.get("product") == "audit_099" and record.get("audit_id"):
-                await _mark_audit_paid(record["audit_id"], record.get("level"))
-            elif record.get("product") == "advanced_interior_check":
-                # Unlock from Stripe's own confirmation, not only when the customer's
-                # browser returns to the success page (interior_check_verify) -- someone
-                # who pays and closes the tab must not be charged and left locked out.
-                await db.interior_checks.update_one(
-                    {"session_id": session_id},
-                    {"$set": {"paid": True, "paid_at": now_iso}},
-                )
-            elif record.get("user_id") and record.get("tier"):
-                await db.users.update_one(
-                    {"_id": ObjectId(record["user_id"])},
-                    {"$set": {
-                        "tier": record["tier"],
-                        "subscription_status": "active",
-                        "stripe_subscription_id": obj_get("subscription"),
-                    }},
-                )
+        await _on_checkout_paid(obj_get("id"), obj)
     elif t == "invoice.paid":
         await book_pass.purchases.on_invoice_paid(db, stripe, obj)
     elif t == "checkout.session.expired":
@@ -3512,6 +3522,49 @@ async def stripe_webhook(request: Request):
                 {"$set": {"subscription_status": "past_due", "updated_at": now_iso}},
             )
 
+    return {"status": "ok", "event_type": t}
+
+
+@api_router.post("/square/webhook")
+async def square_webhook(request: Request):
+    """Square's confirmations: the same outcomes as the Stripe webhook above. Signed requests only -- unlike
+    the old Stripe setup, an unsigned or wrongly signed request is always refused."""
+    payload = await request.body()
+    if not payments.square_signature_ok(payload, request.headers.get("x-square-hmacsha256-signature", "")):
+        raise HTTPException(400, "Invalid webhook signature")
+    try:
+        import json as _json
+        event = _json.loads(payload)
+    except ValueError:
+        raise HTTPException(400, "Invalid webhook body")
+    t = event.get("type", "")
+    obj = (event.get("data") or {}).get("object") or {}
+
+    if t in ("payment.created", "payment.updated"):
+        pay = obj.get("payment") or {}
+        if pay.get("status") == "COMPLETED" and pay.get("order_id"):
+            record = await db.payment_transactions.find_one({"provider_order_id": pay["order_id"]})
+            if record and record.get("payment_status") != "paid":
+                session = await asyncio.to_thread(payments.retrieve_session, record["session_id"])
+                if session.payment_status == "paid":
+                    await _on_checkout_paid(record["session_id"], session)
+    elif t == "invoice.payment_made":
+        inv = obj.get("invoice") or {}
+        sub_id = inv.get("subscription_id")
+        start = inv.get("sale_or_service_date") or (inv.get("created_at") or "")[:10]
+        if sub_id and start:
+            shim = payments.square_period_invoice(sub_id, start)
+            shim["subscription"] = sub_id
+            await book_pass.purchases.on_invoice_paid(db, stripe, shim)
+    elif t == "subscription.updated":
+        sub = obj.get("subscription") or {}
+        if sub.get("id") and sub.get("status") in ("CANCELED", "DEACTIVATED"):
+            await book_pass.purchases.on_subscription_deleted(db, sub["id"])
+            await db.users.update_one(
+                {"stripe_subscription_id": sub["id"]},
+                {"$set": {"tier": "free", "subscription_status": "canceled",
+                          "updated_at": datetime.now(timezone.utc).isoformat()}},
+            )
     return {"status": "ok", "event_type": t}
 
 
@@ -5539,8 +5592,8 @@ async def _start_audit_checkout(a: dict, level: str, *, origin: str, success_url
             raise HTTPException(400, "The Advanced Audit checks every page of an interior — a cover is fully checked by the standard audit.")
         if a.get("paid") and not _audit_can_upgrade(a):
             raise HTTPException(400, "This audit's file was deleted after its report was downloaded — start a new audit and choose Advanced to check every page.")
-    if not stripe.api_key or stripe.api_key in ("sk_test_not_configured", ""):
-        raise HTTPException(503, "Payments not configured — Stripe key missing")
+    if not payments.ready():
+        raise HTTPException(503, "Payments not configured yet.")
 
     upgrading = bool(a.get("paid"))
     price = book_pass.audit_level_price_cents(level, AUDIT_PRICE_CENTS)
@@ -5552,7 +5605,7 @@ async def _start_audit_checkout(a: dict, level: str, *, origin: str, success_url
     if upgrading:
         desc += " You pay only the difference from your standard audit."
     try:
-        session = stripe.checkout.Session.create(
+        session = payments.create_session(
             mode="payment",
             line_items=[{"price_data": {"currency": "usd", "product_data": {"name": name, "description": desc},
                                         "unit_amount": amount}, "quantity": 1}],
@@ -5560,11 +5613,12 @@ async def _start_audit_checkout(a: dict, level: str, *, origin: str, success_url
             metadata={"audit_id": a["audit_id"], "level": level, "purpose": "print_failure_audit"},
             **({"customer_email": email} if email else {}),
         )
-    except stripe.error.StripeError as e:
-        raise HTTPException(500, f"Stripe error: {e}")
+    except payments.ERRORS as e:
+        raise HTTPException(500, f"Payment error: {e}")
     await db.audits.update_one({"audit_id": a["audit_id"]}, {"$set": {"session_id": session.id}})
     await db.payment_transactions.insert_one({
-        "session_id": session.id, "audit_id": a["audit_id"], "amount": amount, "level": level,
+        "session_id": session.id, "provider_order_id": getattr(session, "order_id", None),
+        "audit_id": a["audit_id"], "amount": amount, "level": level,
         "currency": "usd", "status": "initiated", "payment_status": "pending", "product": "audit_099",
         "created_at": datetime.now(timezone.utc).isoformat(), **(extra_tx or {}),
     })
@@ -5604,7 +5658,7 @@ async def audit_verify(audit_id: str, session_id: str):
     if not tx and a.get("paid"):
         return {"paid": True}
     try:
-        s = stripe.checkout.Session.retrieve(session_id)
+        s = payments.retrieve_session(session_id)
         if s.payment_status == "paid" or s.status == "complete":
             await _mark_audit_paid(audit_id, (tx or {}).get("level"))
             await db.payment_transactions.update_one(
@@ -5613,8 +5667,8 @@ async def audit_verify(audit_id: str, session_id: str):
             )
             return {"paid": True}
         return {"paid": False, "status": s.payment_status}
-    except stripe.error.StripeError as e:
-        raise HTTPException(500, f"Stripe verify failed: {e}")
+    except payments.ERRORS as e:
+        raise HTTPException(500, f"Payment check failed: {e}")
 
 
 class ResultsUnlockIn(BaseModel):
@@ -6290,6 +6344,10 @@ async def on_startup():
             await db.beta_passes.insert_many(docs)
             logger.info(f"Seeded {len(docs)} beta passes: {[d['code'] for d in docs]}")
 
+    if payments.using_square():
+        logger.info(f"Payments go through {payments.mode_label()}.")
+        if not os.environ.get("SQUARE_WEBHOOK_SIGNATURE_KEY"):
+            logger.warning("SQUARE_WEBHOOK_SIGNATURE_KEY is not set: Square confirmations are refused until it is.")
     if not os.environ.get("STRIPE_WEBHOOK_SECRET"):
         logger.warning("STRIPE_WEBHOOK_SECRET is not set — webhook accepts unsigned JSON. Do NOT ship to production without it.")
     if stripe.api_key and (stripe.api_key.startswith("sk_live_") or stripe.api_key.startswith("rk_live_")):
