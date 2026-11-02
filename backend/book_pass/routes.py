@@ -64,7 +64,7 @@ def build_router(*, db, get_current_user, stripe, find_project) -> APIRouter:
         w = await ent.project_window(db, user["id"], project_id)
         s = await ent.summary(db, user["id"])
         out = {"active": bool(w), "window_days": PASS_WINDOW_DAYS, "available_books": s["available_books"],
-               "book_price_cents": BOOK_PASS_PRICE_CENTS}
+               "book_price_cents": s["book_price_cents"], "is_member": s["is_member"]}
         if w:
             ends = ent.parse(w["window_ends_at"])
             out.update(ends_at=w["window_ends_at"], seconds_left=int((ends - ent.now_utc()).total_seconds()))

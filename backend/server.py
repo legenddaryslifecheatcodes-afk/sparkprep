@@ -3494,6 +3494,8 @@ async def stripe_webhook(request: Request):
         await book_pass.purchases.on_invoice_paid(db, stripe, obj)
     elif t == "checkout.session.expired":
         await book_pass.purchases.on_session_expired(db, obj)
+    elif t == "customer.subscription.updated":
+        await book_pass.purchases.on_subscription_updated(db, obj_get("id"), obj_get("status"))
     elif t == "customer.subscription.deleted":
         await book_pass.purchases.on_subscription_deleted(db, obj_get("id"))
         # Downgrade the user to free when their subscription cancels

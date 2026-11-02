@@ -14,7 +14,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 PASS_WINDOW_DAYS = 7                    # unlimited exports for this long once a book is started
-BOOK_PASS_PRICE_CENTS = 7499            # one book, no subscription
+BOOK_PASS_PRICE_CENTS = 7499            # one book, no membership
+MEMBER_BOOK_PRICE_CENTS = 4999          # one book for a SparkPrep member (same price for cover, interior, or both)
+MEMBERSHIP_PLAN = "member"              # the $9.99/month membership: no books included, it lowers every book's price
 AUDIT_PRICE_CENTS_LEGACY = 199          # must equal server.AUDIT_PRICE_CENTS -- /api/pricing shows this in legacy mode
 MAX_ADVANCED_RUNS_PER_WINDOW = 10       # cap on the heavy interior deep-check per started book
 
@@ -33,11 +35,14 @@ SPECIAL_END = datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 AUDIT_SPECIAL_CENTS = 199
 ADVANCED_AUDIT_SPECIAL_CENTS = 999
 
-# Subscriptions: N books per billing month, unused books do not roll over. Only "available" plans can be bought;
-# the bigger ones are shown as "coming soon".
+# Subscriptions. "member" is the membership (Nov 2026): $9.99/month, includes no books, and lets the member buy
+# each book at MEMBER_BOOK_PRICE_CENTS. Other plans give N books per billing month (unused books do not roll over).
+# Only "available" plans can be bought; "retired" plans are hidden but still honoured for anyone already on them.
 PLANS = {
-    "book_1": {"name": "1 Book / month", "price_cents": 4999, "books_per_period": 1, "available": True,
-               "audience": "Independent authors"},
+    "member": {"name": "SparkPrep Membership", "price_cents": 999, "books_per_period": 0, "available": True,
+               "audience": "Authors who publish more than one book"},
+    "book_1": {"name": "1 Book / month", "price_cents": 4999, "books_per_period": 1, "available": False,
+               "retired": True, "audience": "Independent authors"},
     "book_3": {"name": "3 Books / month", "price_cents": 11999, "books_per_period": 3, "available": False,
                "audience": "Working self-publishers"},
     "book_10": {"name": "10 Books / month", "price_cents": 29999, "books_per_period": 10, "available": False,
@@ -99,11 +104,15 @@ def public_pricing() -> dict:
                            if book_model else None),
         "special": ({"active": special_active(), "name": SPECIAL_NAME, "ends_at": SPECIAL_END.isoformat()}
                     if book_model else None),
-        "book": {"price_cents": BOOK_PASS_PRICE_CENTS, "window_days": PASS_WINDOW_DAYS, "includes": BOOK_INCLUDES},
+        "book": {"price_cents": BOOK_PASS_PRICE_CENTS, "member_price_cents": MEMBER_BOOK_PRICE_CENTS,
+                 "window_days": PASS_WINDOW_DAYS, "includes": BOOK_INCLUDES},
+        "membership": {"plan": MEMBERSHIP_PLAN, "price_cents": PLANS[MEMBERSHIP_PLAN]["price_cents"],
+                       "book_price_cents": MEMBER_BOOK_PRICE_CENTS,
+                       "saves_per_book_cents": BOOK_PASS_PRICE_CENTS - MEMBER_BOOK_PRICE_CENTS},
         "plans": [{"id": pid, **p} if p["available"] else
                   {"id": pid, "name": p["name"], "books_per_period": p["books_per_period"], "available": False,
                    "audience": p["audience"], "price_cents": None, "note": "Coming soon"}
-                  for pid, p in PLANS.items()],
+                  for pid, p in PLANS.items() if not p.get("retired")],
     }
 
 
@@ -113,4 +122,5 @@ def _usd(cents: int) -> str:
 
 def book_offer_text() -> str:
     """The one sentence every "you need to pay for this" message uses, built from the real prices above."""
-    return f"{_usd(BOOK_PASS_PRICE_CENTS)} for one book (cover, interior, or both), or {_usd(PLANS['book_1']['price_cents'])}/month"
+    return (f"{_usd(BOOK_PASS_PRICE_CENTS)} for one book (cover, interior, or both), or "
+            f"{_usd(MEMBER_BOOK_PRICE_CENTS)} per book with a {_usd(PLANS[MEMBERSHIP_PLAN]['price_cents'])}/month membership")
