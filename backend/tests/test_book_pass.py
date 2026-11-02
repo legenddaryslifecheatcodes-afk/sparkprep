@@ -142,11 +142,14 @@ def test_pricing_is_served_from_one_place_and_bigger_plans_are_coming_soon(clien
     assert p["model"] == "book_pass"
     assert p["audit"]["price_cents"] == 199 and p["book"]["price_cents"] == 7499 and p["book"]["window_days"] == 7
     plans = {x["id"]: x for x in p["plans"]}
-    assert plans["book_1"]["price_cents"] == 4999 and plans["book_1"]["available"] is True
+    assert plans["member"]["price_cents"] == 999 and plans["member"]["available"] is True
+    assert plans["member"]["books_per_period"] == 0 and "book_1" not in plans           # retired: hidden
+    assert p["book"]["member_price_cents"] == 4999
+    assert p["membership"] == {"plan": "member", "price_cents": 999, "book_price_cents": 4999, "saves_per_book_cents": 2500}
     # bigger plans are "coming soon" and show NO price (their pricing isn't decided)
     for pid in ("book_3", "book_10"):
         assert plans[pid]["available"] is False and plans[pid]["price_cents"] is None and plans[pid]["note"] == "Coming soon"
-    assert [p["id"] for p in p["plans"] if p["price_cents"] is not None] == ["book_1"]
+    assert [p["id"] for p in p["plans"] if p["price_cents"] is not None] == ["member"]
 
 
 def test_legacy_mode_is_untouched_by_default(client, monkeypatch):
@@ -254,28 +257,69 @@ def test_interior_deep_check_is_included_with_the_book_not_sold_separately(clien
 
 
 # ---------------------------------------------------------------- subscriptions
-def test_only_the_one_book_subscription_can_be_bought_for_now(client, stripe_fake):
-    for plan in ("book_3", "book_10"):
+def test_only_the_membership_can_be_bought_for_now(client, stripe_fake):
+    for plan in ("book_1", "book_3", "book_10"):
         r = client.post("/api/payments/subscribe", json={"plan": plan, "origin_url": "https://sparkprep.legenddary.com"})
         assert r.status_code == 400 and "coming soon" in r.json()["detail"]
     assert client.post("/api/payments/subscribe", json={"plan": "nope", "origin_url": "https://x"}).status_code == 400
     assert not stripe_fake["sessions"]
 
 
-def test_subscription_gives_one_book_per_paid_month_once_per_invoice(client, stripe_fake):
-    out = client.post("/api/payments/subscribe", json={"plan": "book_1", "origin_url": "https://sparkprep.legenddary.com"}).json()
-    call = stripe_fake["sessions"][-1]
-    pd = call["line_items"][0]["price_data"]
-    assert call["mode"] == "subscription" and pd["unit_amount"] == 4999 and pd["recurring"] == {"interval": "month"}
-    assert call["subscription_data"]["metadata"] == {"user_id": uid(), "product": "subscription", "plan": "book_1"}
-    sid = call["id"]
-    stripe_fake["invoices"]["in_1"] = invoice("in_1")
-    hook(client, paid_session_event(sid, subscription="sub_1", invoice="in_1"))
+def test_a_retired_one_book_plan_still_gets_its_book_each_paid_month_once_per_invoice(client, stripe_fake):
+    stripe_fake["subs"]["sub_1"] = Obj(metadata={"user_id": uid(), "plan": "book_1"})
+    hook(client, {"id": "e", "type": "invoice.paid", "data": {"object": invoice("in_1")}})
     hook(client, {"id": "e", "type": "invoice.paid", "data": {"object": invoice("in_1")}})     # arrives twice
     assert client.get("/api/me/books").json()["available_books"] == 1
     assert client.get("/api/me/books").json()["subscription"]["plan"] == "book_1"
+    assert client.get("/api/me/books").json()["is_member"] is False
     hook(client, {"id": "e2", "type": "invoice.paid", "data": {"object": invoice("in_2")}})    # next month's renewal
     assert client.get("/api/me/books").json()["available_books"] == 2
+
+
+def become_member(client, stripe_fake, sub="sub_m"):
+    client.post("/api/payments/subscribe", json={"plan": "member", "origin_url": "https://sparkprep.legenddary.com"})
+    sid = stripe_fake["sessions"][-1]["id"]
+    stripe_fake["invoices"]["in_m"] = invoice("in_m", sub=sub)
+    hook(client, paid_session_event(sid, subscription=sub, invoice="in_m"))
+
+
+def test_membership_is_9_99_a_month_includes_no_books_and_makes_every_book_49_99(client, stripe_fake):
+    assert buy_pass(client)["you_pay_cents"] == 7499                                       # not a member yet
+    out = client.post("/api/payments/subscribe", json={"plan": "member", "origin_url": "https://sparkprep.legenddary.com"}).json()
+    call = stripe_fake["sessions"][-1]
+    pd = call["line_items"][0]["price_data"]
+    assert out["you_pay_cents"] == 999
+    assert call["mode"] == "subscription" and pd["unit_amount"] == 999 and pd["recurring"] == {"interval": "month"}
+    assert call["subscription_data"]["metadata"] == {"user_id": uid(), "product": "subscription", "plan": "member"}
+    stripe_fake["invoices"]["in_m"] = invoice("in_m", sub="sub_m")
+    hook(client, paid_session_event(call["id"], subscription="sub_m", invoice="in_m"))
+    hook(client, {"id": "e", "type": "invoice.paid", "data": {"object": invoice("in_m", sub="sub_m")}})
+    books = client.get("/api/me/books").json()
+    assert books["available_books"] == 0 and books["is_member"] is True and books["book_price_cents"] == 4999
+    out = buy_pass(client)
+    assert out["you_pay_cents"] == 4999 and stripe_fake["sessions"][-1]["line_items"][0]["price_data"]["unit_amount"] == 4999
+    pid = make_project(client)
+    assert client.get(f"/api/projects/{pid}/book").json()["book_price_cents"] == 4999
+    r = client.post("/api/payments/subscribe", json={"plan": "member", "origin_url": "https://sparkprep.legenddary.com"})
+    assert r.status_code == 409                                                            # can't join twice
+
+
+def test_member_price_stops_when_the_membership_lapses_or_is_cancelled(client, stripe_fake):
+    become_member(client, stripe_fake)
+    assert buy_pass(client)["you_pay_cents"] == 4999
+    hook(client, {"id": "e", "type": "customer.subscription.updated", "data": {"object": {"id": "sub_m", "status": "past_due"}}})
+    assert buy_pass(client)["you_pay_cents"] == 7499
+    hook(client, {"id": "e", "type": "invoice.paid", "data": {"object": invoice("in_m2", sub="sub_m")}})   # paid again
+    assert buy_pass(client)["you_pay_cents"] == 4999
+    hook(client, {"id": "e", "type": "customer.subscription.deleted", "data": {"object": {"id": "sub_m"}}})
+    assert buy_pass(client)["you_pay_cents"] == 7499 and client.get("/api/me/books").json()["is_member"] is False
+
+
+def test_audit_credit_comes_off_the_member_book_price(client, stripe_fake):
+    become_member(client, stripe_fake)
+    paid_audit()
+    out = buy_pass(client, audit_id="aud_1")
+    assert out["you_pay_cents"] == 4999 - 199 and out["audit_credit_cents"] == 199
 
 
 def test_invoice_paid_arriving_before_checkout_completed_still_works(client, stripe_fake):
@@ -326,10 +370,11 @@ def test_audit_credit_reduces_a_book_pass_by_what_the_audit_cost(client, stripe_
     assert stripe_fake["sessions"][-1]["metadata"]["audit_id"] == "aud_1"
 
 
-def test_audit_credit_also_reduces_a_subscription(client, stripe_fake):
+def test_audit_credit_is_kept_for_the_book_not_spent_on_the_membership(client, stripe_fake):
     paid_audit()
-    out = client.post("/api/payments/subscribe", json={"plan": "book_1", "origin_url": "https://sparkprep.legenddary.com", "audit_id": "aud_1"}).json()
-    assert out["you_pay_cents"] == 4999 - 199 and stripe_fake["sessions"][-1]["discounts"]
+    out = client.post("/api/payments/subscribe", json={"plan": "member", "origin_url": "https://sparkprep.legenddary.com", "audit_id": "aud_1"}).json()
+    assert out["you_pay_cents"] == 999 and out["audit_credit_cents"] == 0 and "discounts" not in stripe_fake["sessions"][-1]
+    assert buy_pass(client, audit_id="aud_1")["audit_credit_cents"] == 199                  # still there for the book
 
 
 def test_an_audit_credit_can_only_be_used_once(client, stripe_fake):
@@ -590,7 +635,7 @@ def test_the_assistants_price_source_shows_the_book_prices_not_the_retired_plans
     assert "tiers" not in specs                                    # no Author/Creator Pro/Publisher/Studio prices
     pr = specs["pricing"]
     assert pr["audit"]["price_cents"] == 199 and pr["book"]["price_cents"] == 7499
-    assert [p["price_cents"] for p in pr["plans"]] == [4999, None, None]
+    assert [p["price_cents"] for p in pr["plans"]] == [999, None, None]
 
 
 def test_upgrade_messages_quote_the_book_prices_not_old_plan_names(client):
@@ -598,14 +643,15 @@ def test_upgrade_messages_quote_the_book_prices_not_old_plan_names(client):
     assert r.status_code in (402, 503), r.text
     if r.status_code == 402:
         msg = r.json()["detail"]
-        assert "$74.99" in msg and "$49.99/month" in msg and "Author" not in msg
+        assert "$74.99" in msg and "$49.99 per book with a $9.99/month membership" in msg and "Author" not in msg
     r = client.patch("/api/team/branding", json={"brand_name": "x"})
     assert r.status_code == 402 and "coming soon" in r.json()["detail"] and "Studio" not in r.json()["detail"]
 
 
 def test_paid_feature_message_wording():
     msg = server._paid_msg("AI Cover Generation requires the Author plan or higher.", "AI Cover Generation")
-    assert msg == "AI Cover Generation is included with a book — $74.99 for one book (cover, interior, or both), or $49.99/month."
+    assert msg == ("AI Cover Generation is included with a book — $74.99 for one book (cover, interior, or both), "
+                   "or $49.99 per book with a $9.99/month membership.")
 
 
 # ---------------------------------------------------------------- disk housekeeping (the server disk is 1 GB)

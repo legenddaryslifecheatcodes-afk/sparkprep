@@ -12,7 +12,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from .config import PASS_WINDOW_DAYS, PAID_EFFECTIVE_TIER, PLANS
+from .config import (BOOK_PASS_PRICE_CENTS, MEMBER_BOOK_PRICE_CENTS, MEMBERSHIP_PLAN, PASS_WINDOW_DAYS,
+                     PAID_EFFECTIVE_TIER, PLANS)
 
 
 class NoCredit(Exception):
@@ -128,6 +129,19 @@ async def require_active_book(db, user_id: str, project_id: str, now: Optional[d
     return w
 
 
+async def is_member(db, user_id: str) -> bool:
+    """True while the customer's $9.99/month membership is active (a cancelled one stops the member price)."""
+    async for s in db.book_subscriptions.find({"user_id": user_id, "plan": MEMBERSHIP_PLAN}):
+        if s.get("status", "active") == "active":
+            return True
+    return False
+
+
+async def book_price_cents(db, user_id: str) -> int:
+    """What ONE book costs this customer right now: the member price while a membership is active."""
+    return MEMBER_BOOK_PRICE_CENTS if await is_member(db, user_id) else BOOK_PASS_PRICE_CENTS
+
+
 async def summary(db, user_id: str, now: Optional[datetime] = None) -> dict:
     now = now or now_utc()
     credits = await _credits(db, user_id)
@@ -143,7 +157,9 @@ async def summary(db, user_id: str, now: Optional[datetime] = None) -> dict:
     sub = None
     async for s in db.book_subscriptions.find({"user_id": user_id}):
         sub = {"plan": s.get("plan"), "status": s.get("status"), "plan_name": PLANS.get(s.get("plan"), {}).get("name")}
-    return {"available_books": available, "active_windows": windows, "subscription": sub}
+    member = await is_member(db, user_id)
+    return {"available_books": available, "active_windows": windows, "subscription": sub, "is_member": member,
+            "book_price_cents": MEMBER_BOOK_PRICE_CENTS if member else BOOK_PASS_PRICE_CENTS}
 
 
 # ------------------------------------------------------------------ Stripe -> credits

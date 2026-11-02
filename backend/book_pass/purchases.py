@@ -13,8 +13,10 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from .config import (AUDIT_SPECIAL_CENTS, BOOK_PASS_PRICE_CENTS, PASS_WINDOW_DAYS, PLANS)
-from .entitlements import (_get, grant_credit, grant_for_invoice, register_subscription, iso, now_utc)
+from .config import (AUDIT_SPECIAL_CENTS, BOOK_PASS_PRICE_CENTS, MEMBER_BOOK_PRICE_CENTS, MEMBERSHIP_PLAN,
+                     PASS_WINDOW_DAYS, PLANS)
+from .entitlements import (_get, book_price_cents, grant_credit, grant_for_invoice, is_member, register_subscription,
+                           iso, now_utc)
 
 DEFAULT_ORIGIN = "https://sparkprep.legenddary.com"
 _ALLOWED_ORIGIN_RE = re.compile(
@@ -83,25 +85,35 @@ async def start_checkout(*, db, stripe, user: dict, product: str, origin_url: st
                          audit_id: Optional[str] = None) -> dict:
     _stripe_ready(stripe)
     origin = safe_origin(origin_url)
+    if plan == MEMBERSHIP_PLAN:
+        audit_id = None          # an audit is credited toward the BOOK, so it stays unused for the member's first book
     credit = await audit_credit_cents(db, stripe, audit_id) if audit_id else 0
 
+    if product == "subscription" and plan == MEMBERSHIP_PLAN and await is_member(db, user["id"]):
+        raise HTTPException(409, "You're already a SparkPrep member.")
+
     if product == "book_pass":
-        list_price, name = BOOK_PASS_PRICE_CENTS, "SparkPrep Book Pass"
+        list_price = await book_price_cents(db, user["id"])      # member price while the membership is active
+        name = "SparkPrep Book (member price)" if list_price < BOOK_PASS_PRICE_CENTS else "SparkPrep Book Pass"
         desc = f"One book — cover, interior, or both — with {PASS_WINDOW_DAYS} days of unlimited exports."
         price_data = {"currency": "usd", "unit_amount": list_price, "product_data": {"name": name, "description": desc}}
         mode, sub_kwargs = "payment", {}
     else:
         p = PLANS[plan]
         list_price = p["price_cents"]
+        desc = (f"Every book (cover, interior, or both) for the member price of ${MEMBER_BOOK_PRICE_CENTS / 100:.2f}. Cancel any time."
+                if plan == MEMBERSHIP_PLAN else
+                f"{p['books_per_period']} book(s) each month, {PASS_WINDOW_DAYS} days of unlimited exports per book.")
         price_data = {"currency": "usd", "unit_amount": list_price, "recurring": {"interval": "month"},
-                      "product_data": {"name": f"SparkPrep {p['name']}",
-                                       "description": f"{p['books_per_period']} book(s) each month, {PASS_WINDOW_DAYS} days of unlimited exports per book."}}
+                      "product_data": {"name": f"SparkPrep {p['name']}" if not p["name"].startswith("SparkPrep") else p["name"],
+                                       "description": desc}}
         mode = "subscription"
         sub_kwargs = {"subscription_data": {"metadata": {"user_id": user["id"], "product": "subscription", "plan": plan}}}
 
     metadata = {"user_id": user["id"], "product": product}
     if plan:
         metadata["plan"] = plan
+    credit = min(credit, max(list_price - 1, 0))
     kwargs = dict(mode=mode, line_items=[{"price_data": price_data, "quantity": 1}],
                   success_url=f"{origin}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
                   cancel_url=f"{origin}/pricing", customer_email=user["email"], metadata=metadata, **sub_kwargs)
@@ -172,6 +184,9 @@ async def on_invoice_paid(db, stripe, invoice) -> int:
             return 0
         await register_subscription(db, user_id=user_id, subscription_id=sub_id, plan=plan)
         sub = {"user_id": user_id, "plan": plan}
+    elif sub.get("status") not in ("active", "canceled"):
+        # a paid renewal after a failed one: the membership (and its member price) is active again
+        await db.book_subscriptions.update_one({"subscription_id": sub_id}, {"$set": {"status": "active"}})
     return await grant_for_invoice(db, invoice, user_id=sub["user_id"], subscription_id=sub_id, plan=sub["plan"])
 
 
@@ -188,3 +203,12 @@ async def on_session_expired(db, session) -> None:
 async def on_subscription_deleted(db, sub_id: str) -> None:
     """Cancelled: no new books. Books already granted stay usable until their period ends."""
     await db.book_subscriptions.update_one({"subscription_id": sub_id}, {"$set": {"status": "canceled"}})
+
+
+async def on_subscription_updated(db, sub_id: str, status: Optional[str]) -> None:
+    """A renewal failed (past_due/unpaid) or recovered. Only an active membership gets the member book price;
+    the next paid invoice marks it active again."""
+    if not sub_id or not status:
+        return
+    await db.book_subscriptions.update_one({"subscription_id": sub_id}, {"$set": {
+        "status": "active" if status in ("active", "trialing") else status}})
