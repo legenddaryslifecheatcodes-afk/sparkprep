@@ -63,6 +63,33 @@ BOOK_INCLUDES = [
 ]
 
 
+# The Holiday Free Audit (Nov 2026): the standard audit is free, ONE per account (sign-up required, so we get the
+# author's email). Only the standard audit -- the Advanced (every-page) Audit stays paid. A free audit is not a
+# payment, so it earns no credit toward a book. Switch, strongest first:
+#   FREE_AUDIT=off  -> paid again right away;  FREE_AUDIT=on -> free, ignoring the end date;
+#   default "auto"  -> free until FREE_AUDIT_END (ISO time, default below), then paid again on its own.
+FREE_AUDIT_NAME = "Holiday Free Audit"
+FREE_AUDIT_DEFAULT_END = "2026-12-31T23:59:59-08:00"
+
+
+def free_audit_end() -> datetime:
+    raw = (os.environ.get("FREE_AUDIT_END") or FREE_AUDIT_DEFAULT_END).strip()
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        dt = datetime.fromisoformat(FREE_AUDIT_DEFAULT_END)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def free_audit_active(now: Optional[datetime] = None) -> bool:
+    mode = (os.environ.get("FREE_AUDIT") or "auto").strip().lower()
+    if mode == "off" or not book_pass_on():
+        return False
+    if mode == "on":
+        return True
+    return (now or datetime.now(timezone.utc)) <= free_audit_end()
+
+
 def pricing_mode() -> str:
     return os.environ.get("SPARKPREP_PRICING_MODEL", "legacy").strip().lower()
 
@@ -102,6 +129,9 @@ def public_pricing() -> dict:
         "advanced_audit": ({"price_cents": advanced_audit_price_cents(), "credit_cents": advanced_audit_price_cents(),
                             "regular_cents": ADVANCED_AUDIT_REGULAR_CENTS, "max_pages": ADVANCED_AUDIT_MAX_PAGES}
                            if book_model else None),
+        # The audit's normal price (above) is what it costs once the free one is used or the offer ends.
+        "free_audit": {"active": free_audit_active(), "name": FREE_AUDIT_NAME, "ends_at": free_audit_end().isoformat(),
+                       "per_account": 1, "regular_cents": AUDIT_REGULAR_CENTS if book_model else None},
         "special": ({"active": special_active(), "name": SPECIAL_NAME, "ends_at": SPECIAL_END.isoformat()}
                     if book_model else None),
         "book": {"price_cents": BOOK_PASS_PRICE_CENTS, "member_price_cents": MEMBER_BOOK_PRICE_CENTS,
