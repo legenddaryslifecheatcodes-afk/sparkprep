@@ -68,6 +68,7 @@ from image_upscale_engine import upscale_to_size
 import autofix_agents
 import book_pass
 import open_house
+import traffic
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -6123,6 +6124,8 @@ async def _find_owned_project(project_id: str, user: dict):
 
 api_router.include_router(book_pass.build_router(db=db, get_current_user=get_current_user, stripe=stripe,
                                                  find_project=_find_owned_project))
+# Site traffic tracker: POST /api/pv (public beacon from /track.js), GET /api/admin/traffic (owner only).
+api_router.include_router(traffic.build_router(db=db, require_admin=require_admin, client_ip=_client_ip))
 # ---- Database backups (owner's rule, 2026-09-29: no lockout or accident can ever cost SparkPrep its customers)
 # Every collection, exported to one gzip'd JSON file (Mongo-exact types via bson.json_util, so a restore brings
 # back real ObjectIds and dates). Nightly copies stay on the server (last BACKUP_KEEP); the admin page's
@@ -6301,6 +6304,7 @@ async def on_startup():
     await db.beta_passes.create_index("code", unique=True)
     await db.beta_feedback.create_index("user_id")
     await db.leads.create_index("email")
+    await db.pageviews.create_index("day")
 
     # Seed admin account if configured and missing
     if ADMIN_EMAIL:
