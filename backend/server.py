@@ -5502,6 +5502,7 @@ async def audit_get(audit_id: str):
         "file_metadata": a.get("file_metadata") if paid else _strip_file_facts(a.get("file_metadata")),
         "summary": _audit_public_summary(a.get("summary")) if paid else _audit_unpaid_summary(a.get("summary")),
         "paid": paid,
+        "free_audit": bool(a.get("free_audit")),
         "level": a.get("level") or "standard",
         "can_upgrade": _audit_can_upgrade(a),
         # what this audit is worth toward a book: everything paid for it, until it's been used on one
@@ -5591,6 +5592,42 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
         success_url=f"{origin}/audit/{audit_id}/report?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{origin}/audit/{audit_id}/{'report' if a.get('paid') else 'preview'}",
     )
+
+
+@api_router.get("/free-audit/status")
+async def audit_free_status(user: dict = Depends(get_current_user)):
+    """Whether this account can still use its one free audit (the Holiday Free Audit, see book_pass config)."""
+    used = await db.free_audit_claims.find_one({"_id": user["id"]})
+    return {"active": book_pass.config.free_audit_active(), "used": bool(used),
+            "audit_id": (used or {}).get("audit_id")}
+
+
+@api_router.post("/audit/{audit_id}/claim-free")
+async def audit_claim_free(audit_id: str, user: dict = Depends(get_current_user)):
+    """The Holiday Free Audit: unlocks a standard audit's full results for free, once per account. Sign-in is
+    required (that's how we get the author's email). The Advanced Audit stays paid, and a free audit is not a
+    payment, so it carries no credit toward a book (_audit_paid_cents only counts real payments)."""
+    if not book_pass.config.free_audit_active():
+        raise HTTPException(410, "The free audit offer has ended. You can still see your results with a paid audit.")
+    a = await db.audits.find_one({"audit_id": audit_id})
+    if not a:
+        raise HTTPException(404, "Audit not found")
+    if a.get("paid"):
+        return {"paid": True, "already_unlocked": True}
+    if a.get("full_findings") is None:
+        raise HTTPException(400, "Upload your file first, then claim your free audit.")
+    if await db.free_audit_claims.find_one({"_id": user["id"]}):
+        raise HTTPException(409, "You've already used your free audit. Your next audit is the normal price.")
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        # _id = the account, so a second claim (even two at once) is rejected by the database itself.
+        await db.free_audit_claims.insert_one({"_id": user["id"], "email": user.get("email"), "audit_id": audit_id,
+                                               "claimed_at": now})
+    except Exception:  # noqa: BLE001 - DuplicateKeyError on a race: the other request won
+        raise HTTPException(409, "You've already used your free audit. Your next audit is the normal price.")
+    await db.audits.update_one({"audit_id": audit_id}, {"$set": {
+        "paid": True, "paid_at": now, "free_audit": True, "claimed_by": user["id"], "level": "standard"}})
+    return {"paid": True, "free": True}
 
 
 @api_router.get("/audit/{audit_id}/verify")

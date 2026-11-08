@@ -219,12 +219,12 @@ def three_page_interior_with_a_page_3_problem():
 def test_prices_follow_the_99_day_special(client, monkeypatch):
     from datetime import timedelta
     p = client.get("/api/pricing").json()
-    assert (p["audit"]["price_cents"], p["audit"]["regular_cents"]) == (199, 999)
-    assert (p["advanced_audit"]["price_cents"], p["advanced_audit"]["regular_cents"]) == (999, 1999)
+    assert (p["audit"]["price_cents"], p["audit"]["regular_cents"]) == (199, 399)
+    assert (p["advanced_audit"]["price_cents"], p["advanced_audit"]["regular_cents"]) == (999, 1499)
     assert p["special"]["active"] is True
     monkeypatch.setattr(book_pass.config, "SPECIAL_END", datetime.now(timezone.utc) - timedelta(seconds=1))
     p = client.get("/api/pricing").json()
-    assert p["audit"]["price_cents"] == 999 and p["advanced_audit"]["price_cents"] == 1999 and not p["special"]["active"]
+    assert p["audit"]["price_cents"] == 399 and p["advanced_audit"]["price_cents"] == 1499 and not p["special"]["active"]
 
 
 def test_advanced_audit_checks_every_page_and_an_upgrade_costs_only_the_difference(client, stripe_fake):
