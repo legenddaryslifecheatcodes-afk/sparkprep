@@ -23,8 +23,8 @@ MAX_ADVANCED_RUNS_PER_WINDOW = 10       # cap on the heavy interior deep-check p
 # The two audits (detection only -- fixing is the book). The standard audit checks a whole cover and page 1 of an
 # interior; the Advanced Audit checks every interior page (up to ADVANCED_AUDIT_MAX_PAGES). Whatever a customer
 # actually paid for an audit is credited toward their book.
-AUDIT_REGULAR_CENTS = 999
-ADVANCED_AUDIT_REGULAR_CENTS = 1999
+AUDIT_REGULAR_CENTS = 399             # Trey 2026-10-19: normal audit $3.99 from January
+ADVANCED_AUDIT_REGULAR_CENTS = 1499   # Trey 2026-10-19: full audit $14.99 from January
 ADVANCED_AUDIT_MAX_PAGES = 300
 
 # The 99-Day Special (the "Audit Season"): special audit prices until it ends, then the regular prices above
