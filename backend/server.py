@@ -5502,6 +5502,7 @@ async def audit_get(audit_id: str):
         "file_metadata": a.get("file_metadata") if paid else _strip_file_facts(a.get("file_metadata")),
         "summary": _audit_public_summary(a.get("summary")) if paid else _audit_unpaid_summary(a.get("summary")),
         "paid": paid,
+        "free_audit": bool(a.get("free_audit")),
         "level": a.get("level") or "standard",
         "can_upgrade": _audit_can_upgrade(a),
         # what this audit is worth toward a book: everything paid for it, until it's been used on one
