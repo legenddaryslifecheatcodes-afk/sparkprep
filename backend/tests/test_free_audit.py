@@ -91,3 +91,38 @@ def test_switch_off_and_end_date(client, monkeypatch):
     assert client.post(f"/api/audit/{aid}/claim-free", headers=h).status_code == 410
     monkeypatch.setenv("FREE_AUDIT", "on")
     assert client.post(f"/api/audit/{aid}/claim-free", headers=h).status_code == 200
+
+
+def test_free_audit_by_email_no_account(client):
+    first, second = uploaded_audit(client), uploaded_audit(client)
+    r = client.post(f"/api/audit/{first}/claim-free-email", json={"email": "New.Author@Example.com"})
+    assert r.status_code == 200 and r.json()["free"] is True
+    a = client.get(f"/api/audit/{first}").json()
+    assert a["paid"] is True and a["full_report"] is not None and a["credit_cents"] == 0
+    # same email again (any case) is refused
+    assert client.post(f"/api/audit/{second}/claim-free-email", json={"email": "new.author@example.com"}).status_code == 409
+    assert client.get(f"/api/audit/{second}").json()["paid"] is False
+    # bad email is refused
+    assert client.post(f"/api/audit/{second}/claim-free-email", json={"email": "nope"}).status_code == 422
+    # a different email works
+    assert client.post(f"/api/audit/{second}/claim-free-email", json={"email": "other@example.com"}).status_code == 200
+
+
+def test_email_claim_blocked_if_account_used_it(client):
+    h = login(client)
+    first, second = uploaded_audit(client), uploaded_audit(client)
+    assert client.post(f"/api/audit/{first}/claim-free", headers=h).status_code == 200
+    assert client.post(f"/api/audit/{second}/claim-free-email", json={"email": USERS[0]}).status_code == 409
+
+
+def test_email_claim_respects_switch(client, monkeypatch):
+    aid = uploaded_audit(client)
+    monkeypatch.setenv("FREE_AUDIT", "off")
+    assert client.post(f"/api/audit/{aid}/claim-free-email", json={"email": "late@example.com"}).status_code == 410
+
+
+def test_free_audit_has_no_pdf(client):
+    aid = uploaded_audit(client)
+    assert client.post(f"/api/audit/{aid}/claim-free-email", json={"email": "pdf@example.com"}).status_code == 200
+    assert client.get(f"/api/audit/{aid}/report").status_code == 403
+    assert client.get(f"/api/audit/{aid}").json()["claimed_email"] == "pdf@example.com"

@@ -5419,6 +5419,9 @@ async def audit_download_report(audit_id: str):
         raise HTTPException(404, "Audit not found or not yet run")
     if not a.get("paid"):
         raise HTTPException(402, "Unlock the full report ($1.99) to download the PDF.")
+    if a.get("free_audit") and a.get("level") != "advanced":
+        # Free Holiday Audit (Trey, 2026-11-10): results are shown on screen only, no printable copy.
+        raise HTTPException(403, "The free audit shows your results on screen. The PDF report comes with a paid audit or a SparkPrep book.")
 
     report_path = UPLOAD_DIR.parent / "exports" / f"{audit_id}_report.pdf"
     generate_audit_brief_pdf(
@@ -5504,6 +5507,7 @@ async def audit_get(audit_id: str):
         "summary": _audit_public_summary(a.get("summary")) if paid else _audit_unpaid_summary(a.get("summary")),
         "paid": paid,
         "free_audit": bool(a.get("free_audit")),
+        "claimed_email": a.get("claimed_email") if paid else None,
         "level": a.get("level") or "standard",
         "can_upgrade": _audit_can_upgrade(a),
         # what this audit is worth toward a book: everything paid for it, until it's been used on one
@@ -5628,6 +5632,41 @@ async def audit_claim_free(audit_id: str, user: dict = Depends(get_current_user)
         raise HTTPException(409, "You've already used your free audit. Your next audit is the normal price.")
     await db.audits.update_one({"audit_id": audit_id}, {"$set": {
         "paid": True, "paid_at": now, "free_audit": True, "claimed_by": user["id"], "level": "standard"}})
+    return {"paid": True, "free": True}
+
+
+class FreeAuditEmailIn(BaseModel):
+    email: EmailStr
+
+
+@api_router.post("/audit/{audit_id}/claim-free-email")
+async def audit_claim_free_email(audit_id: str, payload: FreeAuditEmailIn):
+    """The Holiday Free Audit with no sign-up (Trey, 2026-11-10): the author runs the audit, then just types the
+    email they want their results sent to. One free audit per email address (and an email that already used
+    its free audit through an account can't use it again). Same rules otherwise as claim-free: standard audit
+    only, and no credit toward a book."""
+    if not book_pass.config.free_audit_active():
+        raise HTTPException(410, "The free audit offer has ended. You can still see your results with a paid audit.")
+    email = str(payload.email).strip().lower()
+    a = await db.audits.find_one({"audit_id": audit_id})
+    if not a:
+        raise HTTPException(404, "Audit not found")
+    if a.get("paid"):
+        return {"paid": True, "already_unlocked": True}
+    if a.get("full_findings") is None:
+        raise HTTPException(400, "Upload your file first, then claim your free audit.")
+    used_msg = "This email has already used its free audit. Your next audit is the normal price."
+    if await db.free_audit_claims.find_one({"_id": "email:" + email}) or \
+            await db.free_audit_claims.find_one({"email": email}):
+        raise HTTPException(409, used_msg)
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await db.free_audit_claims.insert_one({"_id": "email:" + email, "email": email, "audit_id": audit_id,
+                                               "claimed_at": now, "source": "email"})
+    except Exception:  # noqa: BLE001 - DuplicateKeyError on a race: the other request won
+        raise HTTPException(409, used_msg)
+    await db.audits.update_one({"audit_id": audit_id}, {"$set": {
+        "paid": True, "paid_at": now, "free_audit": True, "claimed_email": email, "level": "standard"}})
     return {"paid": True, "free": True}
 
 
