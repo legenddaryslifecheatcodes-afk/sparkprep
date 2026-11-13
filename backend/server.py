@@ -241,6 +241,9 @@ else:
 # why previously uploaded files kept disappearing). Falls back to the repo
 # folder for local dev, where that's not an issue.
 DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR)
+# If DATA_DIR's disk is ever removed (e.g. moving to a free instance with no persistent disk),
+# create the folder instead of crashing on startup. Files then live until the next restart.
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR = DATA_DIR / "uploads"
 EXPORT_DIR = DATA_DIR / "exports"
 UPLOAD_DIR.mkdir(exist_ok=True)
