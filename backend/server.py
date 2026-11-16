@@ -3047,6 +3047,7 @@ async def interior_check_checkout(project_id: str, payload: InteriorCheckCheckou
             success_url=f"{origin}/editor/{project_id}?interior_check_session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{origin}/editor/{project_id}",
             metadata={"project_id": project_id, "user_id": user["id"], "purpose": "advanced_interior_check"},
+            allow_promotion_codes=True,  # referral partner discount codes
         )
     except stripe.error.StripeError as e:
         raise HTTPException(500, f"Stripe error: {e}")
@@ -5569,6 +5570,7 @@ async def _start_audit_checkout(a: dict, level: str, *, origin: str, success_url
                                         "unit_amount": amount}, "quantity": 1}],
             success_url=success_url, cancel_url=cancel_url,
             metadata={"audit_id": a["audit_id"], "level": level, "purpose": "print_failure_audit"},
+            allow_promotion_codes=True,  # referral partner discount codes
             **({"customer_email": email} if email else {}),
         )
     except stripe.error.StripeError as e:

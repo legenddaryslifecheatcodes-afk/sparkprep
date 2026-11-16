@@ -122,6 +122,10 @@ async def start_checkout(*, db, stripe, user: dict, product: str, origin_url: st
         coupon = await asyncio.to_thread(stripe.Coupon.create, amount_off=credit, currency="usd", duration="once",
                                          max_redemptions=1, name="SparkPrep audit credit")
         kwargs["discounts"] = [{"coupon": coupon.id}]
+    else:
+        # Lets a referral partner's discount code (e.g. ANAN10) be typed at checkout. Stripe won't take both a
+        # fixed discount and a code box on one session, so a purchase that already uses an audit credit keeps it.
+        kwargs["allow_promotion_codes"] = True
     try:
         session = await asyncio.to_thread(stripe.checkout.Session.create, **kwargs)
     except stripe.error.StripeError as e:
