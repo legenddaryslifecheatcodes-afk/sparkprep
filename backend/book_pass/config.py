@@ -69,6 +69,9 @@ BOOK_INCLUDES = [
 #   FREE_AUDIT=off  -> paid again right away;  FREE_AUDIT=on -> free, ignoring the end date;
 #   default "auto"  -> free until FREE_AUDIT_END (ISO time, default below), then paid again on its own.
 FREE_AUDIT_NAME = "Holiday Free Audit"
+# How many free audits each person (account or email) gets. Trey, 2026-11-16: 2, one for the practice file on
+# the audit page and one for their real book (some will check 2 real files, and that's fine).
+FREE_AUDITS_PER_PERSON = 2
 FREE_AUDIT_DEFAULT_END = "2026-12-31T23:59:59-08:00"
 
 
@@ -131,7 +134,7 @@ def public_pricing() -> dict:
                            if book_model else None),
         # The audit's normal price (above) is what it costs once the free one is used or the offer ends.
         "free_audit": {"active": free_audit_active(), "name": FREE_AUDIT_NAME, "ends_at": free_audit_end().isoformat(),
-                       "per_account": 1, "regular_cents": AUDIT_REGULAR_CENTS if book_model else None},
+                       "per_account": FREE_AUDITS_PER_PERSON, "regular_cents": AUDIT_REGULAR_CENTS if book_model else None},
         "special": ({"active": special_active(), "name": SPECIAL_NAME, "ends_at": SPECIAL_END.isoformat()}
                     if book_model else None),
         "book": {"price_cents": BOOK_PASS_PRICE_CENTS, "member_price_cents": MEMBER_BOOK_PRICE_CENTS,

@@ -1,4 +1,4 @@
-"""The Holiday Free Audit: one free standard audit per signed-in account, switchable by env. In-memory DB, no Stripe."""
+"""The Holiday Free Audit: two free standard audits per account or email, switchable by env. In-memory DB, no Stripe."""
 import asyncio
 import io
 import os
@@ -55,7 +55,7 @@ def uploaded_audit(client):
 
 def test_pricing_shows_offer(client):
     fa = client.get("/api/pricing").json()["free_audit"]
-    assert fa["active"] is True and fa["per_account"] == 1
+    assert fa["active"] is True and fa["per_account"] == 2
     assert client.get("/api/pricing").json()["audit"]["price_cents"] > 0      # the paid price is unchanged
 
 
@@ -65,14 +65,17 @@ def test_needs_an_account(client):
     assert client.get(f"/api/audit/{aid}").json()["paid"] is False
 
 
-def test_one_free_audit_per_account(client):
+def test_two_free_audits_per_account(client):
     h = login(client)
-    first, second = uploaded_audit(client), uploaded_audit(client)
+    first, extra, second = uploaded_audit(client), uploaded_audit(client), uploaded_audit(client)
     r = client.post(f"/api/audit/{first}/claim-free", headers=h)
     assert r.status_code == 200 and r.json()["free"] is True
     a = client.get(f"/api/audit/{first}").json()
     assert a["paid"] is True and a["full_report"] is not None
     assert a["credit_cents"] == 0                       # free is not a payment: no credit toward a book
+    st = client.get("/api/free-audit/status", headers=h).json()
+    assert st["used"] is False and st["left"] == 1
+    assert client.post(f"/api/audit/{extra}/claim-free", headers=h).status_code == 200
     assert client.get("/api/free-audit/status", headers=h).json()["used"] is True
     assert client.post(f"/api/audit/{second}/claim-free", headers=h).status_code == 409
     assert client.get(f"/api/audit/{second}").json()["paid"] is False
@@ -94,12 +97,14 @@ def test_switch_off_and_end_date(client, monkeypatch):
 
 
 def test_free_audit_by_email_no_account(client):
-    first, second = uploaded_audit(client), uploaded_audit(client)
+    first, extra, second = uploaded_audit(client), uploaded_audit(client), uploaded_audit(client)
     r = client.post(f"/api/audit/{first}/claim-free-email", json={"email": "New.Author@Example.com"})
     assert r.status_code == 200 and r.json()["free"] is True
     a = client.get(f"/api/audit/{first}").json()
     assert a["paid"] is True and a["full_report"] is not None and a["credit_cents"] == 0
-    # same email again (any case) is refused
+    # a second free audit for the same email (practice file + real book) is allowed
+    assert client.post(f"/api/audit/{extra}/claim-free-email", json={"email": "NEW.author@example.com"}).status_code == 200
+    # a third (any case) is refused
     assert client.post(f"/api/audit/{second}/claim-free-email", json={"email": "new.author@example.com"}).status_code == 409
     assert client.get(f"/api/audit/{second}").json()["paid"] is False
     # bad email is refused
@@ -110,9 +115,12 @@ def test_free_audit_by_email_no_account(client):
 
 def test_email_claim_blocked_if_account_used_it(client):
     h = login(client)
-    first, second = uploaded_audit(client), uploaded_audit(client)
+    first, extra, second, third = (uploaded_audit(client) for _ in range(4))
     assert client.post(f"/api/audit/{first}/claim-free", headers=h).status_code == 200
+    # one used through the account leaves one for the same email
+    assert client.post(f"/api/audit/{extra}/claim-free-email", json={"email": USERS[0]}).status_code == 200
     assert client.post(f"/api/audit/{second}/claim-free-email", json={"email": USERS[0]}).status_code == 409
+    assert client.post(f"/api/audit/{third}/claim-free-email", json={"email": USERS[0]}).status_code == 409
 
 
 def test_email_claim_respects_switch(client, monkeypatch):
