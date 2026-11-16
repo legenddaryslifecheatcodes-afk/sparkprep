@@ -5607,9 +5607,38 @@ async def audit_checkout(audit_id: str, payload: AuditCheckoutIn):
 @api_router.get("/free-audit/status")
 async def audit_free_status(user: dict = Depends(get_current_user)):
     """Whether this account can still use its one free audit (the Holiday Free Audit, see book_pass config)."""
-    used = await db.free_audit_claims.find_one({"_id": user["id"]})
-    return {"active": book_pass.config.free_audit_active(), "used": bool(used),
-            "audit_id": (used or {}).get("audit_id")}
+    first = await db.free_audit_claims.find_one({"_id": user["id"]})
+    left = await _free_audits_left(user["id"])
+    return {"active": book_pass.config.free_audit_active(), "used": left == 0, "left": left,
+            "audit_id": (first or {}).get("audit_id")}
+
+
+def _free_claim_ids(base_id: str) -> list:
+    """The claim record ids one person may hold: base, base:2, ... (one per free audit). Using fixed _ids means
+    the database itself rejects a claim beyond the limit, even two requests at once."""
+    n = book_pass.config.FREE_AUDITS_PER_PERSON
+    return [base_id] + [f"{base_id}:{i}" for i in range(2, n + 1)]
+
+
+async def _free_audits_left(base_id: str) -> int:
+    left = 0
+    for cid in _free_claim_ids(base_id):
+        if not await db.free_audit_claims.find_one({"_id": cid}):
+            left += 1
+    return left
+
+
+async def _take_free_claim(base_id: str, record: dict) -> bool:
+    """Saves one free-audit claim in the person's next free slot. False when every slot is used."""
+    for cid in _free_claim_ids(base_id):
+        if await db.free_audit_claims.find_one({"_id": cid}):
+            continue
+        try:
+            await db.free_audit_claims.insert_one({"_id": cid, **record})
+            return True
+        except Exception:  # noqa: BLE001 - DuplicateKeyError on a race: another request took this slot
+            continue
+    return False
 
 
 @api_router.post("/audit/{audit_id}/claim-free")
@@ -5626,15 +5655,9 @@ async def audit_claim_free(audit_id: str, user: dict = Depends(get_current_user)
         return {"paid": True, "already_unlocked": True}
     if a.get("full_findings") is None:
         raise HTTPException(400, "Upload your file first, then claim your free audit.")
-    if await db.free_audit_claims.find_one({"_id": user["id"]}):
-        raise HTTPException(409, "You've already used your free audit. Your next audit is the normal price.")
     now = datetime.now(timezone.utc).isoformat()
-    try:
-        # _id = the account, so a second claim (even two at once) is rejected by the database itself.
-        await db.free_audit_claims.insert_one({"_id": user["id"], "email": user.get("email"), "audit_id": audit_id,
-                                               "claimed_at": now})
-    except Exception:  # noqa: BLE001 - DuplicateKeyError on a race: the other request won
-        raise HTTPException(409, "You've already used your free audit. Your next audit is the normal price.")
+    if not await _take_free_claim(user["id"], {"email": user.get("email"), "audit_id": audit_id, "claimed_at": now}):
+        raise HTTPException(409, "You've already used your free audits. Your next audit is the normal price.")
     await db.audits.update_one({"audit_id": audit_id}, {"$set": {
         "paid": True, "paid_at": now, "free_audit": True, "claimed_by": user["id"], "level": "standard"}})
     return {"paid": True, "free": True}
@@ -5647,8 +5670,8 @@ class FreeAuditEmailIn(BaseModel):
 @api_router.post("/audit/{audit_id}/claim-free-email")
 async def audit_claim_free_email(audit_id: str, payload: FreeAuditEmailIn):
     """The Holiday Free Audit with no sign-up (Trey, 2026-11-10): the author runs the audit, then just types the
-    email they want their results sent to. One free audit per email address (and an email that already used
-    its free audit through an account can't use it again). Same rules otherwise as claim-free: standard audit
+    email they want their results sent to. FREE_AUDITS_PER_PERSON free audits per email address (free audits
+    that email already used through an account count too). Same rules otherwise as claim-free: standard audit
     only, and no credit toward a book."""
     if not book_pass.config.free_audit_active():
         raise HTTPException(410, "The free audit offer has ended. You can still see your results with a paid audit.")
@@ -5660,15 +5683,13 @@ async def audit_claim_free_email(audit_id: str, payload: FreeAuditEmailIn):
         return {"paid": True, "already_unlocked": True}
     if a.get("full_findings") is None:
         raise HTTPException(400, "Upload your file first, then claim your free audit.")
-    used_msg = "This email has already used its free audit. Your next audit is the normal price."
-    if await db.free_audit_claims.find_one({"_id": "email:" + email}) or \
-            await db.free_audit_claims.find_one({"email": email}):
+    used_msg = "This email has already used its free audits. Your next audit is the normal price."
+    # Free audits already used by this email, with or without an account, count toward the same limit.
+    if await db.free_audit_claims.count_documents({"email": email}) >= book_pass.config.FREE_AUDITS_PER_PERSON:
         raise HTTPException(409, used_msg)
     now = datetime.now(timezone.utc).isoformat()
-    try:
-        await db.free_audit_claims.insert_one({"_id": "email:" + email, "email": email, "audit_id": audit_id,
-                                               "claimed_at": now, "source": "email"})
-    except Exception:  # noqa: BLE001 - DuplicateKeyError on a race: the other request won
+    if not await _take_free_claim("email:" + email, {"email": email, "audit_id": audit_id, "claimed_at": now,
+                                                     "source": "email"}):
         raise HTTPException(409, used_msg)
     await db.audits.update_one({"audit_id": audit_id}, {"$set": {
         "paid": True, "paid_at": now, "free_audit": True, "claimed_email": email, "level": "standard"}})
