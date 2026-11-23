@@ -8,6 +8,7 @@ import base64
 import io
 import re
 import copy
+import math
 import uuid
 import asyncio
 import time
@@ -64,7 +65,7 @@ from beta_engine import (
 )
 from series_engine import check_series_consistency
 from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
-from image_upscale_engine import upscale_to_size
+from image_upscale_engine import upscale_to_size_with_info, upscale_file_for_print
 import autofix_agents
 import book_pass
 import open_house
@@ -1762,6 +1763,33 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 await log_failure(db, "autofix_spine_margin", e, project_id=project_id, user_id=user["id"],
                                    context={"slot": slot})
 
+        # Too few pixels for 300 DPI at the book's real size: AI Upscale it
+        # (super-resolution network, see ai_superres.py) before the CMYK step.
+        # Before 2026-11-23 Auto-Fix only stamped "300 DPI" on the file's
+        # label without adding pixels, so the resolution check kept failing.
+        upscale_info = None
+        try:
+            from PIL import Image
+            with Image.open(margin_source_path) as _probe:
+                src_w_px, src_h_px = _probe.size
+            dpi_now = compute_effective_dpi(src_w_px, src_h_px, final_w, final_h)
+            if dpi_now["effective_dpi"] < 300:
+                upscaled_name = f"{project_id}_{slot or 'cover'}_upscaled_{uuid.uuid4().hex[:6]}.png"
+                upscaled_path = UPLOAD_DIR / upscaled_name
+                upscale_info = await run_with_timeout(
+                    upscale_file_for_print, str(margin_source_path), str(upscaled_path),
+                    int(math.ceil(final_w * 300)), int(math.ceil(final_h * 300)),
+                )
+                upscale_info["dpi_before"] = dpi_now["effective_dpi"]
+                if margin_source_path != file_path:
+                    _remove_if_not_original(margin_source_path)
+                margin_source_path = upscaled_path
+        except HTTPException:
+            raise
+        except Exception as e:
+            upscale_info = {"method": "failed", "reason": str(e)}
+            await log_failure(db, "autofix_upscale", e, project_id=project_id, user_id=user["id"], context={"slot": slot})
+
         # Convert to CMYK TIFF, clamped to this platform's total-ink-coverage limit
         fixed_name = f"{project_id}_{slot or 'cover'}_fixed_{uuid.uuid4().hex[:6]}.tif"
         fixed_path = UPLOAD_DIR / fixed_name
@@ -1788,6 +1816,12 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         metadata["original_filename"] = current_metadata.get("original_filename")
         metadata["stored_filename"] = fixed_name
         metadata["autofixed"] = True
+        if upscale_info:
+            metadata["upscale"] = upscale_info
+            if upscale_info.get("method") == "ai":
+                metadata["ai_enhanced"] = True
+        if margin_source_path != file_path:
+            _remove_if_not_original(margin_source_path)
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
@@ -4909,17 +4943,15 @@ def _case_wrap_geometry(p: dict) -> dict:
 
 @api_router.post("/projects/{project_id}/ai-enhance/{slot}")
 async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_current_user)):
-    """'AI Upscale' fix option for a low-DPI compliance failure: resizes the
-    existing slot image up to the exact pixel size needed to hit 300 DPI at
-    this project's trim + bleed, via LANCZOS resampling + an adaptive
-    unsharp mask (see image_upscale_engine.py) -- self-hosted, CPU, no
-    external API, and consistently under 2 seconds regardless of image
-    size. A prior Real-ESRGAN-based version added marginally more pixel
-    detail but ran 90s-4.5min per image on this service's 1-core instance
-    and regularly timed out (502/499) on real requests; this trades a
-    small amount of sharpness for actually finishing. See the compliance
-    re-check the frontend runs immediately after this to confirm it
-    actually cleared the DPI failure."""
+    """'AI Upscale' fix option for a low-DPI compliance failure: enlarges the
+    existing slot image to the exact pixel size needed for 300 DPI at this
+    project's trim + bleed. A super-resolution neural network (FSRCNN, see
+    ai_superres.py) rebuilds the detail; a Lanczos resize only does the last
+    small step to the exact size. Self-hosted on CPU, tiled so memory stays
+    small, no external API or per-image fee (~2 s per source megapixel; the
+    earlier Real-ESRGAN version timed out on this 1-core server). The
+    response's file_metadata.upscale.method says what really ran: "ai", or
+    "resample" if the network couldn't run (never labelled AI)."""
     if slot not in ALLOWED_SLOTS:
         raise HTTPException(400, f"Unknown slot: {slot}")
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
@@ -4951,7 +4983,7 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     try:
         with open(source_path, "rb") as f:
             source_bytes = f.read()
-        image_bytes = await run_with_timeout(upscale_to_size, source_bytes, target_w_px, target_h_px)
+        image_bytes, upscale_info = await run_with_timeout(upscale_to_size_with_info, source_bytes, target_w_px, target_h_px)
     except HTTPException:
         raise
     except Exception as e:
@@ -4962,7 +4994,7 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     metadata, compliance = _save_generated_slot_file(
         p, project_id, slot, file_id, image_bytes,
         original_filename=slot_data.get("original_filename") or "enhanced.jpg",
-        extra_meta={"ai_enhanced": True},
+        extra_meta={"ai_enhanced": upscale_info.get("method") == "ai", "upscale": upscale_info},
     )
     await _replace_slot(project_id, p, slot, metadata, compliance)
     # Part of the book's story in its preflight report: what was wrong, and that AI Upscale fixed it.

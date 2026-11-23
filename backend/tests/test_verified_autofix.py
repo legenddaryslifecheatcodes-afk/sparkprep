@@ -517,7 +517,7 @@ def test_audit_workflow_never_repairs():
     import re
     src = inspect.getsource(server.audit_upload) + inspect.getsource(server.batch_audit)
     repair_calls = ["convert_to_cmyk", "autofix_cover_safe_margin", "autofix_interior_safety_margins", "convert_to_pdfx1a",
-                    "clamp_total_ink_coverage", "build_print_ready_pdf", "build_interior_pdf_x1a", "upscale_to_size", "autofix_agents", "autofix("]
+                    "clamp_total_ink_coverage", "build_print_ready_pdf", "build_interior_pdf_x1a", "upscale_to_size", "upscale_file_for_print", "ai_superres", "autofix_agents", "autofix("]
     hit = [r for r in repair_calls if re.search(re.escape(r), src)]
     assert not hit, f"audit code references repair functions: {hit}"
 

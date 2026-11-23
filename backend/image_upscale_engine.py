@@ -1,7 +1,11 @@
 """
-image_upscale_engine.py - Production-ready high-DPI enhancement engine.
-Replaces heavy CPU PyTorch inference with instant, high-fidelity Lanczos-3
-resampling and adaptive edge sharpening suitable for 300+ DPI print export.
+image_upscale_engine.py - high-DPI enhancement for print.
+
+AI Upscale (2026-11-23): enlargement now runs a trained super-resolution
+neural network first (FSRCNN, see ai_superres.py) and only uses Lanczos for
+the last small step to the exact size. The Lanczos + sharpen path below
+(upscale_image) is the fallback when the network can't run, and results say
+which one ran ("ai" or "resample").
 """
 
 import io
@@ -113,6 +117,78 @@ enhance_image = upscale_image
 run_upscale = upscale_image
 
 
+def enlarge_rgb(img: Image.Image, target_width_px: int, target_height_px: int) -> tuple:
+    """AI-first enlargement of a PIL RGB image to exactly target_width_px x
+    target_height_px. The super-resolution network (ai_superres.py) does the
+    heavy lifting -- rebuilding detail at 2x/3x/4x -- and a Lanczos resize
+    only makes the last small adjustment to the exact pixel size. Returns
+    (image, info) where info["method"] is "ai" only when the network really
+    ran; otherwise the older resize + sharpen path runs and says "resample"."""
+    import ai_superres
+    needed = max(target_width_px / img.width, target_height_px / img.height)
+    arr, info = ai_superres.ai_enlarge(np.array(img.convert("RGB")), needed)
+    if info.get("method") == "ai":
+        out = Image.fromarray(arr, mode="RGB")
+        if out.size != (target_width_px, target_height_px):
+            out = out.resize((target_width_px, target_height_px), Image.Resampling.LANCZOS)
+        return out, info
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path, out_path = os.path.join(tmpdir, "in.png"), os.path.join(tmpdir, "out.png")
+        img.convert("RGB").save(in_path, format="PNG")
+        scale = max(needed, 1.0)
+        mp = img.width * img.height * scale * scale / 1e6
+        if mp > 12.0:  # same intermediate budget as upscale_to_size below
+            scale = max(1.0, scale * (12.0 / mp) ** 0.5)
+        upscale_image(in_path, out_path, target_dpi=300, scale_factor=scale)
+        with Image.open(out_path) as r:
+            out = r.convert("RGB")
+            if out.size != (target_width_px, target_height_px):
+                out = out.resize((target_width_px, target_height_px), Image.Resampling.LANCZOS)
+    info.setdefault("method", "resample")
+    return out, info
+
+
+def upscale_to_size_with_info(image_bytes: bytes, target_width_px: int, target_height_px: int) -> tuple:
+    """Like upscale_to_size(), plus which method actually ran (see enlarge_rgb)."""
+    with Image.open(io.BytesIO(image_bytes)) as src:
+        src.load()
+        icc_profile = src.info.get("icc_profile")
+        was_cmyk = src.mode == "CMYK"
+        result, info = enlarge_rgb(src.convert("RGB"), target_width_px, target_height_px)
+    if was_cmyk:
+        result = Image.fromarray(rgb_array_to_cmyk_array(np.array(result)), mode="CMYK")
+    out_buf = io.BytesIO()
+    save_kwargs = {"quality": 98, "subsampling": 0, "dpi": (300, 300)}
+    if icc_profile and not was_cmyk:
+        save_kwargs["icc_profile"] = icc_profile
+    result.save(out_buf, format="JPEG", **save_kwargs)
+    return out_buf.getvalue(), info
+
+
+def upscale_file_for_print(input_path: str, output_path: str, target_width_px: int, target_height_px: int) -> dict:
+    """Auto-Fix's resolution fix: enlarges an image file (same proportions,
+    no stretching) until it has at least target_width_px x target_height_px,
+    i.e. 300 DPI at the book's real size. Saves a lossless PNG; Auto-Fix's
+    CMYK step right after turns it into the final print TIFF."""
+    with Image.open(input_path) as src:
+        src.load()
+        if src.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", src.size, (255, 255, 255))
+            bg.paste(src.convert("RGBA"), mask=src.convert("RGBA").split()[-1])
+            rgb = bg
+        else:
+            rgb = src.convert("RGB")
+        w, h = src.size
+    scale = max(target_width_px / w, target_height_px / h)
+    if scale <= 1.0:
+        rgb.save(output_path, format="PNG", dpi=(300, 300))
+        return {"method": "none", "from_px": [w, h], "to_px": [w, h]}
+    new_w, new_h = int(np.ceil(w * scale)), int(np.ceil(h * scale))
+    out, info = enlarge_rgb(rgb, new_w, new_h)
+    out.save(output_path, format="PNG", dpi=(300, 300))
+    return {**info, "from_px": [w, h], "to_px": [new_w, new_h]}
+
+
 def upscale_to_size(image_bytes: bytes, target_width_px: int, target_height_px: int) -> bytes:
     """Bytes-in/bytes-out wrapper around upscale_image() -- what
     server.py's /ai-enhance endpoint actually calls, since it has raw
@@ -139,6 +215,11 @@ def upscale_to_size(image_bytes: bytes, target_width_px: int, target_height_px: 
     Real-ESRGAN pipeline this replaced (90s-4.5min, regularly timing out),
     and nowhere near any realistic request timeout.
     """
+    return upscale_to_size_with_info(image_bytes, target_width_px, target_height_px)[0]
+
+
+def _legacy_resize_to_size(image_bytes: bytes, target_width_px: int, target_height_px: int) -> bytes:
+    """The pre-AI Lanczos-only path, kept for reference/tests."""
     with Image.open(io.BytesIO(image_bytes)) as probe:
         src_w, src_h = probe.width, probe.height
         icc_profile = probe.info.get("icc_profile")

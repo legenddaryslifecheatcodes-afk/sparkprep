@@ -50,13 +50,16 @@ INFORMATIONAL_IDS = {
 
 # Structure-audit findings the repair engine (Ghostscript pass) can really
 # fix -- mirrors the `fixable_ids` set in server.py's autofix().
-STRUCTURE_FIXABLE_IDS = {"live_transparency_detected", "layers_detected"}
+STRUCTURE_FIXABLE_IDS = {"live_transparency_detected", "layers_detected", "fonts_not_embedded", "icc_profile_missing"}
+STRUCTURE_FIX_ACTION = {"fonts_not_embedded": "embed_fonts", "icc_profile_missing": "add_color_profile"}
 
 # fix_action values the existing autofix() engine actually performs. Anything
-# else flagged auto_fix=True (e.g. "upscale_300dpi") belongs to a different
-# tool (AI Upscale) -- the pipeline reports it honestly instead of promising
-# a fix this engine never attempts.
-ENGINE_FIX_ACTIONS = {"convert_cmyk", "scale_safe_margin", "fit_recenter_interior", "flatten", "flatten_pdfx"}
+# else flagged auto_fix=True belongs to a different tool -- the pipeline
+# reports it honestly instead of promising a fix this engine never attempts.
+# Since 2026-11-23 the engine also AI-upscales low-resolution images,
+# embeds fonts, and adds the print colour profile.
+ENGINE_FIX_ACTIONS = {"convert_cmyk", "scale_safe_margin", "fit_recenter_interior", "flatten", "flatten_pdfx",
+                      "upscale_300dpi", "embed_fonts", "add_color_profile"}
 
 FIX_ACTION_LABELS = {
     "convert_cmyk": "Convert to CMYK and limit total ink coverage",
@@ -64,6 +67,9 @@ FIX_ACTION_LABELS = {
     "fit_recenter_interior": "Fit and re-center interior pages",
     "flatten": "Flatten transparency for print",
     "flatten_pdfx": "Flatten transparency/layers and declare PDF/X-1a",
+    "upscale_300dpi": "AI-upscale the image to 300 DPI",
+    "embed_fonts": "Embed every font in the file",
+    "add_color_profile": "Add the print colour profile",
 }
 
 
@@ -74,6 +80,9 @@ FIX_ACTION_PROGRESS = {
     "fit_recenter_interior": "Fitting and re-centering every page…",
     "flatten": "Flattening transparency for print…",
     "flatten_pdfx": "Flattening layers and declaring PDF/X-1a…",
+    "upscale_300dpi": "AI-upscaling the image to 300 DPI…",
+    "embed_fonts": "Embedding every font…",
+    "add_color_profile": "Adding the print colour profile…",
 }
 
 
@@ -182,7 +191,7 @@ def normalize_issues(scan: dict) -> list[dict]:
     for f in scan.get("structure") or []:
         if f.get("id") in STRUCTURE_FIXABLE_IDS:
             issues.append(_issue(f["id"], f.get("title"), f.get("severity"), f.get("why_it_fails"),
-                                 True, "flatten_pdfx"))
+                                 True, STRUCTURE_FIX_ACTION.get(f["id"], "flatten_pdfx")))
     return issues
 
 
