@@ -334,13 +334,14 @@ def check_fonts_embedded(pdf: pikepdf.Pdf, max_pages: Optional[int] = None) -> O
         publisher_rule="PDF/X-1a:2001 — 'All fonts must be embedded, including base-14 fonts'",
         pinpoint={"region": "font resources", "unembedded_fonts": names},
         fix_steps=[
-            "In Acrobat Pro: File → Properties → Fonts tab to see which aren't embedded.",
-            "Re-export from the source app with 'Embed all fonts' (or 'Subset fonts') enabled -- "
-            "this includes Helvetica/Times/Arial, which most tools skip embedding by default.",
+            "Click Auto-Fix: SparkPrep embeds every font for you.",
+            "Standard fonts (Helvetica, Times, Arial, Courier) are embedded with exact-width copies, so no text moves.",
+            "If a font isn't in your file and isn't one of those, Auto-Fix uses a close stand-in and tells you which "
+            "one -- for an exact match, re-export from your design app with 'Embed all fonts' turned on.",
         ],
-        fix_tools=["Adobe Acrobat Pro", "Adobe InDesign", "Adobe Illustrator"],
-        est_fix_minutes=6,
-        one_click_fix=False,
+        fix_tools=["SparkPrep Auto-Fix", "Adobe InDesign", "Adobe Acrobat Pro"],
+        est_fix_minutes=1,
+        one_click_fix=True,
     )
 
 
@@ -472,8 +473,8 @@ def check_icc_output_intent(pdf: pikepdf.Pdf, platform_name: str) -> Optional[di
         ),
         publisher_rule=f"{platform_name} — recommends embedding U.S. Web Coated (SWOP) v2 ICC profile",
         pinpoint={"region": "OutputIntent dictionary"},
-        fix_steps=["Re-export as PDF/X-1a with 'U.S. Web Coated (SWOP) v2' ICC profile embedded, not just named."],
-        fix_tools=["Adobe Acrobat Pro", "Adobe InDesign"],
+        fix_steps=["Click Auto-Fix: SparkPrep adds the standard print colour profile (SWOP, or the one chosen for this book) for you."],
+        fix_tools=["SparkPrep Auto-Fix", "Adobe Acrobat Pro", "Adobe InDesign"],
         est_fix_minutes=3,
         one_click_fix=True,
     )

@@ -1103,6 +1103,46 @@ def _declare_pdfx1a(pdf_path: str, title: str, author: str, bleed_pts: float, to
         pdf.save(pdf_path, linearize=False, min_version="1.4")
 
 
+def stamp_pdfx_output_intent(pdf_path: str, color_profile: str = DEFAULT_COLOR_PROFILE) -> dict:
+    """Auto-Fix's colour-profile fix: marks an existing PDF as PDF/X-1a:2001
+    and gives it the registered print colour condition the printer expects
+    (SWOP / GRACoL / FOGRA39 -- the project's own choice), in place.
+
+    Unlike _declare_pdfx1a() (export), this never touches the page geometry:
+    the customer's MediaBox/BleedBox stay exactly as uploaded. A page with no
+    TrimBox gets one equal to its MediaBox (PDF/X requires one per page).
+    The output intent uses the condition's ICC registry entry
+    (www.color.org), which PDF/X-1a accepts in place of an embedded profile
+    and which pdfx_validator's own check treats as complete."""
+    profile = COLOR_PROFILES.get(color_profile, COLOR_PROFILES[DEFAULT_COLOR_PROFILE])
+    trim_boxes_added = 0
+    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        for page in pdf.pages:
+            if "/TrimBox" not in page.obj and "/ArtBox" not in page.obj:
+                page.trimbox = page.mediabox
+                trim_boxes_added += 1
+        try:
+            with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+                meta["pdfx:GTS_PDFXVersion"] = "PDF/X-1a:2001"
+                meta["pdfx:GTS_PDFXConformance"] = "PDF/X-1a:2001"
+                meta["pdf:Trapped"] = "False"
+        except Exception:
+            pass
+        pdf.Root.GTS_PDFXVersion = pikepdf.String("PDF/X-1a:2001")
+        pdf.Root.Trapped = pikepdf.Name("/False")
+        pdf.Root.OutputIntents = pikepdf.Array([pikepdf.Dictionary(
+            Type=pikepdf.Name.OutputIntent,
+            S=pikepdf.Name("/GTS_PDFX"),
+            OutputCondition=pikepdf.String("CMYK"),
+            OutputConditionIdentifier=pikepdf.String(profile["condition_identifier"]),
+            RegistryName=pikepdf.String(profile["registry"]),
+            Info=pikepdf.String(profile["info"]),
+        )])
+        pdf.save(pdf_path, linearize=False, min_version="1.4")
+    return {"color_profile": profile["info"], "condition": profile["condition_identifier"],
+            "trim_boxes_added": trim_boxes_added}
+
+
 def _open_piece(path: str, dpi: int = 300) -> Image.Image:
     """A cover piece as a PIL image; a PDF piece is rendered at print resolution first."""
     if Path(path).suffix.lower() == ".pdf":

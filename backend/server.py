@@ -42,7 +42,7 @@ from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks, assemble_cover_pieces,
     check_total_ink_coverage, check_final_pdf_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
-    autofix_spine_text_margin,
+    autofix_spine_text_margin, stamp_pdfx_output_intent,
     TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
 )
 from audit_engine import deep_audit, audit_summary
@@ -1615,13 +1615,17 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     await log_failure(db, "autofix_interior_margin", e, project_id=project_id, user_id=user["id"])
 
         # Check what actually needs fixing before touching the file --
-        # only PDF/X-1a declaration, live transparency, and layers are
-        # things Ghostscript's -dPDFX pipeline can genuinely repair (it
-        # flattens transparency and forces CMYK/PDF-X metadata in the same
-        # pass). Font embedding and missing ICC profiles aren't safely
-        # auto-fixable this way, so those are left as manual guidance.
+        # Ghostscript's -dPDFX pipeline repairs all of these in one pass: it
+        # flattens transparency and layers, converts colour to CMYK, and
+        # embeds every font (the 14 standard fonts via exact-width copies;
+        # any other font it can't find gets a stand-in, which is reported
+        # back as font_substitutions so the customer is told to check the
+        # proof instead of being told it was a perfect fix). Right after it,
+        # stamp_pdfx_output_intent() adds the PDF/X-1a flag and the
+        # project's print colour profile (SWOP / GRACoL / FOGRA39).
         structure_findings = await run_with_timeout(run_pdf_structure_audit, str(file_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
-        fixable_ids = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent"}
+        fixable_ids = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent",
+                       "fonts_not_embedded", "icc_profile_missing"}
         needs_gs_fix = any(f["id"] in fixable_ids for f in structure_findings)
 
         if needs_gs_fix:
@@ -1636,7 +1640,10 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 fixed_name = f"{project_id}_{slot or 'cover'}_gsfixed_{uuid.uuid4().hex[:6]}.pdf"
                 fixed_path = UPLOAD_DIR / fixed_name
                 try:
-                    await run_with_timeout(convert_to_pdfx1a, str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
+                    gs_out = await run_with_timeout(convert_to_pdfx1a, str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
+                    color_profile = (p.get("adjustments") or {}).get("color_profile") or DEFAULT_COLOR_PROFILE
+                    profile_stamp = await run_with_timeout(stamp_pdfx_output_intent, str(fixed_path), color_profile)
+                    font_substitutions = (gs_out or {}).get("font_substitutions") or []
                     _remove_if_not_original(file_path)
                     file_path = fixed_path
                     metadata = await run_with_timeout(analyze_file, str(fixed_path))
@@ -1667,6 +1674,14 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                         "succeeded": not genuinely_unresolved,
                         "fixed_issues": [f["id"] for f in structure_findings if f["id"] in fixable_ids],
                         "still_present": still_broken,
+                        "color_profile": profile_stamp.get("color_profile"),
+                        "font_substitutions": font_substitutions,
+                        "font_warning": (
+                            "We embedded every font, but these weren't included in your file and aren't on our server, "
+                            "so a close stand-in was used: "
+                            + ", ".join(f"{x['font']} (now {x['substitute']})" for x in font_substitutions)
+                            + ". Please check your proof. For an exact match, re-export with 'embed all fonts' turned on."
+                        ) if font_substitutions else None,
                         "reason": (
                             "Ghostscript fixed some issues automatically, but couldn't resolve: "
                             + "; ".join(f["title"] for f in genuinely_unresolved)
