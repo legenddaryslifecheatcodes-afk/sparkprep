@@ -53,6 +53,12 @@ async def supervise(*, get_project, slot, resolve_target, upload_dir, snapshot: 
     add("independent_verification", "Verification ran independently, after the repair", after_repair,
         f"verification scan at t={verification.get('scanned_at')}s, repair finished t={r2 and r2['finished']}s")
 
+    # 2b. The independent checker (separate code and process) agreed.
+    indep = verification.get("independent")
+    if indep is not None:
+        add("independent_checker_agreed", "Independent checker agreed with the main scan", indep.get("agree"),
+            indep.get("reason") or f"{len(indep.get('targeted') or [])} targeted check(s) confirmed by separate code")
+
     # 3. What Agent 3 approved is what is actually saved.
     project = await get_project()
     stored_filename, cur_meta = resolve_target(project, slot)

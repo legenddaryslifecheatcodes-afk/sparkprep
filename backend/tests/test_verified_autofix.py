@@ -517,7 +517,7 @@ def test_audit_workflow_never_repairs():
     import re
     src = inspect.getsource(server.audit_upload) + inspect.getsource(server.batch_audit)
     repair_calls = ["convert_to_cmyk", "autofix_cover_safe_margin", "autofix_interior_safety_margins", "convert_to_pdfx1a",
-                    "clamp_total_ink_coverage", "build_print_ready_pdf", "build_interior_pdf_x1a", "upscale_to_size", "autofix_agents", "autofix("]
+                    "clamp_total_ink_coverage", "build_print_ready_pdf", "build_interior_pdf_x1a", "upscale_to_size", "upscale_file_for_print", "ai_superres", "autofix_agents", "autofix("]
     hit = [r for r in repair_calls if re.search(re.escape(r), src)]
     assert not hit, f"audit code references repair functions: {hit}"
 
@@ -854,3 +854,39 @@ def test_a_clean_export_still_gets_its_preflight_report(client):
     data = r.json()
     assert data["export_name"].endswith(".zip") and data["found_and_fixed_report"] is False
     assert data["report_name"] in ("The SparkPrep Certified Complete Publisher Preflight Report", "SparkPrep Preflight Report")
+
+
+# ---------------------------------------------------------------- independent checker (2026-11-23)
+def test_independent_checker_gives_a_second_opinion(client):
+    pid = _upload_cover(client)
+    events, data = _run(client, pid)
+    assert data["pipeline"]["status"] == "confirmed"
+    agree = [e for e in events if e["type"] == "criterion" and e["data"].get("id") == "independent_agrees"]
+    assert agree and agree[0]["data"]["passed"] is True
+    assert any(e["data"].get("id") == "independent:color_cmyk" and e["data"]["passed"] for e in events if e["type"] == "criterion")
+    sup = [e for e in events if e["type"] == "criterion" and e["data"].get("id") == "independent_checker_agreed"]
+    assert sup and sup[0]["data"]["passed"] is True
+
+
+def test_independent_checker_disagreeing_rolls_the_fix_back(client, monkeypatch):
+    """Main scan says fixed, but the separate checker says the colours are still not CMYK -> undo."""
+    pid = _upload_cover(client)
+    _, before = _slot(pid)
+    h = _sha(before["stored_filename"])
+    real = server.run_independent_check
+    calls = []
+
+    def contrarian(path, kind, expect, timeout_s=None):
+        result = real(path, kind, expect, timeout_s)
+        calls.append(path)
+        if len(calls) > 1:  # the after-repair check
+            for c in result["checks"]:
+                if c["id"] == "color_cmyk":
+                    c["passed"], c["evidence"] = False, "image mode RGB"
+        return result
+    monkeypatch.setattr(server, "run_independent_check", contrarian)
+    events, data = _run(client, pid)
+    assert len(calls) == 2
+    assert data["pipeline"]["status"] == "rolled_back"
+    assert 4 not in _agents_started(events)
+    _assert_untouched(pid, before, h)

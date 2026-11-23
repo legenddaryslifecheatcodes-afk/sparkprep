@@ -41,6 +41,10 @@ class Deps:
     resolve_target: Callable[[dict, Optional[str]], tuple]    # -> (stored_filename, metadata)
     scan_fn: Callable                                         # sync; used only by Agents 1 and 3
     repair_fn: Callable[[], Awaitable[dict]]                  # the existing engine; used only by Agent 2
+    # The independent checker (independent_checker/, its own code and process):
+    # async (project, stored_filename) -> its JSON answer. Run on the file
+    # before and after the repair; if it disagrees, the fix is rolled back.
+    independent_fn: Optional[Callable[[dict, str], Awaitable[dict]]] = None
     ai_review: Optional[Callable[[dict], Awaitable[Optional[dict]]]] = None
     log: Optional[Callable[[str, Exception, dict], Awaitable[None]]] = None
     # Called with the issues a run could NOT fix -- the server keeps these as "unsolved cases" to study.
@@ -68,6 +72,42 @@ async def run(deps: Deps, sink: Callable[[dict], Any]) -> dict:
         return await _run(deps, sink)
     finally:
         _RUNNING.discard(f"{deps.project_id}:{deps.slot or ''}")
+
+
+async def _independent_second_opinion(deps: Deps, diagnosis: dict, before: Optional[dict], verification: dict,
+                                      trail: Trail) -> None:
+    """Checker 3's second opinion from the independent checker (separate code,
+    separate PDF reader, separate process). It must agree with the main
+    scanner that every targeted problem is gone and that nothing it passed
+    before now fails -- otherwise the verdict becomes "rejected" and run()
+    rolls the repair back."""
+    from independent_check import compare
+
+    trail.emit("step", 3, "Asking the independent checker (separate code and process) for a second opinion…")
+    project = await deps.get_project()
+    stored_filename, _ = deps.resolve_target(project, deps.slot)
+    after = await deps.independent_fn(project, stored_filename)
+    result = compare(diagnosis.get("fixable") or [], before or {}, after)
+    for t in result["targeted"]:
+        trail.emit("criterion", 3, f"{'✓' if t['passed'] else '✗'} Independent check — {t['label']}: {t['evidence']}",
+                   id=f"independent:{t['check']}", label=f"Independent check: {t['label']}", passed=t["passed"],
+                   evidence=t["evidence"])
+    for c in result["regressions"]:
+        trail.emit("criterion", 3, f"✗ Independent check found a new problem — {c['label']}: {c['evidence']}",
+                   id=f"independent_regression:{c['id']}", label=f"Independent check: {c['label']}", passed=False,
+                   evidence=c["evidence"])
+    if result["not_judged"]:
+        trail.emit("step", 3, "Not something the independent checker measures (checked by the main scanner only): "
+                   + ", ".join(result["not_judged"]))
+    criterion = {"id": "independent_agrees", "label": "Independent checker agrees", "passed": result["agree"],
+                 "evidence": result["reason"] or "every targeted problem is gone by its own check, nothing new failing"}
+    trail.emit("criterion", 3, f"{'✓' if result['agree'] else '✗'} {criterion['label']} — {criterion['evidence']}", **criterion)
+    verification["criteria"].append(criterion)
+    verification["independent"] = {"before": before, "after": after, **result}
+    if not result["agree"]:
+        verification["verdict"] = "rejected"
+        verification["reason"] = "The independent checker disagreed: " + (result["reason"] or "")
+        trail.emit("step", 3, "REJECTED — the independent checker disagreed with the main scan. Reverting to your original state.")
 
 
 async def _take_snapshot(deps: Deps, project: dict, stored_filename: str) -> dict:
@@ -219,6 +259,9 @@ async def _run(deps: Deps, sink) -> dict:
                 await _sync_stale_compliance(deps, project, diagnosis)
         else:
             snap = await _take_snapshot(deps, project, diagnosis["file"])
+            indep_before = None
+            if deps.independent_fn:
+                indep_before = await deps.independent_fn(project, diagnosis["file"])
             repair_out = await repair(repair_fn=deps.repair_fn, diagnosis=diagnosis, trail=trail,
                                       timeout_s=(max(budget.remaining() - 20.0, 5.0) if time_limits_on() else budget.remaining()))  # limits on: leave room for Agents 3 + 4
             if repair_out["status"] != "applied":
@@ -228,6 +271,8 @@ async def _run(deps: Deps, sink) -> dict:
                 verification = await verify(get_project=deps.get_project, slot=deps.slot, resolve_target=deps.resolve_target,
                                             scan_fn=deps.scan_fn, upload_dir=deps.upload_dir, diagnosis=diagnosis,
                                             trail=trail, budget=budget)
+                if deps.independent_fn and verification["verdict"] not in ("rejected", "no_progress"):
+                    await _independent_second_opinion(deps, diagnosis, indep_before, verification, trail)
                 if verification["verdict"] in ("rejected", "no_progress"):
                     await _rollback(deps, snap, trail, "independent verification did not pass")
                     if verification["verdict"] == "no_progress":

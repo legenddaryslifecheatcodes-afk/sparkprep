@@ -21,7 +21,7 @@ from .common import (
 ROLE = "Independently verifying the fix — fresh scan, integrity and regression checks"
 
 
-def _integrity(path: Path, before_meta: dict, original_path: Path) -> list[dict]:
+def _integrity(path: Path, before_meta: dict, original_path: Path, upscale_expected: bool = False) -> list[dict]:
     """Blocking checks on the saved file itself (runs in a worker thread)."""
     checks = []
 
@@ -54,7 +54,14 @@ def _integrity(path: Path, before_meta: dict, original_path: Path) -> list[dict]
             add("opens_cleanly", "File opens and decodes", True, f"{w}×{h}px, {mode}")
             bw, bh = before_meta.get("width_px"), before_meta.get("height_px")
             same = bw is None or (abs(w - bw) <= 1 and abs(h - bh) <= 1)
-            add("size_unchanged", "Pixel dimensions unchanged", same, f"{bw}×{bh} → {w}×{h}")
+            if upscale_expected and bw and bh and not same:
+                # A low-resolution image was AI-upscaled on purpose: it may only
+                # grow, and its shape (width:height) must not change.
+                grew = w >= bw and h >= bh
+                shape_kept = abs((w / h) / (bw / bh) - 1) <= 0.01
+                add("size_proportional", "Enlarged without stretching", grew and shape_kept, f"{bw}×{bh} → {w}×{h}")
+            else:
+                add("size_unchanged", "Pixel dimensions unchanged", same, f"{bw}×{bh} → {w}×{h}")
     except Exception as e:  # noqa: BLE001 - any failure to open is the finding
         add("opens_cleanly", "File opens and decodes", False, f"{type(e).__name__}: {e}")
 
@@ -81,7 +88,8 @@ async def verify(*, get_project, slot, resolve_target, scan_fn, upload_dir, diag
 
     t_int = time.monotonic()
     try:
-        integrity = await run_bounded(_integrity, budget.cap(12.0), path, diagnosis["meta"], original_path)
+        upscale_expected = any(i.get("fix_action") == "upscale_300dpi" for i in diagnosis["fixable"])
+        integrity = await run_bounded(_integrity, budget.cap(12.0), path, diagnosis["meta"], original_path, upscale_expected)
     except StageTimeout:
         return fail("Integrity checks didn't finish in time — treating the fix as unverified.")
     integrity_seconds = round(time.monotonic() - t_int, 2)

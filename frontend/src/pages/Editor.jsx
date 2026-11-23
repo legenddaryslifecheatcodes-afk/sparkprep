@@ -177,6 +177,8 @@ export default function Editor() {
       } else {
         toast.success("Auto-Fix complete: CMYK + 300 DPI + flattened");
       }
+      // A font that wasn't in the file was embedded with a close stand-in: say so plainly.
+      if (data.ghostscript_fix?.font_warning) toast.warning(data.ghostscript_fix.font_warning, { duration: 12000 });
     } catch (e) { toast.error(fmtErr(e.response?.data?.detail)); }
     finally { setFixing(false); }
   };

@@ -17,12 +17,52 @@ whatever machine/container runs this code:
 Same category of dependency as Tesseract OCR -- add it to the Docker
 image's apt-get line alongside tesseract-ocr.
 """
+import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 GS_BINARY_CANDIDATES = ["gs", "gswin64c", "gswin32c"]
+
+# The 14 standard PDF fonts (and their usual aliases). Ghostscript ships
+# metric-compatible URW copies of these (Nimbus Sans for Helvetica, Nimbus
+# Roman for Times, ...), so when a file names one of them without embedding
+# it, Ghostscript embeds a font with the exact same character widths --
+# text keeps every line break. Any OTHER font Ghostscript can't find gets a
+# fallback with different widths, which can move text, so those are
+# reported back rather than silently counted as fixed.
+_BASE14_PREFIXES = (
+    "Helvetica", "Arial", "Times", "Courier", "Symbol", "ZapfDingbats", "Dingbats",
+)
+_LOADING_FONT_RE = re.compile(r"Loading font (\S+) \(or substitute\) from (\S+)")
+_SUBST_RE = re.compile(r"Substituting font (\S+) for (\S+)")
+
+
+def _strip_subset_tag(name: str) -> str:
+    """'ABCDEF+Garamond' -> 'Garamond' (a subset tag is 6 capitals and a plus)."""
+    return name.split("+", 1)[1] if re.match(r"^[A-Z]{6}\+", name) else name
+
+
+def font_substitutions(gs_output: str) -> List[dict]:
+    """Fonts Ghostscript had to stand in for with a DIFFERENT font while
+    embedding (not one of the 14 standard fonts, which have exact-width
+    copies). Read from Ghostscript's own console output."""
+    found = {}
+    for m in _LOADING_FONT_RE.finditer(gs_output or ""):
+        requested, source = _strip_subset_tag(m.group(1)), m.group(2)
+        base = Path(source).name
+        if requested.lstrip("/").startswith(_BASE14_PREFIXES):
+            continue
+        # Ghostscript found the real font file (its own file name matches the name asked for).
+        if requested.lower().replace("-", "") in base.lower().replace("-", ""):
+            continue
+        found[requested] = base
+    for m in _SUBST_RE.finditer(gs_output or ""):
+        substitute, requested = m.group(1).lstrip("/"), _strip_subset_tag(m.group(2).lstrip("/"))
+        if not requested.startswith(_BASE14_PREFIXES):
+            found.setdefault(requested, substitute)
+    return [{"font": k, "substitute": v} for k, v in sorted(found.items())]
 
 
 def find_ghostscript() -> Optional[str]:
@@ -117,11 +157,17 @@ def convert_to_pdfx1a(
         cmd.insert(-1, f"-sOutputICCProfile={icc_profile_path}")
     cmd.append(input_path)
 
+    # -dEmbedAllFonts/-dSubsetFonts are already on under /prepress; spelled
+    # out here because embedding every font is one of the things Auto-Fix
+    # promises, so it shouldn't depend on a preset's defaults.
+    cmd.insert(-1, "-dEmbedAllFonts=true")
+    cmd.insert(-1, "-dSubsetFonts=true")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     if result.returncode != 0:
         raise RuntimeError(f"Ghostscript PDF/X-1a conversion failed: {result.stderr[-2000:]}")
 
     return {
+        "font_substitutions": font_substitutions((result.stdout or "") + "\n" + (result.stderr or "")),
         "output_path": output_path,
         "pdf_standard": "PDF/X-1a:2001",
         "converter": "ghostscript",

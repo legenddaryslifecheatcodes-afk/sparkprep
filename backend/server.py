@@ -8,6 +8,7 @@ import base64
 import io
 import re
 import copy
+import math
 import uuid
 import asyncio
 import time
@@ -42,7 +43,7 @@ from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks, assemble_cover_pieces,
     check_total_ink_coverage, check_final_pdf_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
-    autofix_spine_text_margin,
+    autofix_spine_text_margin, stamp_pdfx_output_intent,
     TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
 )
 from audit_engine import deep_audit, audit_summary
@@ -64,7 +65,8 @@ from beta_engine import (
 )
 from series_engine import check_series_consistency
 from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
-from image_upscale_engine import upscale_to_size
+from image_upscale_engine import upscale_to_size_with_info, upscale_file_for_print
+from independent_check import run_independent_check
 import autofix_agents
 import book_pass
 import open_house
@@ -1615,13 +1617,17 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     await log_failure(db, "autofix_interior_margin", e, project_id=project_id, user_id=user["id"])
 
         # Check what actually needs fixing before touching the file --
-        # only PDF/X-1a declaration, live transparency, and layers are
-        # things Ghostscript's -dPDFX pipeline can genuinely repair (it
-        # flattens transparency and forces CMYK/PDF-X metadata in the same
-        # pass). Font embedding and missing ICC profiles aren't safely
-        # auto-fixable this way, so those are left as manual guidance.
+        # Ghostscript's -dPDFX pipeline repairs all of these in one pass: it
+        # flattens transparency and layers, converts colour to CMYK, and
+        # embeds every font (the 14 standard fonts via exact-width copies;
+        # any other font it can't find gets a stand-in, which is reported
+        # back as font_substitutions so the customer is told to check the
+        # proof instead of being told it was a perfect fix). Right after it,
+        # stamp_pdfx_output_intent() adds the PDF/X-1a flag and the
+        # project's print colour profile (SWOP / GRACoL / FOGRA39).
         structure_findings = await run_with_timeout(run_pdf_structure_audit, str(file_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
-        fixable_ids = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent"}
+        fixable_ids = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent",
+                       "fonts_not_embedded", "icc_profile_missing"}
         needs_gs_fix = any(f["id"] in fixable_ids for f in structure_findings)
 
         if needs_gs_fix:
@@ -1636,7 +1642,10 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 fixed_name = f"{project_id}_{slot or 'cover'}_gsfixed_{uuid.uuid4().hex[:6]}.pdf"
                 fixed_path = UPLOAD_DIR / fixed_name
                 try:
-                    await run_with_timeout(convert_to_pdfx1a, str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
+                    gs_out = await run_with_timeout(convert_to_pdfx1a, str(file_path), str(fixed_path), title=p.get("name", "SparkPrep Export"))
+                    color_profile = (p.get("adjustments") or {}).get("color_profile") or DEFAULT_COLOR_PROFILE
+                    profile_stamp = await run_with_timeout(stamp_pdfx_output_intent, str(fixed_path), color_profile)
+                    font_substitutions = (gs_out or {}).get("font_substitutions") or []
                     _remove_if_not_original(file_path)
                     file_path = fixed_path
                     metadata = await run_with_timeout(analyze_file, str(fixed_path))
@@ -1667,6 +1676,14 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                         "succeeded": not genuinely_unresolved,
                         "fixed_issues": [f["id"] for f in structure_findings if f["id"] in fixable_ids],
                         "still_present": still_broken,
+                        "color_profile": profile_stamp.get("color_profile"),
+                        "font_substitutions": font_substitutions,
+                        "font_warning": (
+                            "We embedded every font, but these weren't included in your file and aren't on our server, "
+                            "so a close stand-in was used: "
+                            + ", ".join(f"{x['font']} (now {x['substitute']})" for x in font_substitutions)
+                            + ". Please check your proof. For an exact match, re-export with 'embed all fonts' turned on."
+                        ) if font_substitutions else None,
                         "reason": (
                             "Ghostscript fixed some issues automatically, but couldn't resolve: "
                             + "; ".join(f["title"] for f in genuinely_unresolved)
@@ -1747,6 +1764,33 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 await log_failure(db, "autofix_spine_margin", e, project_id=project_id, user_id=user["id"],
                                    context={"slot": slot})
 
+        # Too few pixels for 300 DPI at the book's real size: AI Upscale it
+        # (super-resolution network, see ai_superres.py) before the CMYK step.
+        # Before 2026-11-23 Auto-Fix only stamped "300 DPI" on the file's
+        # label without adding pixels, so the resolution check kept failing.
+        upscale_info = None
+        try:
+            from PIL import Image
+            with Image.open(margin_source_path) as _probe:
+                src_w_px, src_h_px = _probe.size
+            dpi_now = compute_effective_dpi(src_w_px, src_h_px, final_w, final_h)
+            if dpi_now["effective_dpi"] < 300:
+                upscaled_name = f"{project_id}_{slot or 'cover'}_upscaled_{uuid.uuid4().hex[:6]}.png"
+                upscaled_path = UPLOAD_DIR / upscaled_name
+                upscale_info = await run_with_timeout(
+                    upscale_file_for_print, str(margin_source_path), str(upscaled_path),
+                    int(math.ceil(final_w * 300)), int(math.ceil(final_h * 300)),
+                )
+                upscale_info["dpi_before"] = dpi_now["effective_dpi"]
+                if margin_source_path != file_path:
+                    _remove_if_not_original(margin_source_path)
+                margin_source_path = upscaled_path
+        except HTTPException:
+            raise
+        except Exception as e:
+            upscale_info = {"method": "failed", "reason": str(e)}
+            await log_failure(db, "autofix_upscale", e, project_id=project_id, user_id=user["id"], context={"slot": slot})
+
         # Convert to CMYK TIFF, clamped to this platform's total-ink-coverage limit
         fixed_name = f"{project_id}_{slot or 'cover'}_fixed_{uuid.uuid4().hex[:6]}.tif"
         fixed_path = UPLOAD_DIR / fixed_name
@@ -1773,6 +1817,12 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         metadata["original_filename"] = current_metadata.get("original_filename")
         metadata["stored_filename"] = fixed_name
         metadata["autofixed"] = True
+        if upscale_info:
+            metadata["upscale"] = upscale_info
+            if upscale_info.get("method") == "ai":
+                metadata["ai_enhanced"] = True
+        if margin_source_path != file_path:
+            _remove_if_not_original(margin_source_path)
 
     trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
     plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
@@ -1885,6 +1935,24 @@ def _scan_slot_sync(p: dict, slot: Optional[str], stored_filename: str) -> dict:
     return {"metadata": metadata, "compliance": compliance, "structure": structure}
 
 
+def _independent_expect(p: dict, slot: Optional[str], stored_filename: str) -> tuple:
+    """What the independent checker should hold this file to: the book's real
+    size and the platform's limits. Only facts about the order go in -- never
+    the main scanner's findings -- so its verdict stays its own."""
+    is_pdf = stored_filename.lower().endswith(".pdf")
+    effective_slot = slot or "full_wrap"
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    if is_pdf and effective_slot == "interior":
+        trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+        return "pdf", {"trim_w_in": trim["w"], "trim_h_in": trim["h"], "bleed_in": plat["bleed"],
+                       "check_margins": True, "max_pages": BASIC_CHECK_MAX_PAGES}
+    final_w, final_h = _target_inches_for_slot(p, effective_slot)
+    if is_pdf:
+        return "pdf", {"trim_w_in": final_w, "trim_h_in": final_h, "bleed_in": 0, "max_pages": BASIC_CHECK_MAX_PAGES}
+    return "image", {"w_in": final_w, "h_in": final_h,
+                     "ink_limit_pct": TAC_THRESHOLD_BY_PLATFORM.get(p["platform"], TAC_THRESHOLD_DEFAULT)}
+
+
 @api_router.post("/projects/{project_id}/autofix/verified")
 async def autofix_verified(project_id: str, slot: str = None, stream: bool = True, user: dict = Depends(get_current_user)):
     """Auto-fix with independent verification and live progress.
@@ -1904,6 +1972,10 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
 
     async def get_project():
         return await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+
+    async def _run_independent_for(proj: dict, stored_filename: str) -> dict:
+        kind, expect = _independent_expect(proj, slot, stored_filename)
+        return await asyncio.to_thread(run_independent_check, str(UPLOAD_DIR / stored_filename), kind, expect)
 
     async def save_fields(fields: dict, unset: list):
         upd = {}
@@ -1926,6 +1998,7 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
         project_id=project_id, slot=slot, user_id=user["id"], upload_dir=UPLOAD_DIR,
         get_project=get_project, save_fields=save_fields, resolve_target=_resolve_slot_target,
         scan_fn=_scan_slot_sync,
+        independent_fn=_run_independent_for,
         repair_fn=lambda: autofix(project_id=project_id, slot=slot, user=user),
         ai_review=ai_review, log=log,
         on_unsolved=lambda issues: _record_unsolved_case(project_id, user["id"], "repair_bay", [slot] if slot else [],
@@ -4894,17 +4967,15 @@ def _case_wrap_geometry(p: dict) -> dict:
 
 @api_router.post("/projects/{project_id}/ai-enhance/{slot}")
 async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_current_user)):
-    """'AI Upscale' fix option for a low-DPI compliance failure: resizes the
-    existing slot image up to the exact pixel size needed to hit 300 DPI at
-    this project's trim + bleed, via LANCZOS resampling + an adaptive
-    unsharp mask (see image_upscale_engine.py) -- self-hosted, CPU, no
-    external API, and consistently under 2 seconds regardless of image
-    size. A prior Real-ESRGAN-based version added marginally more pixel
-    detail but ran 90s-4.5min per image on this service's 1-core instance
-    and regularly timed out (502/499) on real requests; this trades a
-    small amount of sharpness for actually finishing. See the compliance
-    re-check the frontend runs immediately after this to confirm it
-    actually cleared the DPI failure."""
+    """'AI Upscale' fix option for a low-DPI compliance failure: enlarges the
+    existing slot image to the exact pixel size needed for 300 DPI at this
+    project's trim + bleed. A super-resolution neural network (FSRCNN, see
+    ai_superres.py) rebuilds the detail; a Lanczos resize only does the last
+    small step to the exact size. Self-hosted on CPU, tiled so memory stays
+    small, no external API or per-image fee (~2 s per source megapixel; the
+    earlier Real-ESRGAN version timed out on this 1-core server). The
+    response's file_metadata.upscale.method says what really ran: "ai", or
+    "resample" if the network couldn't run (never labelled AI)."""
     if slot not in ALLOWED_SLOTS:
         raise HTTPException(400, f"Unknown slot: {slot}")
     p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
@@ -4936,7 +5007,7 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     try:
         with open(source_path, "rb") as f:
             source_bytes = f.read()
-        image_bytes = await run_with_timeout(upscale_to_size, source_bytes, target_w_px, target_h_px)
+        image_bytes, upscale_info = await run_with_timeout(upscale_to_size_with_info, source_bytes, target_w_px, target_h_px)
     except HTTPException:
         raise
     except Exception as e:
@@ -4947,7 +5018,7 @@ async def ai_enhance_image(project_id: str, slot: str, user: dict = Depends(get_
     metadata, compliance = _save_generated_slot_file(
         p, project_id, slot, file_id, image_bytes,
         original_filename=slot_data.get("original_filename") or "enhanced.jpg",
-        extra_meta={"ai_enhanced": True},
+        extra_meta={"ai_enhanced": upscale_info.get("method") == "ai", "upscale": upscale_info},
     )
     await _replace_slot(project_id, p, slot, metadata, compliance)
     # Part of the book's story in its preflight report: what was wrong, and that AI Upscale fixed it.
