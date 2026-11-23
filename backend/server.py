@@ -66,6 +66,7 @@ from beta_engine import (
 from series_engine import check_series_consistency
 from ai_cover_engine import build_cover_prompt, generate_cover_image, AICoverError
 from image_upscale_engine import upscale_to_size_with_info, upscale_file_for_print
+from independent_check import run_independent_check
 import autofix_agents
 import book_pass
 import open_house
@@ -1934,6 +1935,24 @@ def _scan_slot_sync(p: dict, slot: Optional[str], stored_filename: str) -> dict:
     return {"metadata": metadata, "compliance": compliance, "structure": structure}
 
 
+def _independent_expect(p: dict, slot: Optional[str], stored_filename: str) -> tuple:
+    """What the independent checker should hold this file to: the book's real
+    size and the platform's limits. Only facts about the order go in -- never
+    the main scanner's findings -- so its verdict stays its own."""
+    is_pdf = stored_filename.lower().endswith(".pdf")
+    effective_slot = slot or "full_wrap"
+    plat = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+    if is_pdf and effective_slot == "interior":
+        trim = TRIM_SIZES.get(p["trim_size"], TRIM_SIZES["6x9"])
+        return "pdf", {"trim_w_in": trim["w"], "trim_h_in": trim["h"], "bleed_in": plat["bleed"],
+                       "check_margins": True, "max_pages": BASIC_CHECK_MAX_PAGES}
+    final_w, final_h = _target_inches_for_slot(p, effective_slot)
+    if is_pdf:
+        return "pdf", {"trim_w_in": final_w, "trim_h_in": final_h, "bleed_in": 0, "max_pages": BASIC_CHECK_MAX_PAGES}
+    return "image", {"w_in": final_w, "h_in": final_h,
+                     "ink_limit_pct": TAC_THRESHOLD_BY_PLATFORM.get(p["platform"], TAC_THRESHOLD_DEFAULT)}
+
+
 @api_router.post("/projects/{project_id}/autofix/verified")
 async def autofix_verified(project_id: str, slot: str = None, stream: bool = True, user: dict = Depends(get_current_user)):
     """Auto-fix with independent verification and live progress.
@@ -1953,6 +1972,10 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
 
     async def get_project():
         return await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+
+    async def _run_independent_for(proj: dict, stored_filename: str) -> dict:
+        kind, expect = _independent_expect(proj, slot, stored_filename)
+        return await asyncio.to_thread(run_independent_check, str(UPLOAD_DIR / stored_filename), kind, expect)
 
     async def save_fields(fields: dict, unset: list):
         upd = {}
@@ -1975,6 +1998,7 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
         project_id=project_id, slot=slot, user_id=user["id"], upload_dir=UPLOAD_DIR,
         get_project=get_project, save_fields=save_fields, resolve_target=_resolve_slot_target,
         scan_fn=_scan_slot_sync,
+        independent_fn=_run_independent_for,
         repair_fn=lambda: autofix(project_id=project_id, slot=slot, user=user),
         ai_review=ai_review, log=log,
         on_unsolved=lambda issues: _record_unsolved_case(project_id, user["id"], "repair_bay", [slot] if slot else [],
