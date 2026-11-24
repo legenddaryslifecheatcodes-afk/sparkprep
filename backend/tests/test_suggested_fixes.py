@@ -148,3 +148,31 @@ def test_pdf_cover_text_is_pulled_inside_the_safe_margin_and_stays_vector(tmp_pa
     with fitz.open(str(out)) as d:
         assert abs(d[0].rect.width - 12.75 * 72) < 0.5 and abs(d[0].rect.height - 9.5 * 72) < 0.5
         assert "EDGE TITLE" in d[0].get_text()            # still real text, not a picture
+
+
+def _edge_text_cover(w, h=2775):
+    from PIL import ImageDraw, ImageFont
+    img = Image.new("RGB", (w, h), (40, 40, 110))
+    d = ImageDraw.Draw(img)
+    f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 110)
+    d.text((150, 300), "BACKCOPY", font=f, fill=(255, 255, 255))           # 0.5" in from the left
+    d.text((w - 150, 300), "TITLE", font=f, fill=(255, 255, 255), anchor="ra")  # 0.5" in from the right
+    return img
+
+
+@pytest.mark.parametrize("pct", [7.9, 8.0, -7.9, -8.0])
+def test_shape_fit_at_the_8_percent_limit_keeps_text_safe(pct, tmp_path):
+    from pdfx_validator import check_cover_safety_margins
+    h = 2775
+    w = round(h * (12.7 / 9.25) / (1 + pct / 100))
+    out, msg = sf.fit_cover_shape(_edge_text_cover(w, h), 12.7, 9.25)
+    assert abs(out.width / out.height - 12.7 / 9.25) < 0.002          # right shape
+    p = tmp_path / "out.png"
+    out.save(p)
+    found = check_cover_safety_margins(str(p), False, 12.7, 9.25, "ingramspark", bleed_in=0.125)
+    assert not [c for c in found if c.get("id") == "cover_safety_margin"], msg
+
+
+def test_shape_fit_just_over_8_percent_is_refused():
+    with pytest.raises(sf.NotOffered, match="8.1%"):
+        sf.fit_cover_shape(_edge_text_cover(round(2775 * (12.7 / 9.25) / 0.919)), 12.7, 9.25)
