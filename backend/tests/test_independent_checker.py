@@ -124,3 +124,41 @@ def test_compare_blocks_unfixed_targets_and_regressions():
     assert v["agree"] is False and v["regressions"][0]["id"] == "layers"
     # A finding it doesn't measure (cover text margins, read by OCR) is listed, not faked.
     assert compare([{"id": "cover_safety_margin"}], before, fixed)["not_judged"] == ["cover_safety_margin"]
+
+
+# ---------------------------------------------------------------- scanners compared (2026-11-24)
+def test_cross_check_compares_both_directions():
+    from independent_check import cross_check
+    s1 = [{"id": "dpi", "status": "fail"}, {"id": "colorspace", "status": "pass"},
+          {"id": "cover_size", "status": "pass"}, {"id": "cover_safety_margin", "status": "fail"}]
+    s2 = {"checks": [{"id": "opens", "label": "Opens", "passed": True, "evidence": ""},
+                     {"id": "resolution", "label": "Resolution", "passed": True, "evidence": "320 DPI"},
+                     {"id": "color_cmyk", "label": "CMYK", "passed": False, "evidence": "RGB"},
+                     {"id": "page_size", "label": "Size", "passed": True, "evidence": "ok"}]}
+    r = cross_check(s1, s2)
+    assert r["agree"] is False
+    assert {d["check"] for d in r["disagreements"]} == {"resolution", "color_cmyk"}
+    assert "cover_safety_margin" not in str(r["compared"])
+    assert r["not_judged"] == []
+
+
+def test_cross_check_never_treats_a_crash_as_agreement():
+    from independent_check import cross_check
+    assert cross_check([{"id": "dpi", "status": "fail"}], {"checks": [], "error": "boom"})["agree"] is False
+
+
+def test_majority_vote():
+    from autofix_agents.disagreements import settle
+    d1 = {"check": "resolution", "label": "Resolution", "scanner1_passed": False, "scanner2_passed": True}
+    d2 = {"check": "color_cmyk", "label": "CMYK", "scanner1_passed": True, "scanner2_passed": False}
+    # Tiebreaker agrees with Scanner 2 on both.
+    r = settle([d1, d2], {"resolution": {"verdict": "fine"}, "color_cmyk": {"verdict": "problem", "why": "looks RGB"}})
+    assert r["skip_checks"] == {"resolution"}
+    assert [o["winner"] for o in r["outcomes"]] == ["scanner2", "scanner2"]
+    assert [c["check"] for c in r["checks"]] == ["color_cmyk"]        # real problem Scanner 1 missed -> ask
+    # Tiebreaker agrees with Scanner 1 -> fix goes ahead, nothing to ask.
+    r = settle([d1], {"resolution": {"verdict": "problem"}})
+    assert r["skip_checks"] == set() and r["checks"] == [] and r["outcomes"][0]["fixed"] is True
+    # No tiebreaker -> don't fix, ask the customer.
+    r = settle([d1], {})
+    assert r["skip_checks"] == {"resolution"} and r["checks"][0]["check"] == "resolution"

@@ -11,6 +11,7 @@ import copy
 import math
 import uuid
 import asyncio
+import contextvars
 import time
 import logging
 import shutil
@@ -1526,6 +1527,16 @@ async def preview_file(project_id: str, request: Request):
         raise HTTPException(500, f"Couldn't render a preview of this file: {e}")
 
 
+# Printer rules (independent checker ids) the Auto-Fix engine must leave alone
+# for this one run, because Scanner 1 and Scanner 2 disagreed and the
+# tiebreaker didn't prove there's a problem. Set only by the verified
+# pipeline (autofix_verified); the plain endpoint always sees an empty set.
+_AUTOFIX_SKIP: contextvars.ContextVar = contextvars.ContextVar("autofix_skip", default=frozenset())
+_GS_CHECK_FOR_FINDING = {"fonts_not_embedded": "fonts", "icc_profile_missing": "color_profile",
+                         "pdfx1a_not_declared": "pdfx", "pdfx1a_missing_output_intent": "pdfx",
+                         "live_transparency_detected": "transparency", "layers_detected": "layers"}
+
+
 @api_router.post("/projects/{project_id}/autofix")
 async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_current_user)):
     """Run all auto-fixes (convert to CMYK, upscale, flatten transparency,
@@ -1594,8 +1605,11 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                 check_interior_safety_margins,
                 str(file_path), plat_name, trim["w"], trim["h"], max_pages=BASIC_CHECK_MAX_PAGES,
             )
+            _skip = _AUTOFIX_SKIP.get()
             needs_geometry_fix = any(
-                f["id"] in ("interior_page_size_mismatch", "interior_safety_margin") for f in margin_findings
+                (f["id"] == "interior_page_size_mismatch" and "page_size" not in _skip)
+                or (f["id"] == "interior_safety_margin" and "margins" not in _skip)
+                for f in margin_findings
             )
             if needs_geometry_fix:
                 geom_fixed_name = f"{project_id}_interior_marginfixed_{uuid.uuid4().hex[:6]}.pdf"
@@ -1628,7 +1642,8 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
         structure_findings = await run_with_timeout(run_pdf_structure_audit, str(file_path), PLATFORMS.get(p["platform"], {}).get("name", "your distributor"), max_pages=BASIC_CHECK_MAX_PAGES)
         fixable_ids = {"pdfx1a_not_declared", "live_transparency_detected", "layers_detected", "pdfx1a_missing_output_intent",
                        "fonts_not_embedded", "icc_profile_missing"}
-        needs_gs_fix = any(f["id"] in fixable_ids for f in structure_findings)
+        needs_gs_fix = any(f["id"] in fixable_ids and _GS_CHECK_FOR_FINDING.get(f["id"]) not in _AUTOFIX_SKIP.get()
+                           for f in structure_findings)
 
         if needs_gs_fix:
             if not find_ghostscript():
@@ -1774,7 +1789,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             with Image.open(margin_source_path) as _probe:
                 src_w_px, src_h_px = _probe.size
             dpi_now = compute_effective_dpi(src_w_px, src_h_px, final_w, final_h)
-            if dpi_now["effective_dpi"] < 300:
+            if dpi_now["effective_dpi"] < 300 and "resolution" not in _AUTOFIX_SKIP.get():
                 upscaled_name = f"{project_id}_{slot or 'cover'}_upscaled_{uuid.uuid4().hex[:6]}.png"
                 upscaled_path = UPLOAD_DIR / upscaled_name
                 upscale_info = await run_with_timeout(
@@ -1953,6 +1968,27 @@ def _independent_expect(p: dict, slot: Optional[str], stored_filename: str) -> t
                      "ink_limit_pct": TAC_THRESHOLD_BY_PLATFORM.get(p["platform"], TAC_THRESHOLD_DEFAULT)}
 
 
+def _tiebreak_picture(fp: Path, max_px: int = 1400) -> Optional[bytes]:
+    """A small PNG of the file (page 1 of a PDF) for the tiebreaker to look at."""
+    try:
+        from PIL import Image
+        if fp.suffix.lower() == ".pdf":
+            import fitz
+            with fitz.open(str(fp)) as doc:
+                img = Image.open(io.BytesIO(doc[0].get_pixmap(dpi=100).tobytes("png")))
+                img.load()
+        else:
+            img = Image.open(fp)
+            img.load()
+        img = img.convert("RGB")
+        img.thumbnail((max_px, max_px))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001 - no picture: the tiebreaker works from the evidence alone
+        return None
+
+
 @api_router.post("/projects/{project_id}/autofix/verified")
 async def autofix_verified(project_id: str, slot: str = None, stream: bool = True, user: dict = Depends(get_current_user)):
     """Auto-fix with independent verification and live progress.
@@ -1989,6 +2025,28 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
     async def log(stage, exc, context):
         await log_failure(db, stage, exc, project_id=project_id, user_id=user["id"], context=context)
 
+    async def repair_fn():
+        # Leave alone any rule the two scanners disagreed on and the tiebreaker didn't prove.
+        token = _AUTOFIX_SKIP.set(frozenset(deps.skip_checks))
+        try:
+            return await autofix(project_id=project_id, slot=slot, user=user)
+        finally:
+            _AUTOFIX_SKIP.reset(token)
+
+    async def record_disagreement(row: dict):
+        await db.scanner_disagreements.insert_one({
+            **row, "project_id": project_id, "user_id": user["id"], "platform": p.get("platform"),
+            "at": datetime.now(timezone.utc).isoformat()})
+
+    tiebreak_fn = None
+    if ANTHROPIC_API_KEY:
+        async def tiebreak_fn(disputes):
+            proj = await get_project()
+            stored_filename, _ = _resolve_slot_target(proj, slot)
+            picture = await asyncio.to_thread(_tiebreak_picture, UPLOAD_DIR / stored_filename)
+            return await autofix_agents.claude_tiebreak(disputes, picture, api_key=ANTHROPIC_API_KEY,
+                                                        model=SUPERVISOR_MODEL)
+
     ai_review = None
     if ANTHROPIC_API_KEY:
         async def ai_review(summary):
@@ -1999,8 +2057,10 @@ async def autofix_verified(project_id: str, slot: str = None, stream: bool = Tru
         get_project=get_project, save_fields=save_fields, resolve_target=_resolve_slot_target,
         scan_fn=_scan_slot_sync,
         independent_fn=_run_independent_for,
-        repair_fn=lambda: autofix(project_id=project_id, slot=slot, user=user),
+        repair_fn=repair_fn,
         ai_review=ai_review, log=log,
+        tiebreak_fn=tiebreak_fn, record_disagreement=record_disagreement,
+        picture_url=(f"/api/projects/{project_id}/slot/{slot}/preview" if slot else f"/api/projects/{project_id}/preview"),
         on_unsolved=lambda issues: _record_unsolved_case(project_id, user["id"], "repair_bay", [slot] if slot else [],
                                                          [{"title": i.get("label") or i.get("id"), "why": i.get("message", ""),
                                                            "id": i.get("id")} for i in issues]),
@@ -6139,6 +6199,24 @@ async def admin_unsolved_cases(include_solved: bool = False, limit: int = 200, _
         c.pop("_id", None)
         items.append(c)
     return {"cases": items, "count": len(items)}
+
+
+@api_router.get("/admin/scanner-disagreements")
+async def admin_scanner_disagreements(limit: int = 200, _: dict = Depends(require_admin)):
+    """Every time Scanner 1 and Scanner 2 disagreed about a file, newest first,
+    plus a tally of which scanner the tiebreaker sided with per printer rule --
+    so the scanner that keeps getting a rule wrong can be fixed."""
+    items, tally = [], {}
+    async for d in db.scanner_disagreements.find({}).sort("at", -1).limit(max(1, min(500, limit))):
+        d.pop("_id", None)
+        items.append(d)
+        for o in d.get("outcomes") or []:
+            t = tally.setdefault(o["check"], {"disagreements": 0, "scanner1_right": 0, "scanner2_right": 0, "undecided": 0})
+            t["disagreements"] += 1
+            key = {"scanner1": "scanner1_right", "scanner2": "scanner2_right"}.get(o.get("winner"), "undecided")
+            t[key] += 1
+    glitches = sum(1 for d in items if d.get("resolved_by") == "rescan")
+    return {"disagreements": items, "count": len(items), "fixed_by_rescan": glitches, "by_rule": tally}
 
 
 @api_router.post("/admin/unsolved-cases/{case_id}/solved")

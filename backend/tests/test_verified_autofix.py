@@ -890,3 +890,160 @@ def test_independent_checker_disagreeing_rolls_the_fix_back(client, monkeypatch)
     assert data["pipeline"]["status"] == "rolled_back"
     assert 4 not in _agents_started(events)
     _assert_untouched(pid, before, h)
+
+
+# ---------------------------------------------------------------- trey's scanner order (2026-11-24)
+# 1. Scanner 1 scans. 2. Scanner 2 scans the ORIGINAL on its own, then the two
+# are compared. Disagreement -> rescan once, fix what's agreed, tiebreaker,
+# ask the customer, log it. 3. Repair + Supervisor. 4. Final Scanner 1 rescan.
+def _contrarian_before(monkeypatch, check_id, passed, evidence, times=None, every_file=False):
+    """Make Scanner 2's scan of the ORIGINAL file say `passed` for one rule
+    (and of the fixed file too, with every_file=True -- a scanner that
+    consistently sees it differently). `times` limits how many scans are bent."""
+    real = server.run_independent_check
+    seen = {"n": 0, "paths": set()}
+
+    def fake(path, kind, expect, timeout_s=None):
+        result = real(path, kind, expect, timeout_s)
+        original = not seen["paths"] or path in seen["paths"] or every_file
+        if original:
+            seen["paths"].add(path)
+            seen["n"] += 1
+            if times is None or seen["n"] <= times:
+                for c in result["checks"]:
+                    if c["id"] == check_id:
+                        c["passed"], c["evidence"] = passed, evidence
+        return result
+    monkeypatch.setattr(server, "run_independent_check", fake)
+    return seen
+
+
+def _disagreements():
+    async def go():
+        return [d async for d in server.db.scanner_disagreements.find({})]
+    return asyncio.run(go())
+
+
+def test_scanner2_scans_the_original_and_both_agree(client):
+    pid = _upload_cover(client)
+    events, data = _run(client, pid)
+    assert data["pipeline"]["status"] == "confirmed"
+    first = [e for e in events if e["type"] == "criterion" and e["data"].get("id") == "scanners_agree"]
+    assert first and first[0]["data"]["passed"] is True and first[0]["agent"] == 1
+    # Scanner 2's first look comes BEFORE the repair starts.
+    i_agree = events.index(first[0])
+    i_repair = next(i for i, e in enumerate(events) if e["type"] == "agent_start" and e["agent"] == 2)
+    assert i_agree < i_repair
+    final = [e for e in events if e["type"] == "criterion" and e["data"].get("id") == "scanner1_final_pass"]
+    assert final and final[0]["data"]["passed"] is True
+    i_sup = next(i for i, e in enumerate(events) if e["type"] == "agent_start" and e["agent"] == 4)
+    assert events.index(final[0]) > i_sup                     # final rescan comes after the supervisor
+    assert not data["pipeline"]["customer_checks"]
+
+
+def test_disagreement_that_vanishes_on_rescan_is_logged_as_a_glitch(client, monkeypatch):
+    n0 = len(_disagreements())
+    pid = _upload_cover(client)
+    _contrarian_before(monkeypatch, "color_cmyk", True, "image mode CMYK", times=1)
+    events, data = _run(client, pid)
+    assert data["pipeline"]["status"] == "confirmed"
+    assert any(e["data"].get("id") == "scanners_agree_rescan" and e["data"]["passed"] for e in events if e["type"] == "criterion")
+    rows = _disagreements()[n0:]
+    assert len(rows) == 1 and rows[0]["resolved_by"] == "rescan" and rows[0]["project_id"] == pid
+
+
+def test_agreed_problems_still_get_fixed_and_unsettled_one_goes_to_the_customer(client, monkeypatch):
+    """Scanner 1: low resolution + RGB. Scanner 2: resolution is fine. No tiebreaker
+    -> the RGB problem (agreed) is fixed, resolution is NOT upscaled, the customer is asked."""
+    n0 = len(_disagreements())
+    pid = _upload_cover(client, _rgb_cover(1270, 925))
+    _contrarian_before(monkeypatch, "resolution", True, "300 DPI at 12.7\"×9.25\"", every_file=True)
+    events, data = _run(client, pid)
+    pl = data["pipeline"]
+    assert pl["status"] == "partial", pl
+    assert "colorspace" in pl["resolved"]
+    _, now = _slot(pid)
+    assert "upscale" not in now                                   # the disputed fix was not applied
+    checks = [e for e in events if e["type"] == "check_this"]
+    assert len(checks) == 1 and checks[0]["data"]["check"] == "resolution"
+    assert checks[0]["data"]["picture"].endswith("/slot/full_wrap/preview")
+    assert "Please check" in checks[0]["message"]
+    assert pl["customer_checks"] and "couldn't agree" in pl["message"]
+    rows = _disagreements()[n0:]
+    assert rows[-1]["resolved_by"] == "tiebreak" and rows[-1]["outcomes"][0]["winner"] is None
+
+
+def test_tiebreaker_majority_decides(client, monkeypatch):
+    """Tiebreaker sides with Scanner 1 -> resolution IS fixed (AI upscale runs)."""
+    n0 = len(_disagreements())
+    pid = _upload_cover(client, _rgb_cover(1270, 925))
+    _contrarian_before(monkeypatch, "resolution", True, "300 DPI")
+    async def tiebreak(disputes, picture, **kw):
+        assert picture and picture[:8] == b"\x89PNG\r\n\x1a\n"
+        return {d["check"]: {"verdict": "problem", "why": "the picture is soft"} for d in disputes}
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(autofix_agents, "claude_tiebreak", tiebreak)
+    monkeypatch.setattr(autofix_agents, "anthropic_review", lambda *a, **k: asyncio.sleep(0, result=None))
+    events, data = _run(client, pid)
+    assert data["pipeline"]["status"] == "confirmed", data["pipeline"]
+    _, now = _slot(pid)
+    assert now.get("upscale")
+    assert not [e for e in events if e["type"] == "check_this"]
+    row = _disagreements()[n0:][-1]
+    assert row["outcomes"][0]["winner"] == "scanner1" and row["outcomes"][0]["fixed"] is True
+    # The admin view's tally (called directly: who counts as admin depends on env other test modules change).
+    view = asyncio.run(server.admin_scanner_disagreements(limit=500, _={}))
+    assert view["by_rule"]["resolution"]["scanner1_right"] >= 1
+
+
+def test_nothing_agreed_means_nothing_changed(client, monkeypatch):
+    pid = _upload_cover(client, _rgb_cover(1270, 925))
+    _, before = _slot(pid)
+    h = _sha(before["stored_filename"])
+    real = server.run_independent_check
+
+    def fake(path, kind, expect, timeout_s=None):
+        result = real(path, kind, expect, timeout_s)
+        for c in result["checks"]:
+            if c["id"] in ("resolution", "color_cmyk"):
+                c["passed"] = True
+        return result
+    monkeypatch.setattr(server, "run_independent_check", fake)
+    events, data = _run(client, pid)
+    assert data["pipeline"]["status"] == "needs_check"
+    assert 2 not in _agents_started(events)
+    assert len(data["pipeline"]["customer_checks"]) == 2
+    _assert_untouched(pid, before, h)
+
+
+def test_scanner2_crash_before_the_fix_means_no_fix(client, monkeypatch):
+    pid = _upload_cover(client)
+    _, before = _slot(pid)
+    h = _sha(before["stored_filename"])
+    monkeypatch.setattr(server, "run_independent_check",
+                        lambda *a, **k: {"checks": [], "ok": False, "error": "the independent checker ran out of time"})
+    events, data = _run(client, pid)
+    assert data["pipeline"]["status"] == "flagged"
+    assert 2 not in _agents_started(events)
+    _assert_untouched(pid, before, h)
+
+
+def test_final_scanner1_rescan_failing_undoes_the_fix():
+    from autofix_agents.pipeline import _scanner1_final_pass
+
+    class D:
+        slot = None
+        async def get_project(self):
+            return {}
+        def resolve_target(self, p, s):
+            return "f.tif", {}
+        def scan_fn(self, *a):
+            return {"compliance": [{"id": "colorspace", "label": "Colour", "status": "fail", "message": "RGB"},
+                                   {"id": "cover_size", "label": "Size", "status": "fail", "message": "wrong"}]}
+    events = []
+    trail = common.Trail(events.append)
+    diag = {"issues": [{"id": "colorspace", "status": "fail", "informational": False},
+                       {"id": "cover_size", "status": "pass", "informational": False}],
+            "fixable": [{"id": "colorspace", "label": "Colour"}]}
+    out = asyncio.run(_scanner1_final_pass(D(), diag, {"remaining": []}, trail, common.Budget(30), require_clean=True))
+    assert out["passed"] is False and out["remaining"] == ["colorspace"] and out["new"] == ["cover_size"]
