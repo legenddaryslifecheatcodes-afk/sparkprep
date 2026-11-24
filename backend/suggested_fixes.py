@@ -113,44 +113,83 @@ def _ocr_boxes(img: Image.Image, scale: float = 1.0) -> list:
 
 
 # ------------------------------------------------------------------ the fixes
+SAFE_FROM_FILE_EDGE_IN = 0.375  # 0.125" bleed + 0.25" safe zone: text must stay this far in from the file's edge
+
+
+def _extend(img: Image.Image, left: int, right: int, top: int, bottom: int) -> Image.Image:
+    """Grow the picture by mirroring its outer edges, softened so the new strips read as background."""
+    arr = np.asarray(img)
+    padded = np.pad(arr, ((top, bottom), (left, right), (0, 0)), mode="reflect")
+    ext = Image.fromarray(padded)
+    blur = ext.filter(ImageFilter.GaussianBlur(radius=max(2, ext.height // 300)))
+    mask = np.zeros((ext.height, ext.width), dtype=np.uint8)
+    if left:
+        mask[:, :left] = 255
+    if right:
+        mask[:, ext.width - right:] = 255
+    if top:
+        mask[:top, :] = 255
+    if bottom:
+        mask[ext.height - bottom:, :] = 255
+    ext.paste(blur, (0, 0), Image.fromarray(mask))
+    return ext
+
+
+def _nearest_text_px(img: Image.Image) -> Optional[int]:
+    """How close (in pixels) the nearest readable word comes to the left or right edge. None if there's no text."""
+    words = [b for b in _ocr_boxes(img, min(1.0, 2400 / max(img.size)))
+             if sum(ch.isalnum() for ch in b[0]) >= 2]
+    if not words:
+        return None
+    return min(min(x0, img.width - x1) for _, x0, _, x1, _ in words)
+
+
 def fit_cover_shape(img: Image.Image, target_w_in: float, target_h_in: float) -> tuple[Image.Image, str]:
-    """No squashing: at most a 2% stretch, then extend (or trim) the outer edges for the rest."""
+    """No squashing and no cut-off text: at most a 2% stretch, then extend the edges (cover too narrow), or trim
+    only plain background off the sides and add background top and bottom for the rest (cover too wide)."""
     w, h = img.size
     need = target_w_in / target_h_in
     have = w / h
     off = need / have - 1.0                      # + = cover needs to be wider, - = narrower
     if abs(off) < 1e-4:
         raise NotOffered("This cover is already the right shape.")
-    if abs(off) > MAX_SHAPE_FIX:
-        raise NotOffered(f"This cover is {abs(off) * 100:.0f}% off the right shape. Fixing that much would show, "
-                         "so it needs to be rebuilt at the right size.")
+    if abs(off) > MAX_SHAPE_FIX + 1e-9:
+        raise NotOffered(f"This cover is {abs(off) * 100:.1f}% off the right shape. SparkPrep fixes up to "
+                         f"{MAX_SHAPE_FIX * 100:.0f}%. Fixing more would show, so it needs to be rebuilt at the right size.")
     stretch = max(-MAX_INVISIBLE_STRETCH, min(MAX_INVISIBLE_STRETCH, off))
     new_w = max(1, round(w * (1 + stretch)))
     out = img.resize((new_w, h), Image.LANCZOS)
     final_w = round(h * need)
     if final_w > new_w:                          # still too narrow: extend both outer edges
         add = final_w - new_w
-        left, right = add // 2, add - add // 2
-        arr = np.asarray(out)
-        padded = np.pad(arr, ((0, 0), (left, right), (0, 0)), mode="reflect")
-        ext = Image.fromarray(padded)
-        # Soften only the new strips so a mirrored edge reads as background, not a copy.
-        blur = ext.filter(ImageFilter.GaussianBlur(radius=max(2, h // 300)))
-        mask = np.zeros((h, final_w), dtype=np.uint8)
-        mask[:, :left] = 255
-        mask[:, final_w - right:] = 255
-        ext.paste(blur, (0, 0), Image.fromarray(mask))
-        out = ext
+        out = _extend(out, add // 2, add - add // 2, 0, 0)
         how = f"stretched {abs(stretch) * 100:.1f}% (not visible) and extended the left and right edges by {add} pixels"
-    elif final_w < new_w:                        # still too wide: trim the outer edges evenly
+    elif final_w < new_w:                        # still too wide: never cut into text
         cut = new_w - final_w
-        left = cut // 2
-        out = out.crop((left, 0, left + final_w, h))
-        how = f"narrowed {abs(stretch) * 100:.1f}% (not visible) and trimmed {cut} pixels evenly off the outer edges"
+        nearest = _nearest_text_px(out)
+        if nearest is None:
+            per_side = cut // 2
+        else:
+            # The finished picture is (new_w - 2*t) pixels across for target_w_in inches, so the safe distance
+            # shrinks with it: keep nearest - t >= k * (new_w - 2*t), with k = safe inches per inch of width.
+            k = (SAFE_FROM_FILE_EDGE_IN + 0.02) / target_w_in
+            per_side = max(0, min(cut // 2, int((nearest - k * new_w) / (1 - 2 * k))))
+        if per_side:
+            out = out.crop((per_side, 0, new_w - per_side, h))
+        rest_w = out.width
+        if rest_w > final_w:                     # the rest: add background top and bottom, keep proportions
+            need_h = round(rest_w / need)
+            add = need_h - h
+            out = _extend(out, 0, 0, add // 2, add - add // 2)
+            how = (f"narrowed {abs(stretch) * 100:.1f}% (not visible), trimmed {2 * per_side} pixels of plain "
+                   f"background off the sides and extended the top and bottom by {add} pixels, so no text was cut")
+        else:
+            how = (f"narrowed {abs(stretch) * 100:.1f}% (not visible) and trimmed {2 * per_side} pixels of plain "
+                   "background evenly off the outer edges")
     else:
         how = f"adjusted the shape by {abs(stretch) * 100:.1f}% (not visible)"
     return out, (f"Your cover was {abs(off) * 100:.1f}% off the right shape. SparkPrep {how}, "
-                 "so nothing on it is squashed. Please check the left and right edges.")
+                 "so nothing on it is squashed. Please check the edges.")
 
 
 def remove_template_guides(img: Image.Image) -> tuple[Image.Image, str]:
