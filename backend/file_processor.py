@@ -253,6 +253,54 @@ def autofix_cover_safe_margin(input_path: str, output_path: str, worst_margin_in
     }
 
 
+def autofix_pdf_cover_safe_margin(input_path: str, output_path: str, worst_margin_in: float,
+                                   target_margin_in: float = 0.27, background_dpi: int = 300) -> dict:
+    """The PDF-cover version of autofix_cover_safe_margin (2026-11-24).
+
+    Same idea -- shrink the whole cover a little about its centre so text near
+    the trim moves inside the safe margin, then fill the thin strip left at the
+    outer edge -- but without turning the cover's text into pixels:
+      * underneath: a 300 DPI picture of the SHRUNK page, its edge pixels
+        extended out to the full page (fills only the thin outer strip),
+      * on top: the original page itself, shrunk and centred, still vector --
+        every font and line stays sharp and embedded.
+    The page size never changes.
+    """
+    import fitz
+    src = fitz.open(input_path)
+    try:
+        page = src[0]
+        w_pt, h_pt = page.rect.width, page.rect.height
+        half_short_in = min(w_pt, h_pt) / 72.0 / 2.0
+        denom = half_short_in - worst_margin_in
+        scale = (half_short_in - target_margin_in) / denom if denom > 1e-6 else 1.0
+        scale = float(np.clip(scale, 0.90, 1.0))
+
+        pix = page.get_pixmap(dpi=background_dpi, colorspace=fitz.csRGB, alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        w, h = img.size
+        new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+        arr = np.array(img.resize((new_w, new_h), Image.LANCZOS))
+        pl, pt_ = (w - new_w) // 2, (h - new_h) // 2
+        arr = np.pad(arr, ((pt_, h - new_h - pt_), (pl, w - new_w - pl), (0, 0)), mode="edge")
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+
+        out = fitz.open()
+        new_page = out.new_page(width=w_pt, height=h_pt)
+        new_page.insert_image(new_page.rect, stream=buf.getvalue())
+        sw, sh = w_pt * scale, h_pt * scale
+        target = fitz.Rect((w_pt - sw) / 2, (h_pt - sh) / 2, (w_pt + sw) / 2, (h_pt + sh) / 2)
+        new_page.show_pdf_page(target, src, 0)
+        out.save(output_path, deflate=True, garbage=3)
+        out.close()
+    finally:
+        src.close()
+    return {"output_path": output_path, "scale_factor": round(scale, 4),
+            "worst_margin_before_in": round(worst_margin_in, 3), "target_margin_in": target_margin_in,
+            "vector_kept": True}
+
+
 def autofix_spine_text_margin(input_path: str, output_path: str, worst_margin_in: float,
                               img_w_in: float, img_h_in: float,
                               spine_x_in: float, spine_w_in: float,

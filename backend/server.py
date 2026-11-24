@@ -44,6 +44,7 @@ from file_processor import (
     analyze_file, compute_effective_dpi, convert_to_cmyk,
     build_print_ready_pdf, build_interior_pdf_x1a, run_compliance_checks, assemble_cover_pieces,
     check_total_ink_coverage, check_final_pdf_ink_coverage, autofix_cover_safe_margin, autofix_interior_safety_margins,
+    autofix_pdf_cover_safe_margin,
     autofix_spine_text_margin, stamp_pdfx_output_intent,
     TAC_THRESHOLD_BY_PLATFORM, TAC_THRESHOLD_DEFAULT,
 )
@@ -1587,6 +1588,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
 
     ghostscript_result = None
     interior_margin_fix = None
+    pdf_cover_margin_fix = None
     if current_metadata.get("is_pdf"):
         # Interior manuscripts get a geometry pass FIRST, before the
         # Ghostscript/PDF-X pass below -- a wrong page size or a too-tight
@@ -1630,6 +1632,41 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                     interior_margin_fix = {"attempted": True, "succeeded": False, "reason": str(e)}
                     await log_failure(db, "autofix_interior_margin", e, project_id=project_id, user_id=user["id"])
 
+        # A PDF COVER with text too close to the trim (2026-11-24): shrink it a
+        # little about its centre, keeping the text vector, and fill the thin
+        # outer strip -- see autofix_pdf_cover_safe_margin. Ghostscript's pass
+        # below then runs on the result so it still leaves as PDF/X-1a.
+        if slot != "interior" and "margins" not in _AUTOFIX_SKIP.get():
+            plat_c = PLATFORMS.get(p["platform"], PLATFORMS["kdp"])
+            eff = slot or "full_wrap"
+            fw, fh = _target_inches_for_slot(p, eff)
+            mbleed = _cover_bleed_for_slot(p, eff) or 0.0
+            gkw = {}
+            if eff == "full_wrap":
+                g = _full_wrap_geometry(p)
+                gkw = {"spine_x_in": g["spine_x"], "spine_w_in": g["spine_width"],
+                       "page_count": p.get("page_count"), "binding": p.get("binding", "paperback")}
+            cover_findings = await run_with_timeout(
+                check_cover_safety_margins, str(file_path), True, fw, fh, plat_c.get("name", "your distributor"),
+                bleed_in=mbleed, **gkw)
+            outer = next((f for f in cover_findings if f["id"] == "cover_safety_margin"), None)
+            if outer:
+                mf_name = f"{project_id}_{slot or 'cover'}_marginfixed_{uuid.uuid4().hex[:6]}.pdf"
+                mf_path = UPLOAD_DIR / mf_name
+                try:
+                    pdf_cover_margin_fix = await run_with_timeout(
+                        autofix_pdf_cover_safe_margin, str(file_path), str(mf_path),
+                        outer["pinpoint"]["margin_in"] + mbleed, 0.27 + mbleed)
+                    _remove_if_not_original(file_path)
+                    file_path = mf_path
+                    stored_filename = mf_name
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    pdf_cover_margin_fix = {"attempted": True, "succeeded": False, "reason": str(e)}
+                    await log_failure(db, "autofix_pdf_cover_margin", e, project_id=project_id, user_id=user["id"],
+                                      context={"slot": slot})
+
         # Check what actually needs fixing before touching the file --
         # Ghostscript's -dPDFX pipeline repairs all of these in one pass: it
         # flattens transparency and layers, converts colour to CMYK, and
@@ -1644,6 +1681,8 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
                        "fonts_not_embedded", "icc_profile_missing"}
         needs_gs_fix = any(f["id"] in fixable_ids and _GS_CHECK_FOR_FINDING.get(f["id"]) not in _AUTOFIX_SKIP.get()
                            for f in structure_findings)
+        if pdf_cover_margin_fix and pdf_cover_margin_fix.get("vector_kept"):
+            needs_gs_fix = True   # the rebuilt page goes through the same PDF/X-1a pass
 
         if needs_gs_fix:
             if not find_ghostscript():
@@ -1897,7 +1936,7 @@ async def autofix(project_id: str, slot: str = None, user: dict = Depends(get_cu
             existing_slots["full_wrap"] = {**metadata, "compliance": compliance}
             update["slots"] = existing_slots
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
-    return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "interior_margin_fix": interior_margin_fix, "check_type": "basic"}
+    return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "ghostscript_fix": ghostscript_result, "interior_margin_fix": interior_margin_fix, "pdf_cover_margin_fix": pdf_cover_margin_fix, "check_type": "basic"}
 
 
 # ---- Verified auto-fix (four-agent pipeline) ----
@@ -4684,6 +4723,155 @@ async def _replace_slot(project_id: str, p: dict, slot: str, metadata: dict, com
         update["file_metadata"] = metadata
         update["compliance"] = compliance
     await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": update})
+
+
+# ---- Suggested fixes (2026-11-24, trey): SparkPrep's best attempt at problems that normally need the author's
+# judgement. The customer sees before/after and keeps it or declines (and can upload their own). See suggested_fixes.py.
+class SuggestedFixIn(BaseModel):
+    slot: str = "full_wrap"
+    issue_id: str
+
+
+def _cover_geometry_for(p: dict, slot: str) -> dict:
+    fw, fh = _target_inches_for_slot(p, slot)
+    g = _full_wrap_geometry(p) if slot == "full_wrap" else {}
+    return {"final_w": fw, "final_h": fh, "spine_x": g.get("spine_x"), "spine_w": g.get("spine_width"),
+            "back_x": g.get("back_x", 0.0), "panel_w": g.get("panel_width")}
+
+
+def _make_suggested_fix(p: dict, slot: str, issue_id: str, src: Path, out_base: str) -> dict:
+    import suggested_fixes as sf
+    img, info = sf.load(str(src))
+    geo = _cover_geometry_for(p, slot)
+    # Inches across the picture: a PDF knows its own size; a picture is taken to be the book's size.
+    img_w_in = info.get("w_in") or geo["final_w"]
+    size_in = None
+    if issue_id == "cover_size":
+        out, summary = sf.fit_cover_shape(img, geo["final_w"], geo["final_h"])
+        size_in = (geo["final_w"], geo["final_h"])
+    elif issue_id == "cover_template_leftovers":
+        out, summary = sf.remove_template_guides(img)
+    elif issue_id == "cover_spine_text_forbidden":
+        if not geo["spine_x"] or not geo["spine_w"]:
+            raise sf.NotOffered("This fix needs a full cover (back, spine and front in one file).")
+        scale = img_w_in / geo["final_w"] if geo["final_w"] else 1.0
+        out, summary = sf.clear_spine_text(img, img_w_in, geo["spine_x"] * scale, geo["spine_w"] * scale)
+    elif issue_id == "cover_isbn_mismatch":
+        out, summary = sf.replace_barcode(img, p.get("isbn") or "", img_w_in)
+    else:
+        raise sf.NotOffered("SparkPrep doesn't have a suggested fix for this one yet.")
+    path = sf.save(out, info, out_base, size_in)
+    if info["pdf"]:
+        summary += " (Your PDF cover was turned into a 400 DPI picture for this fix.)"
+    return {"path": path, "summary": summary}
+
+
+@api_router.post("/projects/{project_id}/suggested-fix")
+async def create_suggested_fix(project_id: str, payload: SuggestedFixIn, user: dict = Depends(get_current_user)):
+    import suggested_fixes as sf
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    await _require_product(p, user, "Suggested fixes")
+    if payload.issue_id not in sf.SUPPORTED:
+        raise HTTPException(400, "SparkPrep doesn't have a suggested fix for this one yet.")
+    stored_filename, _ = _resolve_slot_target(p, payload.slot)
+    fix_id = uuid.uuid4().hex[:10]
+    out_base = str(UPLOAD_DIR / f"{project_id}_{payload.slot}_suggested_{fix_id}")
+    try:
+        made = await run_with_timeout(_make_suggested_fix, p, payload.slot, payload.issue_id,
+                                      UPLOAD_DIR / stored_filename, out_base)
+    except sf.NotOffered as e:
+        return {"offered": False, "issue_id": payload.issue_id, "reason": str(e)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await log_failure(db, "suggested_fix", e, project_id=project_id, user_id=user["id"],
+                          context={"slot": payload.slot, "issue_id": payload.issue_id})
+        return {"offered": False, "issue_id": payload.issue_id,
+                "reason": "SparkPrep couldn't make a suggested fix for this file. You can upload your own fix instead."}
+    # Only one pending suggestion per slot: drop any older one.
+    pending = dict(p.get("suggested_fixes") or {})
+    for old_id, old in list(pending.items()):
+        if old.get("slot") == payload.slot:
+            try: os.remove(UPLOAD_DIR / old["candidate"])
+            except OSError: pass
+            pending.pop(old_id, None)
+    pending[fix_id] = {"slot": payload.slot, "issue_id": payload.issue_id, "candidate": Path(made["path"]).name,
+                       "based_on": stored_filename, "summary": made["summary"],
+                       "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"suggested_fixes": pending}})
+    base = f"/api/projects/{project_id}/suggested-fix/{fix_id}/preview"
+    return {"offered": True, "fix_id": fix_id, "issue_id": payload.issue_id, "summary": made["summary"],
+            "before_url": base + "?which=before", "after_url": base + "?which=after"}
+
+
+@api_router.get("/projects/{project_id}/suggested-fix/{fix_id}/preview")
+async def suggested_fix_preview(project_id: str, fix_id: str, request: Request, which: str = "after"):
+    token = request.cookies.get("access_token") or request.query_params.get("token") \
+        or (request.headers.get("authorization") or "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        user_id = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])["sub"]
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user_id})
+    fix = ((p or {}).get("suggested_fixes") or {}).get(fix_id)
+    if not fix:
+        raise HTTPException(404, "This suggested fix is gone. Ask for a new one.")
+    name = fix["candidate"] if which == "after" else fix["based_on"]
+    fp = UPLOAD_DIR / name
+    if not fp.exists():
+        raise HTTPException(404, "File missing")
+    return _render_web_preview(fp, 1600)
+
+
+@api_router.post("/projects/{project_id}/suggested-fix/{fix_id}/accept")
+async def accept_suggested_fix(project_id: str, fix_id: str, user: dict = Depends(get_current_user)):
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    await _require_product(p, user, "Suggested fixes")
+    pending = dict(p.get("suggested_fixes") or {})
+    fix = pending.pop(fix_id, None)
+    if not fix:
+        raise HTTPException(404, "This suggested fix is gone. Ask for a new one.")
+    slot = fix["slot"]
+    current, cur_meta = _resolve_slot_target(p, slot)
+    if current != fix["based_on"]:
+        try: os.remove(UPLOAD_DIR / fix["candidate"])
+        except OSError: pass
+        await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"suggested_fixes": pending}})
+        raise HTTPException(409, "Your file changed since this fix was made. Ask for a new suggested fix.")
+    path = UPLOAD_DIR / fix["candidate"]
+    metadata = await run_with_timeout(analyze_file, str(path))
+    metadata["stored_filename"] = fix["candidate"]
+    metadata["original_filename"] = cur_meta.get("original_filename")
+    metadata["slot"] = slot
+    metadata["suggested_fix_applied"] = fix["issue_id"]
+    for k in ("made_in_cover_studio", "made_for_spine_width", "made_for_page_count"):
+        if cur_meta.get(k) is not None:
+            metadata[k] = cur_meta[k]
+    # The full check runs again on the kept file.
+    compliance = await run_with_timeout(_slot_compliance, p, slot, str(path), metadata)
+    await _replace_slot(project_id, p, slot, metadata, compliance)
+    await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"suggested_fixes": pending}})
+    return {"slot": slot, "file_metadata": metadata, "compliance": compliance, "accepted": fix["issue_id"]}
+
+
+@api_router.post("/projects/{project_id}/suggested-fix/{fix_id}/decline")
+async def decline_suggested_fix(project_id: str, fix_id: str, user: dict = Depends(get_current_user)):
+    p = await db.projects.find_one({"_id": ObjectId(project_id), "user_id": user["id"]})
+    if not p:
+        raise HTTPException(404, "Project not found")
+    pending = dict(p.get("suggested_fixes") or {})
+    fix = pending.pop(fix_id, None)
+    if fix:
+        try: os.remove(UPLOAD_DIR / fix["candidate"])
+        except OSError: pass
+        await db.projects.update_one({"_id": ObjectId(project_id)}, {"$set": {"suggested_fixes": pending}})
+    return {"declined": True}
 
 
 # ---- AI Cover Generation (Author plan+, requires OPENAI_API_KEY) ----

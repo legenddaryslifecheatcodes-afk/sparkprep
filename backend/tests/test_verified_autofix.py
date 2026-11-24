@@ -1047,3 +1047,84 @@ def test_final_scanner1_rescan_failing_undoes_the_fix():
             "fixable": [{"id": "colorspace", "label": "Colour"}]}
     out = asyncio.run(_scanner1_final_pass(D(), diag, {"remaining": []}, trail, common.Budget(30), require_clean=True))
     assert out["passed"] is False and out["remaining"] == ["colorspace"] and out["new"] == ["cover_size"]
+
+
+# ---------------------------------------------------------------- suggested fixes (2026-11-24)
+def _target(pid, slot="full_wrap"):
+    p, _ = _slot(pid)
+    return server._target_inches_for_slot(p, slot)
+
+
+def test_suggested_fix_for_a_slightly_wrong_shaped_cover_can_be_kept(client):
+    pid = _project(client)
+    p, _ = _slot(pid)
+    w_in, h_in = server._target_inches_for_slot(p, "full_wrap")
+    h = 2775
+    w = round(h * w_in / h_in / 1.04)                       # 4% too narrow
+    pid = _upload_cover(client, _rgb_cover(w, h))
+    _, before = _slot(pid)
+    assert any(c["id"] == "cover_size" and c["status"] == "fail" for c in before["compliance"])
+    r = client.post(f"/api/projects/{pid}/suggested-fix", json={"slot": "full_wrap", "issue_id": "cover_size"})
+    assert r.status_code == 200, r.text
+    s = r.json()
+    assert s["offered"] and "squashed" in s["summary"]
+    assert client.get(s["after_url"]).status_code == 200      # signed in by header
+    assert client.get(s["before_url"]).status_code == 200
+    r = client.post(f"/api/projects/{pid}/suggested-fix/{s['fix_id']}/accept")
+    assert r.status_code == 200, r.text
+    assert next(c for c in r.json()["compliance"] if c["id"] == "cover_size")["status"] == "pass"
+    _, now = _slot(pid)
+    assert now["suggested_fix_applied"] == "cover_size"
+    assert now["original_stored_filename"] == before["original_stored_filename"]      # the upload is kept
+    assert (UPLOADS / before["original_stored_filename"]).exists()
+
+
+def test_declining_a_suggested_fix_changes_nothing(client):
+    pid = _project(client)
+    p, _ = _slot(pid)
+    w_in, h_in = server._target_inches_for_slot(p, "full_wrap")
+    pid = _upload_cover(client, _rgb_cover(round(2775 * w_in / h_in * 0.95), 2775))
+    _, before = _slot(pid)
+    h = _sha(before["stored_filename"])
+    s = client.post(f"/api/projects/{pid}/suggested-fix", json={"slot": "full_wrap", "issue_id": "cover_size"}).json()
+    assert s["offered"]
+    assert client.post(f"/api/projects/{pid}/suggested-fix/{s['fix_id']}/decline").json()["declined"]
+    _assert_untouched(pid, before, h)
+    assert client.post(f"/api/projects/{pid}/suggested-fix/{s['fix_id']}/accept").status_code == 404
+
+
+def test_suggested_fix_explains_when_it_cant_help(client):
+    pid = _upload_cover(client)                                  # already the right shape
+    s = client.post(f"/api/projects/{pid}/suggested-fix", json={"slot": "full_wrap", "issue_id": "cover_size"}).json()
+    assert s["offered"] is False and "already the right shape" in s["reason"]
+    r = client.post(f"/api/projects/{pid}/suggested-fix", json={"slot": "full_wrap", "issue_id": "cover_jacket_fold"})
+    assert r.status_code == 400
+
+
+def test_verified_autofix_pulls_pdf_cover_text_inside_the_margin(client):
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    pid = _project(client)
+    p, _ = _slot(pid)
+    w_in, h_in = server._target_inches_for_slot(p, "full_wrap")
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(w_in * inch, h_in * inch))
+    c.setFillColorRGB(0.1, 0.1, 0.3)
+    c.rect(0, 0, w_in * inch, h_in * inch, fill=1, stroke=0)
+    c.setFillColorRGB(0.95, 0.85, 0.3)
+    c.setFont("Helvetica-Bold", 40)
+    c.drawString(8 * inch, h_in * inch - 0.18 * inch - 40, "EDGE TITLE")
+    c.showPage()
+    c.save()
+    r = client.post(f"/api/projects/{pid}/slot-upload/full_wrap", files={"file": ("c.pdf", buf.getvalue(), "application/pdf")})
+    assert r.status_code == 200, r.text
+    _, before = _slot(pid)
+    assert any(x["id"] == "cover_safety_margin" and x["auto_fix"] for x in before["compliance"])
+    events, data = _run(client, pid)
+    pl = data["pipeline"]
+    assert pl["status"] in ("confirmed", "partial"), pl
+    assert "cover_safety_margin" in pl["resolved"]
+    import pymupdf
+    _, now = _slot(pid)
+    with pymupdf.open(str(UPLOADS / now["stored_filename"])) as d:
+        assert "EDGE TITLE" in d[0].get_text()

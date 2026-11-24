@@ -974,11 +974,11 @@ def check_cover_safety_margins(
             pinpoint={"detected_text": outer_worst_word, "margin_in": round(outer_worst_in, 2), "flagged_word_count": outer_flagged,
                       "margin_from_file_edge_in": round(outer_worst_in + bleed_in, 3), "bleed_in": bleed_in},
             fix_steps=[
-                "SparkPrep's Auto-Fix can pull this back into the safe margin automatically by scaling the cover slightly inward -- run Auto-Fix on this file (image covers only; PDF covers should be re-exported with corrected margins from the source design file instead).",
+                "SparkPrep's Auto-Fix can pull this back into the safe margin automatically by scaling the cover slightly inward -- run Auto-Fix on this file (on a PDF cover the text stays sharp; only the thin outer edge is filled in).",
                 f"To fix it manually instead: open your cover design file and move all text/logos at least {COVER_SAFETY_MARGIN_RECOMMENDED_IN}\" inside the trim edge on every side, then re-export and re-upload.",
             ],
             fix_tools=["SparkPrep Auto-Fix", "Adobe Photoshop", "Adobe Illustrator", "Canva"],
-            one_click_fix=not is_pdf,
+            one_click_fix=True,   # PDF covers too since 2026-11-24 (autofix_pdf_cover_safe_margin)
         ))
 
     if spine_text_forbidden and spine_words_found:
