@@ -1,5 +1,16 @@
 """Coordinator for the four-agent verified auto-fix.
 
+Order of a verified fix (trey's order, 2026-11-24):
+  1. Scanner 1 (the main scanner) scans the file            -- Agent 1
+  2. Scanner 2 (independent_checker/, its own process, no database, no keys,
+     nothing from Scanner 1) scans the ORIGINAL file on its own; only then are
+     the two sets of findings compared. If they disagree, the file is flagged
+     and NOT auto-fixed.
+  3. Repair fixes (Agent 2); verification (Agent 3, plus Scanner 2's own
+     check of the fixed file) and the Supervisor (Agent 4) check the work.
+  4. The fixed file goes back through Scanner 1 for a final rescan. Only a
+     clean final pass counts as fixed; otherwise the fix is undone.
+
 The coordinator owns the things no single agent may own: the safety net
 (a snapshot of the project + a backup of the file taken before the repair,
 and the rollback if verification or the audit says no), the time budget, and
@@ -8,17 +19,19 @@ logic of its own -- it only sequences Agent 1 → 2 → 3 → 4.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import os
 import shutil
 import uuid
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from .common import Budget, Trail, time_limits_on
+from .common import Budget, Trail, time_limits_on, run_bounded, StageTimeout, normalize_issues, actionable, brief
+from .disagreements import settle
 from .agent1_triage import diagnose
 from .agent2_repair import repair
 from .agent3_verify import verify
@@ -54,6 +67,14 @@ class Deps:
     # cut-off doesn't apply and it can use most of that window; a single
     # buffered JSON response is bound by the API-wide 45s request limit.
     budget_s: float = 40.0
+    # When the two scanners disagree (see disagreements.py):
+    # tiebreak_fn(disputes) -> {check: {"verdict", "why"}}; record_disagreement(row) logs it for the admin view.
+    tiebreak_fn: Optional[Callable[[list], Awaitable[dict]]] = None
+    record_disagreement: Optional[Callable[[dict], Awaitable[None]]] = None
+    picture_url: Optional[str] = None
+    # Printer rules (independent checker ids) whose fix must not run this time,
+    # because the scanners disagreed and it wasn't proven to be a problem.
+    skip_checks: set = field(default_factory=set)
 
 
 def try_claim(project_id: str, slot: Optional[str]) -> bool:
@@ -108,6 +129,179 @@ async def _independent_second_opinion(deps: Deps, diagnosis: dict, before: Optio
         verification["verdict"] = "rejected"
         verification["reason"] = "The independent checker disagreed: " + (result["reason"] or "")
         trail.emit("step", 3, "REJECTED — the independent checker disagreed with the main scan. Reverting to your original state.")
+
+
+FLAGGED_MESSAGE = ("Our second scanner couldn't confirm the scan of this file, so we didn't change anything. "
+                   "Your file is exactly as you uploaded it. Please try again in a minute.")
+NEEDS_CHECK_MESSAGE = ("Our two scanners disagreed about this file, so we didn't change anything. "
+                       "Please check the items listed below. Your file is exactly as you uploaded it.")
+
+
+async def _scanner2_first_look(deps: Deps, project: dict, diagnosis: dict, trail: Trail) -> tuple[dict, dict]:
+    """Step 2: Scanner 2 scans the original file on its own, then its findings
+    are compared with Scanner 1's. Returns (scanner 2's answer, comparison)."""
+    from independent_check import cross_check
+
+    trail.emit("step", 1, "Scanner 2 (separate program, no database, no keys) is scanning your original file on its own…")
+    before = await deps.independent_fn(project, diagnosis["file"])
+    result = cross_check(diagnosis.get("issues") or [], before)
+    for c in result["compared"]:
+        if c["agree"]:
+            text = f"✓ Both scanners agree — {c['label']}: {'passes' if c['scanner1_passed'] else 'needs fixing'}"
+        elif c["scanner1_passed"]:
+            text = f"✗ Scanners disagree — {c['label']}: Scanner 2 found a problem Scanner 1 passed ({c['evidence']})"
+        else:
+            text = f"✗ Scanners disagree — {c['label']}: Scanner 1 found a problem Scanner 2 says is fine ({c['evidence']})"
+        trail.emit("criterion", 1, text, id=f"scanners_agree:{c['check']}", label=f"Both scanners agree: {c['label']}",
+                   passed=c["agree"], evidence=c["evidence"])
+    if result["not_judged"]:
+        trail.emit("step", 1, "Checked by Scanner 1 only (Scanner 2 doesn't measure these): "
+                   + ", ".join(sorted(set(result["not_judged"]))))
+    criterion = {"id": "scanners_agree", "label": "Scanner 2 confirms Scanner 1's findings", "passed": result["agree"],
+                 "evidence": result["reason"] or "both scanners found the same problems"}
+    trail.emit("criterion", 1, f"{'✓' if result['agree'] else '✗'} {criterion['label']} — {criterion['evidence']}", **criterion)
+    if not result["agree"]:
+        n = len(result["disagreements"])
+        trail.emit("step", 1, f"The two scanners disagree on {n} item{'s' if n != 1 else ''}." if n else
+                   "Scanner 2 could not confirm the scan.")
+    return before, result
+
+
+async def _scanners_step(deps: Deps, project: dict, diagnosis: dict, trail: Trail, budget: Budget) -> dict:
+    """Step 2 plus the disagreement plan. Returns
+    {"stop", "status", "message", "before", "checks", "record"}; when stop is
+    False the repair goes ahead on the problems both scanners agree on."""
+    from independent_check import cross_check, CATEGORY_FOR_ISSUE
+
+    plan = {"stop": False, "status": None, "message": None, "before": None, "checks": [], "record": None}
+    if not deps.independent_fn:
+        return plan
+    before, result = await _scanner2_first_look(deps, project, diagnosis, trail)
+    plan["before"] = before
+    if result["agree"]:
+        return plan
+
+    first = result
+    # 1. Scan again once with both scanners -- a scan can glitch.
+    trail.emit("step", 1, "The scanners disagree. Scanning again with both, in case one of them glitched…")
+    issues = diagnosis.get("issues") or []
+    try:
+        rescan = await run_bounded(deps.scan_fn, budget.cap(15.0), project, deps.slot, diagnosis["file"])
+        issues = [brief(i) | {"informational": i["informational"]} for i in normalize_issues(rescan)]
+    except StageTimeout:
+        trail.emit("step", 1, "Scanner 1's second scan didn't finish; using its first scan.")
+    before = await deps.independent_fn(project, diagnosis["file"])
+    plan["before"] = before
+    result = cross_check(issues, before)
+    record = {"slot": deps.slot, "file": diagnosis.get("file"), "first_scan": first, "second_scan": result,
+              "resolved_by": None, "outcomes": []}
+    plan["record"] = record
+
+    if result["agree"]:
+        trail.emit("criterion", 1, "✓ On the second scan both scanners agree — the first disagreement was a glitch",
+                   id="scanners_agree_rescan", label="Scanners agree on the second scan", passed=True,
+                   evidence=first["reason"] or "")
+        record["resolved_by"] = "rescan"
+        await _record(deps, record)
+        return plan
+
+    if not result["compared"]:
+        # Scanner 2 couldn't run or open the file: there's nothing to vote on,
+        # and "could not confirm" never counts as a pass.
+        trail.emit("criterion", 1, f"✗ {result['reason']}", id="scanners_agree_rescan",
+                   label="Scanner 2 confirms the scan", passed=False, evidence=result["reason"])
+        record["resolved_by"] = "not_confirmed"
+        await _record(deps, record)
+        plan.update(stop=True, status="flagged", message=FLAGGED_MESSAGE)
+        return plan
+
+    # 3. Tiebreaker on each disputed item; the majority (2 of 3) wins.
+    tb = {}
+    if deps.tiebreak_fn:
+        trail.emit("step", 1, "Still disagreeing. Asking a tiebreaker (Claude looks at the file and both scanners' evidence)…")
+        try:
+            tb = await asyncio.wait_for(deps.tiebreak_fn(result["disagreements"]), timeout=max(min(budget.remaining() - 25.0, 30.0), 5.0))
+        except Exception as e:  # noqa: BLE001 - no tiebreaker answer = unsure, never a pass
+            await _log(deps, "verified_autofix_tiebreak", e, {"slot": deps.slot})
+            tb = {}
+    else:
+        trail.emit("step", 1, "No tiebreaker is available right now, so disputed items go to you to check.")
+    settled = settle(result["disagreements"], tb or {})
+    for o in settled["outcomes"]:
+        who = {"scanner1": "Scanner 1 was right", "scanner2": "Scanner 2 was right", None: "couldn't decide"}[o["winner"]]
+        trail.emit("criterion", 1, f"{'✓' if o['winner'] else '?'} Tiebreaker on {o['label']}: {who}"
+                   + (f" — {o['tiebreak_why']}" if o.get("tiebreak_why") else ""),
+                   id=f"tiebreak:{o['check']}", label=f"Tiebreaker: {o['label']}", passed=o["winner"] is not None,
+                   evidence=o.get("tiebreak_why") or o["tiebreak"])
+    # 4. Anything still unclear goes to the customer, in plain words, with a picture.
+    for c in settled["checks"]:
+        trail.emit("check_this", 1, c["message"], picture=deps.picture_url, check=c["check"], label=c["label"])
+    plan["checks"] = settled["checks"]
+
+    # 2. Fix only what's agreed (or proven by the majority).
+    deps.skip_checks = set(settled["skip_checks"])
+    skip_ids = {i["id"] for i in diagnosis.get("issues") or [] if CATEGORY_FOR_ISSUE.get(i["id"]) in deps.skip_checks}
+    diagnosis["fixable"] = [f for f in diagnosis.get("fixable") or [] if f["id"] not in skip_ids]
+    diagnosis["skipped_disputed"] = sorted(skip_ids)
+    if skip_ids:
+        trail.emit("step", 1, "Not fixing (not proven to be a problem): " + ", ".join(sorted(skip_ids)))
+
+    record["resolved_by"] = "tiebreak"
+    record["outcomes"] = settled["outcomes"]
+    record["customer_checks"] = settled["checks"]
+    await _record(deps, record)
+
+    if not diagnosis["fixable"]:
+        plan.update(stop=True, status="needs_check", message=NEEDS_CHECK_MESSAGE)
+    else:
+        n = len(diagnosis["fixable"])
+        trail.emit("step", 1, f"Going ahead with the {n} problem{'s' if n != 1 else ''} both scanners agree on.")
+    return plan
+
+
+async def _record(deps: Deps, row: dict) -> None:
+    """5. Every disagreement is kept for the admin view."""
+    if deps.record_disagreement:
+        try:
+            await deps.record_disagreement(row)
+        except Exception as e:  # noqa: BLE001 - logging must never break a repair
+            await _log(deps, "scanner_disagreement_record", e, {"slot": deps.slot})
+
+
+async def _scanner1_final_pass(deps: Deps, diagnosis: dict, verification: dict, trail: Trail, budget: Budget,
+                               require_clean: bool) -> dict:
+    """Step 4: the fixed file goes back through Scanner 1 one more time.
+    Passes when nothing that was fine before now fails, and (for a full fix)
+    every problem the repair targeted is gone."""
+    trail.emit("step", 4, "Final check: sending the fixed file back through Scanner 1…")
+    project = await deps.get_project()
+    stored_filename, _ = deps.resolve_target(project, deps.slot)
+    try:
+        scan = await run_bounded(deps.scan_fn, budget.cap(15.0), project, deps.slot, stored_filename)
+    except StageTimeout as e:
+        out = {"passed": False, "reason": f"Scanner 1's final rescan didn't finish ({e})", "remaining": [], "new": []}
+        trail.emit("criterion", 4, f"✗ Scanner 1 final rescan — {out['reason']}", id="scanner1_final_pass",
+                   label="Scanner 1 final rescan passes", passed=False, evidence=out["reason"])
+        return out
+    now_failing = {i["id"]: i for i in actionable(normalize_issues(scan))}
+    before_failing = {i["id"] for i in diagnosis.get("issues") or [] if i.get("status") != "pass" and not i.get("informational")}
+    targeted = {i["id"] for i in diagnosis.get("fixable") or []}
+    expected_open = {r["id"] if isinstance(r, dict) else r for r in verification.get("remaining") or []}
+    new = sorted(i for i in now_failing if i not in before_failing)
+    still = sorted(i for i in now_failing if i in targeted and (require_clean or i not in expected_open))
+    passed = not new and not still
+    if passed:
+        evidence = "no new problems" + (", every targeted problem is gone" if require_clean else "")
+    else:
+        bits = []
+        if still:
+            bits.append("still failing: " + ", ".join(now_failing[i]["label"] or i for i in still))
+        if new:
+            bits.append("new problem: " + ", ".join(now_failing[i]["label"] or i for i in new))
+        evidence = "; ".join(bits)
+    trail.emit("criterion", 4, f"{'✓' if passed else '✗'} Scanner 1 final rescan — {evidence}", id="scanner1_final_pass",
+               label="Scanner 1 final rescan passes", passed=passed, evidence=evidence)
+    return {"passed": passed, "reason": None if passed else evidence, "remaining": still, "new": new}
 
 
 async def _take_snapshot(deps: Deps, project: dict, stored_filename: str) -> dict:
@@ -233,6 +427,7 @@ async def _run(deps: Deps, sink) -> dict:
     status, message = "error", "Something unexpected went wrong. Your file was not changed."
     project = await deps.get_project()
     diagnosis = {}
+    plan: dict = {}
 
     try:
         diagnosis = await diagnose(project=project, slot=deps.slot, resolve_target=deps.resolve_target,
@@ -257,11 +452,13 @@ async def _run(deps: Deps, sink) -> dict:
             # another" disconnect this pipeline exists to prevent.
             if diagnosis["outcome"] != "scan_failed":
                 await _sync_stale_compliance(deps, project, diagnosis)
+        elif (plan := await _scanners_step(deps, project, diagnosis, trail, budget))["stop"]:
+            # Step 2: the scanners disagree and nothing is left that both agree
+            # on (or Scanner 2 couldn't confirm) -- nothing is touched.
+            status, message = plan["status"], plan["message"]
         else:
             snap = await _take_snapshot(deps, project, diagnosis["file"])
-            indep_before = None
-            if deps.independent_fn:
-                indep_before = await deps.independent_fn(project, diagnosis["file"])
+            indep_before = plan["before"]
             repair_out = await repair(repair_fn=deps.repair_fn, diagnosis=diagnosis, trail=trail,
                                       timeout_s=(max(budget.remaining() - 20.0, 5.0) if time_limits_on() else budget.remaining()))  # limits on: leave room for Agents 3 + 4
             if repair_out["status"] != "applied":
@@ -291,13 +488,23 @@ async def _run(deps: Deps, sink) -> dict:
                         status, message = "rolled_back", "The supervisor's audit found a problem, so the repair was undone. Your file is unchanged."
                         await _log(deps, "verified_autofix_audit_rejected", RuntimeError("audit rejected"),
                                    {"criteria": [c for c in supervision["criteria"] if not c["passed"]]})
-                    elif supervision["decision"] == "confirmed":
-                        status, message = "confirmed", PROMPT_TEXT
                     else:
-                        n = len(verification["remaining"])
-                        status = "partial"
-                        message = (f"Improved — {len(verification['resolved'])} fixed, {n} still open. "
-                                   "Details are listed below; nothing regressed.")
+                        final = await _scanner1_final_pass(deps, diagnosis, verification, trail, budget,
+                                                           require_clean=supervision["decision"] == "confirmed")
+                        verification["scanner1_final"] = final
+                        if not final["passed"]:
+                            await _rollback(deps, snap, trail, "Scanner 1's final rescan did not pass")
+                            status, message = "rolled_back", ("Scanner 1's final rescan didn't pass, so the repair was undone. "
+                                                              "Your file is exactly as it was before.")
+                            await _log(deps, "verified_autofix_final_rescan_failed", RuntimeError(final["reason"] or "final rescan"),
+                                       {"slot": deps.slot})
+                        elif supervision["decision"] == "confirmed":
+                            status, message = "confirmed", PROMPT_TEXT
+                        else:
+                            n = len(verification["remaining"])
+                            status = "partial"
+                            message = (f"Improved — {len(verification['resolved'])} fixed, {n} still open. "
+                                       "Details are listed below; nothing regressed.")
     except Exception as e:  # noqa: BLE001 - last line of defence: never leave a half-applied repair behind
         await _log(deps, "verified_autofix_crash", e, {"slot": deps.slot})
         if snap:
@@ -311,6 +518,10 @@ async def _run(deps: Deps, sink) -> dict:
 
     if status == "confirmed":
         trail.emit("prompt", 4, PROMPT_TEXT)
+    checks = plan.get("checks") or []
+    if checks and status in ("confirmed", "partial"):
+        message += (f" Please also check the {len(checks)} item{'s' if len(checks) != 1 else ''} "
+                    "our two scanners couldn't agree on (listed below).")
 
     metadata, compliance = await _current_state(deps)
     timings = _stage_timings(trail, diagnosis, verification, budget)
@@ -323,6 +534,9 @@ async def _run(deps: Deps, sink) -> dict:
         "health_after": (verification or {}).get("health_after") if status in ("confirmed", "partial") else diagnosis.get("health"),
         "resolved": (verification or {}).get("resolved", []) if status in ("confirmed", "partial") else [],
         "remaining": (verification or {}).get("remaining", []) if status in ("confirmed", "partial") else [],
+        "scanners_disagree": (plan.get("record") or {}).get("outcomes") or None,
+        "customer_checks": checks,
+        "picture_url": deps.picture_url if checks else None,
         "seconds": round(budget.elapsed(), 1),
         "timings": timings,
     }

@@ -105,3 +105,63 @@ def compare(diagnosis_fixable: list, before: dict, after: dict) -> dict:
     elif regressions:
         reason = "the repair broke something: " + "; ".join(f"{c['label']} ({c['evidence']})" for c in regressions)
     return {"agree": agree, "reason": reason, "targeted": targeted, "regressions": regressions, "not_judged": not_judged}
+
+
+def cross_check(scanner1_issues: list, independent: dict) -> dict:
+    """Step 2 of a verified fix: does Scanner 2's own scan of the ORIGINAL file
+    agree with Scanner 1's findings?
+
+    Scanner 2 has already scanned the file on its own (separate process, no
+    database, no keys, nothing from Scanner 1). Only afterwards are the two
+    sets of findings laid side by side here. They disagree when:
+      * Scanner 2 couldn't run or couldn't open the file ("could not confirm"),
+      * Scanner 1 calls something a problem that Scanner 2 says is fine,
+      * Scanner 2 finds a problem with something Scanner 1 says passes.
+    Rules only one of the scanners measures are listed as not_judged.
+    """
+    if independent.get("error") or not independent.get("checks"):
+        return {"agree": False, "reason": "Scanner 2 could not confirm the scan: "
+                + (independent.get("error") or "no answer from the independent checker"),
+                "compared": [], "disagreements": [], "not_judged": []}
+    s2 = {c["id"]: c for c in independent["checks"]}
+    if s2.get("opens", {}).get("passed") is False:
+        return {"agree": False, "reason": "Scanner 2 couldn't open the file: " + s2["opens"].get("evidence", ""),
+                "compared": [], "disagreements": [], "not_judged": []}
+
+    # Scanner 1's verdict per printer rule: a rule fails if any finding for it fails.
+    s1: dict = {}
+    for issue in scanner1_issues:
+        if issue.get("informational"):
+            continue
+        cat = CATEGORY_FOR_ISSUE.get(issue.get("id"))
+        if not cat:
+            continue
+        row = s1.setdefault(cat, {"failed": False, "issues": []})
+        row["issues"].append(issue)
+        if issue.get("status") != "pass":
+            row["failed"] = True
+
+    compared, disagreements, not_judged = [], [], []
+    for cat, row in s1.items():
+        check = s2.get(cat)
+        if not check or check.get("passed") is None:
+            not_judged.extend(i["id"] for i in row["issues"])
+            continue
+        s1_ok, s2_ok = not row["failed"], bool(check["passed"])
+        entry = {"check": cat, "label": check["label"], "scanner1_passed": s1_ok, "scanner2_passed": s2_ok,
+                 "evidence": check["evidence"], "issues": [i["id"] for i in row["issues"]], "agree": s1_ok == s2_ok}
+        compared.append(entry)
+        if not entry["agree"]:
+            disagreements.append(entry)
+
+    reason = None
+    if disagreements:
+        parts = []
+        for d in disagreements:
+            if d["scanner1_passed"]:
+                parts.append(f"{d['label']}: Scanner 2 found a problem Scanner 1 passed ({d['evidence']})")
+            else:
+                parts.append(f"{d['label']}: Scanner 1 found a problem Scanner 2 says is fine ({d['evidence']})")
+        reason = "; ".join(parts)
+    return {"agree": not disagreements, "reason": reason, "compared": compared,
+            "disagreements": disagreements, "not_judged": not_judged}
