@@ -27,7 +27,7 @@ from PIL import Image, ImageFilter
 
 PDF_RASTER_DPI = 400
 MAX_INVISIBLE_STRETCH = 0.02     # 2%: a change in proportions nobody can see on a cover
-MAX_SHAPE_FIX = 0.08             # beyond 8% off, extending the edges would show -- rebuild instead
+MAX_SHAPE_FIX = 0.05             # beyond 5% off (trey, 2026-11-24): give fix instructions instead
 
 SUPPORTED = ("cover_size", "cover_template_leftovers", "cover_spine_text_forbidden", "cover_isbn_mismatch")
 
@@ -153,7 +153,7 @@ def fit_cover_shape(img: Image.Image, target_w_in: float, target_h_in: float) ->
     off = need / have - 1.0                      # + = cover needs to be wider, - = narrower
     if abs(off) < 1e-4:
         raise NotOffered("This cover is already the right shape.")
-    if abs(off) > MAX_SHAPE_FIX + 1e-9:
+    if abs(off) > MAX_SHAPE_FIX + 1.0 / min(w, h):    # allow one pixel of rounding at the limit
         raise NotOffered(f"This cover is {abs(off) * 100:.1f}% off the right shape. SparkPrep fixes up to "
                          f"{MAX_SHAPE_FIX * 100:.0f}%. Fixing more would show, so it needs to be rebuilt at the right size.")
     stretch = max(-MAX_INVISIBLE_STRETCH, min(MAX_INVISIBLE_STRETCH, off))

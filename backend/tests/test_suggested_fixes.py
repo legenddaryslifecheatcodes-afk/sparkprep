@@ -58,7 +58,7 @@ def test_too_wrong_shape_is_not_offered():
 
 
 def test_slightly_too_wide_is_trimmed_evenly():
-    img = Image.new("RGB", (1350, 925), (30, 60, 120))  # needs 1275 wide: 5.9% too wide
+    img = Image.new("RGB", (1325, 925), (30, 60, 120))  # needs 1275 wide: 3.8% too wide
     out, summary = sf.fit_cover_shape(img, 12.75, 9.25)
     assert abs(out.width - 1275) <= 1 and "trimmed" in summary
 
@@ -160,8 +160,8 @@ def _edge_text_cover(w, h=2775):
     return img
 
 
-@pytest.mark.parametrize("pct", [7.9, 8.0, -7.9, -8.0])
-def test_shape_fit_at_the_8_percent_limit_keeps_text_safe(pct, tmp_path):
+@pytest.mark.parametrize("pct", [4.9, 5.0, -4.9, -5.0])
+def test_shape_fit_at_the_5_percent_limit_keeps_text_safe(pct, tmp_path):
     from pdfx_validator import check_cover_safety_margins
     h = 2775
     w = round(h * (12.7 / 9.25) / (1 + pct / 100))
@@ -173,6 +173,6 @@ def test_shape_fit_at_the_8_percent_limit_keeps_text_safe(pct, tmp_path):
     assert not [c for c in found if c.get("id") == "cover_safety_margin"], msg
 
 
-def test_shape_fit_just_over_8_percent_is_refused():
-    with pytest.raises(sf.NotOffered, match="8.1%"):
-        sf.fit_cover_shape(_edge_text_cover(round(2775 * (12.7 / 9.25) / 0.919)), 12.7, 9.25)
+def test_shape_fit_just_over_5_percent_is_refused():
+    with pytest.raises(sf.NotOffered, match="5.1%"):
+        sf.fit_cover_shape(_edge_text_cover(round(2775 * (12.7 / 9.25) / 1.051)), 12.7, 9.25)

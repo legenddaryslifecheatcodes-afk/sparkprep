@@ -1083,7 +1083,7 @@ def test_declining_a_suggested_fix_changes_nothing(client):
     pid = _project(client)
     p, _ = _slot(pid)
     w_in, h_in = server._target_inches_for_slot(p, "full_wrap")
-    pid = _upload_cover(client, _rgb_cover(round(2775 * w_in / h_in * 0.95), 2775))
+    pid = _upload_cover(client, _rgb_cover(round(2775 * w_in / h_in * 0.97), 2775))
     _, before = _slot(pid)
     h = _sha(before["stored_filename"])
     s = client.post(f"/api/projects/{pid}/suggested-fix", json={"slot": "full_wrap", "issue_id": "cover_size"}).json()
