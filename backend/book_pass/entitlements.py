@@ -137,6 +137,38 @@ async def is_member(db, user_id: str) -> bool:
     return False
 
 
+MEMBER_RECHECK_HOURS = 6
+
+
+async def refresh_member_status(db, stripe, user_id: str, *, max_age_hours: float = MEMBER_RECHECK_HOURS,
+                                timeout_s: float = 6.0) -> None:
+    """Ask Stripe whether each 'active' membership is really still active.
+
+    Without a Stripe webhook the server never hears about a cancellation, so a cancelled member would stay
+    'active' forever. This re-checks each active membership at most every `max_age_hours`. If Stripe can't be
+    reached, nothing changes (a network hiccup must never lock a paying member out)."""
+    import asyncio
+    if stripe is None or not str(getattr(stripe, "api_key", "") or "").startswith(("sk_live_", "rk_live_", "sk_test_", "rk_test_")) \
+            or str(stripe.api_key).startswith("sk_test_not_configured"):
+        return
+    now = now_utc()
+    async for s in db.book_subscriptions.find({"user_id": user_id, "plan": MEMBERSHIP_PLAN}):
+        sub_id = s.get("subscription_id") or ""
+        if s.get("status", "active") != "active" or not sub_id.startswith("sub_"):
+            continue
+        checked = s.get("verified_at")
+        if checked and now - parse(checked) < timedelta(hours=max_age_hours):
+            continue
+        try:
+            live = await asyncio.wait_for(asyncio.to_thread(stripe.Subscription.retrieve, sub_id), timeout_s)
+            status = (live.get("status") if hasattr(live, "get") else getattr(live, "status", None)) or ""
+        except Exception:  # noqa: BLE001 - Stripe down / slow / unknown id: keep what we have
+            continue
+        new_status = "active" if status in ("active", "trialing") else (status or "canceled")
+        await db.book_subscriptions.update_one({"subscription_id": sub_id},
+                                               {"$set": {"status": new_status, "verified_at": iso(now)}})
+
+
 async def book_price_cents(db, user_id: str) -> int:
     """What ONE book costs this customer right now: the member price while a membership is active."""
     return MEMBER_BOOK_PRICE_CENTS if await is_member(db, user_id) else BOOK_PASS_PRICE_CENTS

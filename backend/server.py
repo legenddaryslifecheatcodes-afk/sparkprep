@@ -71,6 +71,7 @@ from image_upscale_engine import upscale_to_size_with_info, upscale_file_for_pri
 from independent_check import run_independent_check
 import autofix_agents
 import book_pass
+import author_studio
 import open_house
 import traffic
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
@@ -6526,6 +6527,9 @@ async def _find_owned_project(project_id: str, user: dict):
 
 api_router.include_router(book_pass.build_router(db=db, get_current_user=get_current_user, stripe=stripe,
                                                  find_project=_find_owned_project))
+# Legenddary SparkPrep Author Studio (members' workspace, 2026-11-25): /api/studio/*
+api_router.include_router(author_studio.build_router(db=db, get_current_user=get_current_user, stripe=stripe,
+                                                     data_dir=DATA_DIR, is_admin=is_admin_user))
 # Site traffic tracker: POST /api/pv (public beacon from /track.js), GET /api/admin/traffic (owner only).
 api_router.include_router(traffic.build_router(db=db, require_admin=require_admin, client_ip=_client_ip))
 # ---- Database backups (owner's rule, 2026-09-29: no lockout or accident can ever cost SparkPrep its customers)

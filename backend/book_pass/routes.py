@@ -54,6 +54,7 @@ def build_router(*, db, get_current_user, stripe, find_project) -> APIRouter:
     @router.get("/me/books")
     async def my_books(user: dict = Depends(get_current_user)):
         _require_model()
+        await ent.refresh_member_status(db, stripe, user["id"])   # catches cancellations Stripe never told us about
         return await ent.summary(db, user["id"])
 
     @router.get("/projects/{project_id}/book")
