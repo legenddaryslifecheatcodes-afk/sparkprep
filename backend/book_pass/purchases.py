@@ -15,7 +15,7 @@ from fastapi import HTTPException
 
 from .config import (AUDIT_SPECIAL_CENTS, BOOK_PASS_PRICE_CENTS, MEMBER_BOOK_PRICE_CENTS, MEMBERSHIP_PLAN,
                      PASS_WINDOW_DAYS, PLANS)
-from .entitlements import (_get, book_price_cents, grant_credit, grant_for_invoice, is_member, register_subscription,
+from .entitlements import (_get, book_price_cents, refresh_member_status, grant_credit, grant_for_invoice, is_member, register_subscription,
                            iso, now_utc)
 
 DEFAULT_ORIGIN = "https://sparkprep.legenddary.com"
@@ -88,6 +88,7 @@ async def start_checkout(*, db, stripe, user: dict, product: str, origin_url: st
     if plan == MEMBERSHIP_PLAN:
         audit_id = None          # an audit is credited toward the BOOK, so it stays unused for the member's first book
     credit = await audit_credit_cents(db, stripe, audit_id) if audit_id else 0
+    await refresh_member_status(db, stripe, user["id"])        # a cancelled member must not keep the member price
 
     if product == "subscription" and plan == MEMBERSHIP_PLAN and await is_member(db, user["id"]):
         raise HTTPException(409, "You're already a SparkPrep member.")

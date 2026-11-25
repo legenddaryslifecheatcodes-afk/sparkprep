@@ -1,0 +1,58 @@
+{
+ "slug": "book-description-that-sells",
+ "title": "Write a book description that makes people click Buy",
+ "summary": "A fill-in-the-blanks way to write the short text on your book page, with examples for fiction and nonfiction.",
+ "category": "marketing",
+ "publish_on": "2026-11-25",
+ "minutes": 6,
+ "video_url": null,
+ "body": [
+  {
+   "p": "After the cover, the description is what sells your book. Most people read the first two lines and decide. So those two lines carry almost all the weight."
+  },
+  {
+   "h": "The shape that works"
+  },
+  {
+   "list": [
+    "Hook: one line that makes the reader feel something or want to know more.",
+    "Setup: who it's about (or who it's for) and what they want.",
+    "Stakes: what goes wrong, or what it costs them if nothing changes.",
+    "Promise: what the reader gets by reading.",
+    "Nudge: a short last line that tells them who will love it."
+   ]
+  },
+  {
+   "h": "Fiction example"
+  },
+  {
+   "p": "Hook: \"The night her brother vanished, the lake froze in July.\" Setup: a small-town nurse who never left home. Stakes: the only way to find him is to trust the man she blames. Promise: a twisting mystery with a warm heart. Nudge: \"For readers who love small towns with big secrets.\""
+  },
+  {
+   "h": "Nonfiction example"
+  },
+  {
+   "p": "Hook: \"You don't need more motivation. You need a better morning.\" Setup: for busy parents who feel behind before 9 AM. Stakes: the days slip by and the goals stay on the list. Promise: a 20-minute routine you can start tomorrow. Nudge: \"If you've tried every planner and still feel stuck, start here.\""
+  },
+  {
+   "h": "Rules that save you"
+  },
+  {
+   "list": [
+    "Write in the third person for fiction and talk straight to the reader in nonfiction.",
+    "Keep it to about 150 to 250 words. Short paragraphs read better on phones.",
+    "Put your strongest line first. On many stores only the first lines show before \"Read more\".",
+    "Don't put the price, discounts or review requests in the description. Many stores don't allow it."
+   ]
+  },
+  {
+   "tip": "Use the Book description template in the Author Studio. It sets up these five parts for you inside your book's notes."
+  },
+  {
+   "h": "Test it in two minutes"
+  },
+  {
+   "p": "Read only your first two lines out loud to someone who hasn't heard of the book. Ask, \"Would you read more?\" If they shrug, rewrite the hook, not the whole thing."
+  }
+ ]
+}

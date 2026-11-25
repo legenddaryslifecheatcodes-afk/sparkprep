@@ -1,0 +1,52 @@
+{
+ "slug": "pick-the-right-printer",
+ "title": "KDP, IngramSpark, Lulu or B&N Press: which one first?",
+ "summary": "What each printer is best at, what it costs to start, and the simple order most first-time authors should follow.",
+ "category": "publishing",
+ "publish_on": "2026-11-25",
+ "minutes": 7,
+ "video_url": null,
+ "body": [
+  {
+   "p": "You can publish the same book in more than one place. The question is where to start so you don't waste money or lock yourself in."
+  },
+  {
+   "h": "Amazon KDP"
+  },
+  {
+   "p": "Best for: reaching Amazon shoppers, which is where most self-published books sell. Cost to start: free to upload. You can use a free ISBN from KDP, but that ISBN only works on Amazon. Good to know: KDP has its own cover and inside-page rules, and it checks your files before it lets you publish."
+  },
+  {
+   "h": "IngramSpark"
+  },
+  {
+   "p": "Best for: getting your book into the catalog that bookstores and libraries order from, and for hardcovers. Cost: uploading is free, but changes after your book is live can cost a fee. Check IngramSpark's site for current fees before you upload. Good to know: IngramSpark's file checks are strict, which is why so many authors get rejection emails here."
+  },
+  {
+   "h": "Lulu"
+  },
+  {
+   "p": "Best for: special formats, small print runs, workbooks and books you sell yourself. Cost: free to upload. Good to know: Lulu can also send books to other stores, but the money per book is usually smaller there."
+  },
+  {
+   "h": "Barnes & Noble Press"
+  },
+  {
+   "p": "Best for: reaching B&N shoppers directly. Cost: free to upload. Good to know: it's a smaller audience than Amazon but it's easy to add once your files are ready."
+  },
+  {
+   "h": "A simple order for a first book"
+  },
+  {
+   "list": [
+    "Buy your own ISBN if you plan to sell in more than one place. In the US they come from Bowker.",
+    "Start with KDP for the paperback and ebook.",
+    "Add IngramSpark for bookstores and hardcover.",
+    "Add B&N Press or Lulu later if it fits your plan."
+   ]
+  },
+  {
+   "tip": "Every printer sizes covers a little differently. The spine width changes with page count and paper. Size each cover for each printer separately, and run your files through the Legenddary SparkPrep check before you upload anywhere."
+  }
+ ]
+}
