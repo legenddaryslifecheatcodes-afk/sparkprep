@@ -20,13 +20,16 @@ TRIM_SIZES = {
 # 8/18/23): Groundwood 38# = 400, Creme 50# = 444, White 50# = 512, Color/Premium Color White 70# = 377.
 # SparkPrep used to apply one number to every distributor, so an IngramSpark white-paper spine came out
 # ~15% too wide and a groundwood spine ~22% too narrow. Always read it through paper_ppi().
+# KDP's own figures (KDP Help "Create a Paperback Cover", checked 2026-11-26): white and standard color
+# 0.002252"/page (444 PPI), cream 0.0025"/page (400 PPI), premium color 0.002347"/page (426 PPI).
 PAPER_TYPES = {
     "white_50lb": {"label": "50lb White (Standard B&W)", "ppi": 444, "platforms": ["kdp", "ingramspark"],
                    "ppi_by_platform": {"ingramspark": 512}},
     "cream_50lb": {"label": "50lb Cream (Fiction)", "ppi": 434, "platforms": ["kdp", "ingramspark"],
-                   "ppi_by_platform": {"ingramspark": 444}},
+                   "ppi_by_platform": {"ingramspark": 444, "kdp": 400}},
     "white_60lb": {"label": "60lb White (Premium)", "ppi": 400, "platforms": ["ingramspark"]},
-    "color_60lb_standard": {"label": "60lb Color Standard", "ppi": 460, "platforms": ["kdp"]},
+    "color_60lb_standard": {"label": "60lb Color Standard", "ppi": 460, "platforms": ["kdp"],
+                            "ppi_by_platform": {"kdp": 444}},
     "color_60lb_premium": {"label": "60lb Color Premium", "ppi": 426, "platforms": ["kdp", "ingramspark"],
                            "ppi_by_platform": {"ingramspark": 377}},
     "groundwood_38lb": {"label": "38lb Groundwood (Novel)", "ppi": 512, "platforms": ["ingramspark"],
