@@ -83,6 +83,16 @@ def test_ingramspark_paper_thickness_comes_from_its_official_sheet(client):
     assert spine("kdp", "white_50lb") == round(200 / 444, 4)               # KDP unchanged
 
 
+def test_kdp_paper_thickness_comes_from_kdps_own_formula(client):
+    def spine(paper, pages=200):
+        return client.post("/api/specs/spine", json={"page_count": pages, "paper_type": paper, "platform": "kdp",
+                                                     "binding": "paperback", "trim_size": "6x9"}).json()["spine_width"]
+    assert spine("white_50lb") == round(200 / 444, 4)            # 0.002252" per page
+    assert spine("cream_50lb") == round(200 * 0.0025, 4)         # 0.0025" per page = 0.5" for 200 pages
+    assert spine("color_60lb_standard") == round(200 / 444, 4)   # standard color = 0.002252" per page
+    assert spine("color_60lb_premium") == round(200 / 426, 4)    # 0.002347" per page
+
+
 def test_page_count_comes_from_the_interior_and_the_cover_is_rechecked(client):
     pid = project(client)
     right_for_200 = 12 + 0.25 + 200 / 512                                  # sized for the default 200 pages
