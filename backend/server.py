@@ -75,6 +75,7 @@ import author_studio
 import open_house
 import traffic
 import site_insights
+import work_line
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -2755,7 +2756,8 @@ async def start_export_job(project_id: str, user: dict = Depends(get_current_use
 
     async def run():
         try:
-            job["result"] = await _export_project_core(project_id, user)
+            async with work_line.export_turn(job_id):       # waits its turn if other books are exporting
+                job["result"] = await _export_project_core(project_id, user)
             job["status"] = "done"
         except HTTPException as e:
             job.update(status="error", status_code=e.status_code, detail=e.detail)
@@ -2775,6 +2777,10 @@ async def export_job_status(job_id: str, user: dict = Depends(get_current_user))
     if not job or job["user_id"] != user["id"]:
         raise HTTPException(404, "That export isn't running any more -- please press Export again.")
     out = {"status": job["status"], "seconds": round(time.time() - job["started"])}
+    place = work_line.in_line(job_id) if job["status"] == "running" else None
+    if place:
+        out.update(in_line=True, line_position=place,
+                   message=f"Lots of authors are exporting right now. Yours is number {place} in line and starts by itself.")
     if job["status"] == "done":
         out["result"] = job["result"]
     elif job["status"] == "error":
@@ -6697,6 +6703,10 @@ async def start_nightly_backups():
 app.include_router(api_router)
 
 app.add_middleware(RequestTimeoutMiddleware)
+
+# The book-work line (owner, 2026-11-27): only 3 heavy book jobs at once so a rush can't run the server out of
+# memory; the rest wait their turn. Inside CORS so a "you're in line" answer still reaches the browser. work_line.py
+app.add_middleware(work_line.BookWorkLine)
 
 app.add_middleware(
     CORSMiddleware,
