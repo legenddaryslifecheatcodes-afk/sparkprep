@@ -74,6 +74,7 @@ import book_pass
 import author_studio
 import open_house
 import traffic
+import site_insights
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -6532,6 +6533,20 @@ api_router.include_router(author_studio.build_router(db=db, get_current_user=get
                                                      data_dir=DATA_DIR, is_admin=is_admin_user))
 # Site traffic tracker: POST /api/pv (public beacon from /track.js), GET /api/admin/traffic (owner only).
 api_router.include_router(traffic.build_router(db=db, require_admin=require_admin, client_ip=_client_ip))
+
+
+# Site Insights (owner's ask, 2026-11-27): funnel steps, trouble visitors hit, what's working.
+# POST /api/trouble (public beacon from /track.js), GET /api/admin/insights (owner only). See site_insights.py.
+async def _insights_paid_count(start_day: str) -> int:
+    n = 0
+    async for t in db.payment_transactions.find({"payment_status": "paid"}):
+        if str(t.get("paid_at") or t.get("updated_at") or t.get("created_at") or "")[:10] >= start_day:
+            n += 1
+    return n
+
+
+_insights_record = site_insights.install_routes(api_router, db=db, require_admin=require_admin,
+                                                client_ip=_client_ip, paid_counter=_insights_paid_count)
 # ---- Database backups (owner's rule, 2026-09-29: no lockout or accident can ever cost SparkPrep its customers)
 # Every collection, exported to one gzip'd JSON file (Mongo-exact types via bson.json_util, so a restore brings
 # back real ObjectIds and dates). Nightly copies stay on the server (last BACKUP_KEEP); the admin page's
@@ -6697,6 +6712,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Outermost, so it sees every /api answer (timeouts included). It only watches; it never changes a response.
+app.add_middleware(site_insights.InsightsMiddleware, recorder=_insights_record)
+
 
 @app.on_event("startup")
 async def on_startup():
@@ -6711,6 +6729,7 @@ async def on_startup():
     await db.beta_feedback.create_index("user_id")
     await db.leads.create_index("email")
     await db.pageviews.create_index("day")
+    await site_insights.ensure_indexes(db)
 
     # Seed admin account if configured and missing
     if ADMIN_EMAIL:
