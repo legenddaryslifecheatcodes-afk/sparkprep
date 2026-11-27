@@ -68,6 +68,16 @@ def test_watcher_records_and_owner_only(monkeypatch):
                                             "exports_this_month": 0, "books_this_month": 0}))
     monkeypatch.setattr(server, "ADMIN_EMAIL", ADMIN)
     person = {"x-forwarded-for": "10.9.9.9", "user-agent": CHROME}
+    before_views = list(server.db.pageviews._docs)
+    try:
+        _watcher_flow(person)
+    finally:   # leave the shared in-memory database as we found it, so other tests' counts aren't changed
+        server.db.pageviews._docs[:] = before_views
+        server.db.site_steps._docs[:] = []
+        server.db.site_trouble._docs[:] = []
+
+
+def _watcher_flow(person):
     with TestClient(server.app) as c:
         c.post("/api/pv", content=json.dumps({"p": "/register", "r": "https://www.tiktok.com/"}),
                headers={**person, "content-type": "text/plain"})
