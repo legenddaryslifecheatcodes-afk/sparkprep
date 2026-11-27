@@ -69,6 +69,8 @@ def test_watcher_records_and_owner_only(monkeypatch):
     monkeypatch.setattr(server, "ADMIN_EMAIL", ADMIN)
     person = {"x-forwarded-for": "10.9.9.9", "user-agent": CHROME}
     before_views = list(server.db.pageviews._docs)
+    server.db.site_steps._docs[:] = []      # earlier tests in the same run also make requests
+    server.db.site_trouble._docs[:] = []
     try:
         _watcher_flow(person)
     finally:   # leave the shared in-memory database as we found it, so other tests' counts aren't changed
