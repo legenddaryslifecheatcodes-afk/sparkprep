@@ -16,6 +16,8 @@ import os
 import re
 from contextlib import asynccontextmanager
 
+import memory_release
+
 BOOK_WORK_SLOTS = int(os.environ.get("BOOK_WORK_SLOTS", "3"))
 EXPORT_SLOTS = int(os.environ.get("EXPORT_SLOTS", "1"))
 REQUEST_WAIT_S = float(os.environ.get("BOOK_WORK_WAIT_S", "20"))
@@ -80,6 +82,16 @@ async def export_turn(job_id: str):
             st["work"].release()
     finally:
         st["export"].release()
+        await _hand_back_memory()
+
+
+async def _hand_back_memory():
+    """After a heavy job: give its leftover memory back to the server (memory_release.py). Runs after the answer
+    has already gone to the customer, off the main loop, and can never fail their request."""
+    try:
+        await asyncio.to_thread(memory_release.release)
+    except Exception:
+        pass
 
 
 class BookWorkLine:
@@ -112,3 +124,4 @@ class BookWorkLine:
             await self.app(scope, receive, send)
         finally:
             st["work"].release()
+            await _hand_back_memory()
