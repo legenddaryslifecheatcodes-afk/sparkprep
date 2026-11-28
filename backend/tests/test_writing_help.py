@@ -107,9 +107,16 @@ def test_needs_login(client):
     assert client.post("/api/ai/writing-help", json={"mode": "spelling", "paragraphs": PARAS}).status_code == 401
 
 
-def test_included_with_a_book_not_free(client):
+def test_free_account_needs_book_editor_credits(client):
+    """Owner's plan (2026-11-27): writing help costs 1 credit per 1,000 characters; out of credits -> join prompt."""
+    import ai_credits
+    uid = str(asyncio.run(server.db.users.find_one({"email": FREE}))["_id"])
+    asyncio.run(server.db.ai_credits.insert_one({"user_id": uid, "pool": "writing", "period": ai_credits.period(),
+                                                 "welcome_used": 50, "month_used": 10}))
     r = client.post("/api/ai/writing-help", json={"mode": "spelling", "paragraphs": PARAS}, headers=login(client, FREE))
     assert r.status_code == 402
+    assert r.json()["detail"]["code"] == "out_of_credits" and "book editor" in r.json()["detail"]["msg"]
+    assert ai_credits.writing_cost(999) == 1 and ai_credits.writing_cost(1001) == 2 and ai_credits.writing_cost(0) == 1
 
 
 def test_returns_checked_suggestions(client, monkeypatch):

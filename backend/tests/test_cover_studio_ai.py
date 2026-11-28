@@ -57,9 +57,39 @@ def test_plan_needs_login(client):
     assert client.post("/api/ai/cover-plan", json=plan_body()).status_code == 401
 
 
-def test_plan_is_included_with_a_book_not_free(client):
-    r = client.post("/api/ai/cover-plan", json=plan_body(), headers=login(client, FREE))
+def _free_id():
+    return str(asyncio.run(server.db.users.find_one({"email": FREE}))["_id"])
+
+
+def _set_cover_credits_used(welcome_used, month_used):
+    import ai_credits
+    uid = _free_id()
+    server.db.ai_credits._docs[:] = [d for d in server.db.ai_credits._docs if d.get("user_id") != uid]
+    asyncio.run(server.db.ai_credits.insert_one({"user_id": uid, "pool": "cover", "period": ai_credits.period(),
+                                                 "welcome_used": welcome_used, "month_used": month_used}))
+
+
+def test_free_account_spends_cover_credits_then_is_asked_to_join(client, monkeypatch):
+    """Owner's plan (2026-11-27): free accounts get 50 cover credits to start plus 10 a month; a plan costs 5."""
+    async def fake(prompt, max_tokens=1200):
+        return {"layout": "classic", "style": "gold", "subtitle": "", "tagline": "", "blurb": "", "art_prompt": ""}
+    monkeypatch.setattr(server, "_claude_json", fake)
+    _set_cover_credits_used(0, 0)
+    hdr = login(client, FREE)
+    assert client.get("/api/ai/credits", headers=hdr).json()["pools"]["cover"]["left"] == 60
+    r = client.post("/api/ai/cover-plan", json=plan_body(), headers=hdr)
+    assert r.status_code == 200, r.text
+    assert r.json()["credits_left"] == 55
+    _set_cover_credits_used(50, 8)                       # 2 credits left, a plan needs 5
+    r = client.post("/api/ai/cover-plan", json=plan_body(), headers=hdr)
     assert r.status_code == 402
+    d = r.json()["detail"]
+    assert d["code"] == "out_of_credits" and "$9.99/month membership" in d["msg"] and "500 credits" in d["msg"]
+
+
+def test_credit_balance_signed_out_offers_free_credits(client):
+    d = client.get("/api/ai/credits").json()
+    assert d["signed_in"] is False and d["offer"]["free_welcome"] == 50 and d["offer"]["member_monthly"] == 500
 
 
 def test_plan_returns_only_layouts_and_styles_that_exist(client, monkeypatch):
@@ -113,9 +143,10 @@ def test_art_is_wide_for_a_full_wrap_and_has_no_lettering(client, monkeypatch):
     assert Image.open(io.BytesIO(base64.b64decode(d["image_b64"]))).size == (1536, 1024)
 
 
-def test_art_is_included_with_a_book_not_free(client):
+def test_art_needs_25_cover_credits(client):
+    _set_cover_credits_used(50, 0)                       # 10 left this month, artwork needs 25
     r = client.post("/api/ai/cover-art", json={"prompt": "x"}, headers=login(client, FREE))
-    assert r.status_code == 402
+    assert r.status_code == 402 and r.json()["detail"]["needed"] == 25
 
 
 def test_spine_calc_gives_the_studio_its_guide_numbers(client):
