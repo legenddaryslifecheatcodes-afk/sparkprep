@@ -58,6 +58,7 @@ from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
 from report_export import generate_audit_brief_pdf, generate_preflight_report_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
 from failure_log import log_failure
+import file_retention
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
 import interior_studio
 import writing_help
@@ -1253,7 +1254,22 @@ async def _present_project(p: dict, user: dict) -> dict:
     pd = await _present_project_inner(p, user)
     pd["cover_refit"] = _cover_refit(p)
     pd["has_cover_design"] = _cover_design_path(str(p["_id"])).exists()
+    pd["files_erased_at"] = p.get("files_erased_at")
+    pd["files_kept_until"] = await _files_kept_until(p)
     return pd
+
+
+async def _files_kept_until(p: dict) -> Optional[str]:
+    """When this book's files will be erased (7-day rule, file_retention.py), for the Editor to show."""
+    pid = str(p["_id"])
+    paths = await asyncio.to_thread(_project_paths, pid, p)
+    start = file_retention.clock_start(file_retention.file_time(x) for x in paths)
+    w = await book_pass.entitlements.project_window(db, p.get("user_id") or "", pid)
+    parse = book_pass.entitlements.parse
+    guards = [d for d in (parse(w["window_ends_at"]) if w else None,
+                          parse(p.get("keep_files_until")) if isinstance(p.get("keep_files_until"), str) else None) if d]
+    due = file_retention.erase_at(start, max(guards) if guards else None)
+    return due.isoformat() if due else None
 
 
 async def _present_project_inner(p: dict, user: dict) -> dict:
@@ -2863,6 +2879,8 @@ async def _owned_export_path(project_id: str, export_name: str, request: Request
         raise HTTPException(403, "Forbidden")
     fp = EXPORT_DIR / export_name
     if not fp.exists():
+        if project.get("files_erased_at"):
+            raise HTTPException(410, "This file was erased 7 days after upload, as SparkPrep's 7-day rule says.")
         raise HTTPException(404, "Export not found")
     return fp
 
@@ -2888,6 +2906,8 @@ async def download_export(project_id: str, export_name: str, request: Request):
         raise HTTPException(403, "Forbidden")
     fp = EXPORT_DIR / export_name
     if not fp.exists():
+        if project.get("files_erased_at"):
+            raise HTTPException(410, "This file was erased 7 days after upload, as SparkPrep's 7-day rule says.")
         raise HTTPException(404, "Export not found")
     # A combined (cover + interior) project's export is a .zip bundling both
     # PDFs -- everything else is still a single .pdf, same as before.
@@ -6750,6 +6770,126 @@ async def start_open_house_cleanup():
     if client is None:
         return
     task = asyncio.create_task(_open_house_cleanup_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+# ---- The 7-day file erase (owner, 2026-11-27). Rules and reasons: file_retention.py ----
+FILE_RETENTION_ID = "file_retention"
+FILE_RETENTION_EVERY_S = 60 * 60
+
+
+def _project_paths(project_id: str, p: dict) -> set:
+    """Every file on disk that belongs to this project (same set _delete_project_files removes)."""
+    names = set()
+    for meta in list((p.get("slots") or {}).values()) + [p.get("file_metadata") or {}]:
+        for key in ("stored_filename", "original_stored_filename", "raw_manuscript_stored_filename"):
+            if isinstance(meta, dict) and meta.get(key):
+                names.add(Path(meta[key]).name)
+    if p.get("uploaded_file"):
+        names.add(Path(p["uploaded_file"]).name)
+    paths = {UPLOAD_DIR / n for n in names}
+    for folder in (UPLOAD_DIR, EXPORT_DIR):
+        paths.update(folder.glob(f"{project_id}_*"))
+    mdir = UPLOAD_DIR / project_id / "manuscript_images"
+    if mdir.is_dir():
+        paths.update(x for x in mdir.rglob("*") if x.is_file())
+    return {x for x in paths if x.is_file() and not file_retention.kept_anyway(x)}
+
+
+def _audit_paths(audit_id: str) -> set:
+    if not re.fullmatch(r"[0-9a-f]{32}", audit_id or ""):
+        return set()
+    paths = {*UPLOAD_DIR.glob(f"audit_{audit_id}_*"), *UPLOAD_DIR.glob(f"{audit_id}_tmpl_*"),
+             EXPORT_DIR / f"{audit_id}_report.pdf"}
+    return {x for x in paths if x.is_file()}
+
+
+def _erase(paths) -> int:
+    removed = 0
+    for x in paths:
+        try:
+            x.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+async def run_file_retention(now: Optional[datetime] = None) -> dict:
+    """Erases every book's files 7 days after its first upload, every free check's files 7 days after the
+    check, and any other leftover file in uploads/exports 7 days after it was written. See file_retention.py."""
+    now = now or datetime.now(timezone.utc)
+    parse = book_pass.entitlements.parse
+    still_kept: set = set()
+    books = audits = files = 0
+    async for p in db.projects.find({}):
+        pid = str(p["_id"])
+        paths = await asyncio.to_thread(_project_paths, pid, p)
+        if not paths:
+            continue
+        start = file_retention.clock_start(file_retention.file_time(x) for x in paths)
+        w = await book_pass.entitlements.project_window(db, p.get("user_id") or "", pid, now)
+        guards = [d for d in (parse(w["window_ends_at"]) if w else None,
+                              parse(p.get("keep_files_until")) if isinstance(p.get("keep_files_until"), str) else None)
+                  if d]
+        if not file_retention.is_due(start, now, max(guards) if guards else None):
+            still_kept |= paths
+            continue
+        files += await asyncio.to_thread(_erase, paths)
+        await db.projects.update_one({"_id": p["_id"]}, {
+            "$set": {"slots": {}, "uploaded_file": None, "file_metadata": None, "compliance": [],
+                     "files_erased_at": now.isoformat(), "updated_at": now.isoformat()}})
+        books += 1
+    async for a in db.audits.find({}):
+        if a.get("files_deleted_at"):
+            continue
+        aid = a.get("audit_id") or ""
+        paths = await asyncio.to_thread(_audit_paths, aid)
+        made = parse(a.get("created_at")) if isinstance(a.get("created_at"), str) else None
+        start = file_retention.clock_start([made] if made else (file_retention.file_time(x) for x in paths))
+        if a.get("source") == "editor" or not file_retention.is_due(start, now):
+            still_kept |= paths
+            continue
+        files += await asyncio.to_thread(_erase, paths)
+        await db.audits.update_one({"audit_id": aid}, {"$set": {"files_deleted_at": now.isoformat()}})
+        audits += 1
+
+    def sweep_leftovers() -> int:
+        removed = 0
+        for folder in (UPLOAD_DIR, EXPORT_DIR):
+            for x in folder.rglob("*"):
+                if not x.is_file() or x in still_kept or file_retention.kept_anyway(x):
+                    continue
+                if file_retention.is_due(file_retention.clock_start([file_retention.file_time(x)]), now):
+                    removed += _erase([x])
+        return removed
+    leftovers = await asyncio.to_thread(sweep_leftovers)
+    result = {"ran_at": now.isoformat(), "books": books, "free_checks": audits,
+              "files": files + leftovers, "leftover_files": leftovers}
+    if await db.settings.find_one({"_id": FILE_RETENTION_ID}):
+        await db.settings.update_one({"_id": FILE_RETENTION_ID}, {"$set": result})
+    else:
+        await db.settings.insert_one({"_id": FILE_RETENTION_ID, **result})
+    if result["files"]:
+        logger.info("7-day file erase: %s", result)
+    return result
+
+
+async def _file_retention_loop():
+    while True:
+        try:
+            await run_file_retention()
+        except Exception as e:                      # a failed erase must never take the site down
+            await log_failure(db, "file_retention", e)
+        await asyncio.sleep(FILE_RETENTION_EVERY_S)
+
+
+@app.on_event("startup")
+async def start_file_retention():
+    if client is None:
+        return
+    task = asyncio.create_task(_file_retention_loop())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
