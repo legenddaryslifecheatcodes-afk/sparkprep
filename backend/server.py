@@ -58,6 +58,7 @@ from ghostscript_engine import convert_to_pdfx1a, find_ghostscript
 from report_export import generate_audit_brief_pdf, generate_preflight_report_pdf
 from docx_reader import extract_manuscript_text, extract_embedded_images
 from failure_log import log_failure
+import file_retention
 from barcode_engine import normalize_isbn, generate_barcode_png_bytes
 import interior_studio
 import writing_help
@@ -76,6 +77,7 @@ import open_house
 import traffic
 import site_insights
 import work_line
+import ai_credits
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -1252,7 +1254,22 @@ async def _present_project(p: dict, user: dict) -> dict:
     pd = await _present_project_inner(p, user)
     pd["cover_refit"] = _cover_refit(p)
     pd["has_cover_design"] = _cover_design_path(str(p["_id"])).exists()
+    pd["files_erased_at"] = p.get("files_erased_at")
+    pd["files_kept_until"] = await _files_kept_until(p)
     return pd
+
+
+async def _files_kept_until(p: dict) -> Optional[str]:
+    """When this book's files will be erased (7-day rule, file_retention.py), for the Editor to show."""
+    pid = str(p["_id"])
+    paths = await asyncio.to_thread(_project_paths, pid, p)
+    start = file_retention.clock_start(file_retention.file_time(x) for x in paths)
+    w = await book_pass.entitlements.project_window(db, p.get("user_id") or "", pid)
+    parse = book_pass.entitlements.parse
+    guards = [d for d in (parse(w["window_ends_at"]) if w else None,
+                          parse(p.get("keep_files_until")) if isinstance(p.get("keep_files_until"), str) else None) if d]
+    due = file_retention.erase_at(start, max(guards) if guards else None)
+    return due.isoformat() if due else None
 
 
 async def _present_project_inner(p: dict, user: dict) -> dict:
@@ -2862,6 +2879,8 @@ async def _owned_export_path(project_id: str, export_name: str, request: Request
         raise HTTPException(403, "Forbidden")
     fp = EXPORT_DIR / export_name
     if not fp.exists():
+        if project.get("files_erased_at"):
+            raise HTTPException(410, "This file was erased 7 days after upload, as SparkPrep's 7-day rule says.")
         raise HTTPException(404, "Export not found")
     return fp
 
@@ -2887,6 +2906,8 @@ async def download_export(project_id: str, export_name: str, request: Request):
         raise HTTPException(403, "Forbidden")
     fp = EXPORT_DIR / export_name
     if not fp.exists():
+        if project.get("files_erased_at"):
+            raise HTTPException(410, "This file was erased 7 days after upload, as SparkPrep's 7-day rule says.")
         raise HTTPException(404, "Export not found")
     # A combined (cover + interior) project's export is a .zip bundling both
     # PDFs -- everything else is still a single .pdf, same as before.
@@ -4957,10 +4978,63 @@ class CoverArtIn(BaseModel):
     height_in: float = 9.25
 
 
-async def _require_ai_access(user: dict, feature: str):
+async def _require_ai_access(user: dict, feature: str, chars: int = 0) -> dict:
+    """AI credits (owner's plan, 2026-11-27, see ai_credits.py). Customers with a book in progress, admins and beta
+    testers stay unlimited as before; everyone else spends credits: free accounts get 50 per editor to start plus 10
+    a month, members 500 a month. Checks only; _charge_ai() takes the credits after the AI call worked."""
     billing_user = await get_billing_user(user)
-    if billing_user.get("tier", "free") == "free":
-        raise HTTPException(402, _paid_msg(f"{feature} requires the Author plan or higher.", feature))
+    pool, cost = ai_credits.cost_of(feature, chars)
+    gate = {"feature": feature, "pool": pool, "billing_id": billing_user["id"], "unlimited": False, "member": False}
+    if billing_user.get("tier", "free") != "free":
+        gate["unlimited"] = True
+        return gate
+    gate["member"] = await book_pass.entitlements.is_member(db, billing_user["id"])
+    await _check_ai_cost(gate, cost)
+    return gate
+
+
+async def _check_ai_cost(gate: dict, cost: int) -> None:
+    if gate["unlimited"]:
+        return
+    bal = await ai_credits.balance(db, gate["billing_id"], gate["pool"], member=gate["member"])
+    if bal["left"] < cost:
+        join = f"${book_pass.config.PLANS[book_pass.config.MEMBERSHIP_PLAN]['price_cents'] / 100:.2f}"
+        raise HTTPException(402, {"msg": ai_credits.out_of_credits_message(gate["pool"], member=gate["member"], join_price=join),
+                                  "code": "out_of_credits", "pool": gate["pool"], "member": gate["member"],
+                                  "left": bal["left"], "needed": cost})
+
+
+async def _charge_ai(gate: dict, chars: int = 0):
+    """Takes the credits for a use that worked. Returns credits left in that pool (None when unlimited)."""
+    if gate["unlimited"]:
+        return None
+    _, cost = ai_credits.cost_of(gate["feature"], chars)
+    try:
+        return (await ai_credits.spend(db, gate["billing_id"], gate["pool"], cost, member=gate["member"]))["left"]
+    except Exception as e:  # noqa: BLE001 - a counting hiccup must never lose the customer's finished result
+        logger.warning("AI credit charge failed: %r", e)
+        return None
+
+
+@api_router.get("/ai/credits")
+async def ai_credit_balance(request: Request):
+    """What the editors show: credits left in each pool. Works signed out too (then: sign up for free credits)."""
+    costs = {"cover_plan": ai_credits.FEATURES["AI Cover Designer"][1], "cover_art": ai_credits.FEATURES["AI Cover Art"][1],
+             "writing_per_1000_chars": 1}
+    offer = {"free_welcome": ai_credits.FREE_WELCOME, "free_monthly": ai_credits.FREE_MONTHLY,
+             "member_monthly": ai_credits.MEMBER_MONTHLY,
+             "member_price_cents": book_pass.config.PLANS[book_pass.config.MEMBERSHIP_PLAN]["price_cents"]}
+    try:
+        user = await get_current_user(request)
+    except HTTPException:
+        return {"signed_in": False, "costs": costs, "offer": offer}
+    billing_user = await get_billing_user(user)
+    if billing_user.get("tier", "free") != "free":
+        return {"signed_in": True, "unlimited": True, "costs": costs, "offer": offer}
+    member = await book_pass.entitlements.is_member(db, billing_user["id"])
+    pools = {pool: await ai_credits.balance(db, billing_user["id"], pool, member=member) for pool in ai_credits.POOLS}
+    return {"signed_in": True, "unlimited": False, "member": member, "pools": pools, "costs": costs, "offer": offer,
+            "refills_at": ai_credits.next_period_start()}
 
 
 async def _claude_json(prompt: str, max_tokens: int = 1200, who: str = "the AI designer") -> dict:
@@ -4995,7 +5069,7 @@ async def _claude_json(prompt: str, max_tokens: int = 1200, who: str = "the AI d
 
 @api_router.post("/ai/cover-plan")
 async def ai_cover_plan(payload: CoverPlanIn, user: dict = Depends(get_current_user)):
-    await _require_ai_access(user, "AI Cover Designer")
+    gate = await _require_ai_access(user, "AI Cover Designer")
     if not ANTHROPIC_API_KEY:
         raise HTTPException(503, "The AI Cover Designer isn't configured yet — add ANTHROPIC_API_KEY to backend/.env")
     if not payload.title.strip():
@@ -5040,7 +5114,9 @@ async def ai_cover_plan(payload: CoverPlanIn, user: dict = Depends(get_current_u
         '{"layout": "...", "style": "...", "subtitle": "...", "tagline": "...", "blurb": "...", "art_prompt": "..."}'
     )
     plan = await _claude_json(prompt)
+    credits_left = await _charge_ai(gate)
     return {
+        "credits_left": credits_left,
         "layout": plan.get("layout") if plan.get("layout") in layouts else layouts[0],
         "style": plan.get("style") if plan.get("style") in styles else styles[0],
         "subtitle": str(plan.get("subtitle") or "")[:200],
@@ -5052,7 +5128,7 @@ async def ai_cover_plan(payload: CoverPlanIn, user: dict = Depends(get_current_u
 
 @api_router.post("/ai/cover-art")
 async def ai_cover_art(payload: CoverArtIn, user: dict = Depends(get_current_user)):
-    await _require_ai_access(user, "AI Cover Art")
+    gate = await _require_ai_access(user, "AI Cover Art")
     if not OPENAI_API_KEY:
         raise HTTPException(503, "AI Cover Art isn't configured yet — add OPENAI_API_KEY to backend/.env")
     if not payload.prompt.strip():
@@ -5069,7 +5145,9 @@ async def ai_cover_art(payload: CoverArtIn, user: dict = Depends(get_current_use
     from PIL import Image
     with Image.open(io.BytesIO(image_bytes)) as art:
         w, h = art.size
-    return {"image_b64": base64.b64encode(image_bytes).decode("ascii"), "mime": "image/png", "width_px": w, "height_px": h}
+    credits_left = await _charge_ai(gate)
+    return {"image_b64": base64.b64encode(image_bytes).decode("ascii"), "mime": "image/png", "width_px": w, "height_px": h,
+            "credits_left": credits_left}
 
 
 # ---- Interior Studio AI Writing Help ----
@@ -5104,7 +5182,7 @@ async def _spend_writing_allowance(user: dict, n: int) -> int:
 
 @api_router.post("/ai/writing-help")
 async def ai_writing_help(payload: WritingHelpIn, user: dict = Depends(get_current_user)):
-    await _require_ai_access(user, "AI Writing Help")
+    gate = await _require_ai_access(user, "AI Writing Help")
     if not ANTHROPIC_API_KEY:
         raise HTTPException(503, "AI Writing Help isn't configured yet — add ANTHROPIC_API_KEY to backend/.env")
     if payload.mode not in writing_help.MODES:
@@ -5112,14 +5190,19 @@ async def ai_writing_help(payload: WritingHelpIn, user: dict = Depends(get_curre
     paragraphs = writing_help.clean_paragraphs([p.model_dump() for p in payload.paragraphs])
     if not paragraphs:
         raise HTTPException(400, "There's no writing here to check yet.")
-    left = await _spend_writing_allowance(user, writing_help.chars(paragraphs))
+    n_chars = writing_help.chars(paragraphs)
+    await _check_ai_cost(gate, ai_credits.writing_cost(n_chars))
+    left = await _spend_writing_allowance(user, n_chars)
     prompt = writing_help.build_prompt(payload.mode, paragraphs, payload.genre, payload.title)
     raw = await _claude_json(prompt, max_tokens=4000, who="the AI writing helper")
+    suggestions = writing_help.clean_suggestions(raw, paragraphs)
+    credits_left = await _charge_ai(gate, n_chars)
     return {
         "mode": payload.mode,
         "checked": [p["id"] for p in paragraphs],
-        "suggestions": writing_help.clean_suggestions(raw, paragraphs),
+        "suggestions": suggestions,
         "allowance_left": left,
+        "credits_left": credits_left,
     }
 
 
@@ -6687,6 +6770,126 @@ async def start_open_house_cleanup():
     if client is None:
         return
     task = asyncio.create_task(_open_house_cleanup_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+# ---- The 7-day file erase (owner, 2026-11-27). Rules and reasons: file_retention.py ----
+FILE_RETENTION_ID = "file_retention"
+FILE_RETENTION_EVERY_S = 60 * 60
+
+
+def _project_paths(project_id: str, p: dict) -> set:
+    """Every file on disk that belongs to this project (same set _delete_project_files removes)."""
+    names = set()
+    for meta in list((p.get("slots") or {}).values()) + [p.get("file_metadata") or {}]:
+        for key in ("stored_filename", "original_stored_filename", "raw_manuscript_stored_filename"):
+            if isinstance(meta, dict) and meta.get(key):
+                names.add(Path(meta[key]).name)
+    if p.get("uploaded_file"):
+        names.add(Path(p["uploaded_file"]).name)
+    paths = {UPLOAD_DIR / n for n in names}
+    for folder in (UPLOAD_DIR, EXPORT_DIR):
+        paths.update(folder.glob(f"{project_id}_*"))
+    mdir = UPLOAD_DIR / project_id / "manuscript_images"
+    if mdir.is_dir():
+        paths.update(x for x in mdir.rglob("*") if x.is_file())
+    return {x for x in paths if x.is_file() and not file_retention.kept_anyway(x)}
+
+
+def _audit_paths(audit_id: str) -> set:
+    if not re.fullmatch(r"[0-9a-f]{32}", audit_id or ""):
+        return set()
+    paths = {*UPLOAD_DIR.glob(f"audit_{audit_id}_*"), *UPLOAD_DIR.glob(f"{audit_id}_tmpl_*"),
+             EXPORT_DIR / f"{audit_id}_report.pdf"}
+    return {x for x in paths if x.is_file()}
+
+
+def _erase(paths) -> int:
+    removed = 0
+    for x in paths:
+        try:
+            x.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+async def run_file_retention(now: Optional[datetime] = None) -> dict:
+    """Erases every book's files 7 days after its first upload, every free check's files 7 days after the
+    check, and any other leftover file in uploads/exports 7 days after it was written. See file_retention.py."""
+    now = now or datetime.now(timezone.utc)
+    parse = book_pass.entitlements.parse
+    still_kept: set = set()
+    books = audits = files = 0
+    async for p in db.projects.find({}):
+        pid = str(p["_id"])
+        paths = await asyncio.to_thread(_project_paths, pid, p)
+        if not paths:
+            continue
+        start = file_retention.clock_start(file_retention.file_time(x) for x in paths)
+        w = await book_pass.entitlements.project_window(db, p.get("user_id") or "", pid, now)
+        guards = [d for d in (parse(w["window_ends_at"]) if w else None,
+                              parse(p.get("keep_files_until")) if isinstance(p.get("keep_files_until"), str) else None)
+                  if d]
+        if not file_retention.is_due(start, now, max(guards) if guards else None):
+            still_kept |= paths
+            continue
+        files += await asyncio.to_thread(_erase, paths)
+        await db.projects.update_one({"_id": p["_id"]}, {
+            "$set": {"slots": {}, "uploaded_file": None, "file_metadata": None, "compliance": [],
+                     "files_erased_at": now.isoformat(), "updated_at": now.isoformat()}})
+        books += 1
+    async for a in db.audits.find({}):
+        if a.get("files_deleted_at"):
+            continue
+        aid = a.get("audit_id") or ""
+        paths = await asyncio.to_thread(_audit_paths, aid)
+        made = parse(a.get("created_at")) if isinstance(a.get("created_at"), str) else None
+        start = file_retention.clock_start([made] if made else (file_retention.file_time(x) for x in paths))
+        if a.get("source") == "editor" or not file_retention.is_due(start, now):
+            still_kept |= paths
+            continue
+        files += await asyncio.to_thread(_erase, paths)
+        await db.audits.update_one({"audit_id": aid}, {"$set": {"files_deleted_at": now.isoformat()}})
+        audits += 1
+
+    def sweep_leftovers() -> int:
+        removed = 0
+        for folder in (UPLOAD_DIR, EXPORT_DIR):
+            for x in folder.rglob("*"):
+                if not x.is_file() or x in still_kept or file_retention.kept_anyway(x):
+                    continue
+                if file_retention.is_due(file_retention.clock_start([file_retention.file_time(x)]), now):
+                    removed += _erase([x])
+        return removed
+    leftovers = await asyncio.to_thread(sweep_leftovers)
+    result = {"ran_at": now.isoformat(), "books": books, "free_checks": audits,
+              "files": files + leftovers, "leftover_files": leftovers}
+    if await db.settings.find_one({"_id": FILE_RETENTION_ID}):
+        await db.settings.update_one({"_id": FILE_RETENTION_ID}, {"$set": result})
+    else:
+        await db.settings.insert_one({"_id": FILE_RETENTION_ID, **result})
+    if result["files"]:
+        logger.info("7-day file erase: %s", result)
+    return result
+
+
+async def _file_retention_loop():
+    while True:
+        try:
+            await run_file_retention()
+        except Exception as e:                      # a failed erase must never take the site down
+            await log_failure(db, "file_retention", e)
+        await asyncio.sleep(FILE_RETENTION_EVERY_S)
+
+
+@app.on_event("startup")
+async def start_file_retention():
+    if client is None:
+        return
+    task = asyncio.create_task(_file_retention_loop())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
