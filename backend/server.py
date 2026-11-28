@@ -77,6 +77,7 @@ import open_house
 import traffic
 import site_insights
 import work_line
+import ai_credits
 from cover_template_engine import COVER_TEMPLATES, render_cover_template, list_cover_templates
 
 class MemoryCursor:
@@ -4977,10 +4978,63 @@ class CoverArtIn(BaseModel):
     height_in: float = 9.25
 
 
-async def _require_ai_access(user: dict, feature: str):
+async def _require_ai_access(user: dict, feature: str, chars: int = 0) -> dict:
+    """AI credits (owner's plan, 2026-11-27, see ai_credits.py). Customers with a book in progress, admins and beta
+    testers stay unlimited as before; everyone else spends credits: free accounts get 50 per editor to start plus 10
+    a month, members 500 a month. Checks only; _charge_ai() takes the credits after the AI call worked."""
     billing_user = await get_billing_user(user)
-    if billing_user.get("tier", "free") == "free":
-        raise HTTPException(402, _paid_msg(f"{feature} requires the Author plan or higher.", feature))
+    pool, cost = ai_credits.cost_of(feature, chars)
+    gate = {"feature": feature, "pool": pool, "billing_id": billing_user["id"], "unlimited": False, "member": False}
+    if billing_user.get("tier", "free") != "free":
+        gate["unlimited"] = True
+        return gate
+    gate["member"] = await book_pass.entitlements.is_member(db, billing_user["id"])
+    await _check_ai_cost(gate, cost)
+    return gate
+
+
+async def _check_ai_cost(gate: dict, cost: int) -> None:
+    if gate["unlimited"]:
+        return
+    bal = await ai_credits.balance(db, gate["billing_id"], gate["pool"], member=gate["member"])
+    if bal["left"] < cost:
+        join = f"${book_pass.config.PLANS[book_pass.config.MEMBERSHIP_PLAN]['price_cents'] / 100:.2f}"
+        raise HTTPException(402, {"msg": ai_credits.out_of_credits_message(gate["pool"], member=gate["member"], join_price=join),
+                                  "code": "out_of_credits", "pool": gate["pool"], "member": gate["member"],
+                                  "left": bal["left"], "needed": cost})
+
+
+async def _charge_ai(gate: dict, chars: int = 0):
+    """Takes the credits for a use that worked. Returns credits left in that pool (None when unlimited)."""
+    if gate["unlimited"]:
+        return None
+    _, cost = ai_credits.cost_of(gate["feature"], chars)
+    try:
+        return (await ai_credits.spend(db, gate["billing_id"], gate["pool"], cost, member=gate["member"]))["left"]
+    except Exception as e:  # noqa: BLE001 - a counting hiccup must never lose the customer's finished result
+        logger.warning("AI credit charge failed: %r", e)
+        return None
+
+
+@api_router.get("/ai/credits")
+async def ai_credit_balance(request: Request):
+    """What the editors show: credits left in each pool. Works signed out too (then: sign up for free credits)."""
+    costs = {"cover_plan": ai_credits.FEATURES["AI Cover Designer"][1], "cover_art": ai_credits.FEATURES["AI Cover Art"][1],
+             "writing_per_1000_chars": 1}
+    offer = {"free_welcome": ai_credits.FREE_WELCOME, "free_monthly": ai_credits.FREE_MONTHLY,
+             "member_monthly": ai_credits.MEMBER_MONTHLY,
+             "member_price_cents": book_pass.config.PLANS[book_pass.config.MEMBERSHIP_PLAN]["price_cents"]}
+    try:
+        user = await get_current_user(request)
+    except HTTPException:
+        return {"signed_in": False, "costs": costs, "offer": offer}
+    billing_user = await get_billing_user(user)
+    if billing_user.get("tier", "free") != "free":
+        return {"signed_in": True, "unlimited": True, "costs": costs, "offer": offer}
+    member = await book_pass.entitlements.is_member(db, billing_user["id"])
+    pools = {pool: await ai_credits.balance(db, billing_user["id"], pool, member=member) for pool in ai_credits.POOLS}
+    return {"signed_in": True, "unlimited": False, "member": member, "pools": pools, "costs": costs, "offer": offer,
+            "refills_at": ai_credits.next_period_start()}
 
 
 async def _claude_json(prompt: str, max_tokens: int = 1200, who: str = "the AI designer") -> dict:
@@ -5015,7 +5069,7 @@ async def _claude_json(prompt: str, max_tokens: int = 1200, who: str = "the AI d
 
 @api_router.post("/ai/cover-plan")
 async def ai_cover_plan(payload: CoverPlanIn, user: dict = Depends(get_current_user)):
-    await _require_ai_access(user, "AI Cover Designer")
+    gate = await _require_ai_access(user, "AI Cover Designer")
     if not ANTHROPIC_API_KEY:
         raise HTTPException(503, "The AI Cover Designer isn't configured yet — add ANTHROPIC_API_KEY to backend/.env")
     if not payload.title.strip():
@@ -5060,7 +5114,9 @@ async def ai_cover_plan(payload: CoverPlanIn, user: dict = Depends(get_current_u
         '{"layout": "...", "style": "...", "subtitle": "...", "tagline": "...", "blurb": "...", "art_prompt": "..."}'
     )
     plan = await _claude_json(prompt)
+    credits_left = await _charge_ai(gate)
     return {
+        "credits_left": credits_left,
         "layout": plan.get("layout") if plan.get("layout") in layouts else layouts[0],
         "style": plan.get("style") if plan.get("style") in styles else styles[0],
         "subtitle": str(plan.get("subtitle") or "")[:200],
@@ -5072,7 +5128,7 @@ async def ai_cover_plan(payload: CoverPlanIn, user: dict = Depends(get_current_u
 
 @api_router.post("/ai/cover-art")
 async def ai_cover_art(payload: CoverArtIn, user: dict = Depends(get_current_user)):
-    await _require_ai_access(user, "AI Cover Art")
+    gate = await _require_ai_access(user, "AI Cover Art")
     if not OPENAI_API_KEY:
         raise HTTPException(503, "AI Cover Art isn't configured yet — add OPENAI_API_KEY to backend/.env")
     if not payload.prompt.strip():
@@ -5089,7 +5145,9 @@ async def ai_cover_art(payload: CoverArtIn, user: dict = Depends(get_current_use
     from PIL import Image
     with Image.open(io.BytesIO(image_bytes)) as art:
         w, h = art.size
-    return {"image_b64": base64.b64encode(image_bytes).decode("ascii"), "mime": "image/png", "width_px": w, "height_px": h}
+    credits_left = await _charge_ai(gate)
+    return {"image_b64": base64.b64encode(image_bytes).decode("ascii"), "mime": "image/png", "width_px": w, "height_px": h,
+            "credits_left": credits_left}
 
 
 # ---- Interior Studio AI Writing Help ----
@@ -5124,7 +5182,7 @@ async def _spend_writing_allowance(user: dict, n: int) -> int:
 
 @api_router.post("/ai/writing-help")
 async def ai_writing_help(payload: WritingHelpIn, user: dict = Depends(get_current_user)):
-    await _require_ai_access(user, "AI Writing Help")
+    gate = await _require_ai_access(user, "AI Writing Help")
     if not ANTHROPIC_API_KEY:
         raise HTTPException(503, "AI Writing Help isn't configured yet — add ANTHROPIC_API_KEY to backend/.env")
     if payload.mode not in writing_help.MODES:
@@ -5132,14 +5190,19 @@ async def ai_writing_help(payload: WritingHelpIn, user: dict = Depends(get_curre
     paragraphs = writing_help.clean_paragraphs([p.model_dump() for p in payload.paragraphs])
     if not paragraphs:
         raise HTTPException(400, "There's no writing here to check yet.")
-    left = await _spend_writing_allowance(user, writing_help.chars(paragraphs))
+    n_chars = writing_help.chars(paragraphs)
+    await _check_ai_cost(gate, ai_credits.writing_cost(n_chars))
+    left = await _spend_writing_allowance(user, n_chars)
     prompt = writing_help.build_prompt(payload.mode, paragraphs, payload.genre, payload.title)
     raw = await _claude_json(prompt, max_tokens=4000, who="the AI writing helper")
+    suggestions = writing_help.clean_suggestions(raw, paragraphs)
+    credits_left = await _charge_ai(gate, n_chars)
     return {
         "mode": payload.mode,
         "checked": [p["id"] for p in paragraphs],
-        "suggestions": writing_help.clean_suggestions(raw, paragraphs),
+        "suggestions": suggestions,
         "allowance_left": left,
+        "credits_left": credits_left,
     }
 
 
