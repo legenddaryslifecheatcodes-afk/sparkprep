@@ -106,6 +106,9 @@ def generate_audit_brief_pdf(
         story.append(Paragraph(
             f"<b>{brand_name} can fix these issues for you right now</b> — no need to go anywhere else. "
             "Your audit fee is credited toward your SparkPrep book.", body_style))
+    from file_retention import NOTICE
+    story.append(Spacer(1, 0.12 * inch))
+    story.append(Paragraph(f"<b>A friendly reminder:</b> {_esc(NOTICE)}", small_style))
 
     doc.build(story)
     return output_path
@@ -279,6 +282,10 @@ def generate_preflight_report_pdf(cert: dict, repair_log: list, project_meta: di
         f"The printer makes the final acceptance decision. SparkPrep checks files against {platform}'s published "
         "specifications; it does not control printing, trimming or binding. For the best result, order a printed proof.",
         small_style))
+    # Owner, 2026-11-27: a friendly reminder at the bottom of every report that files are kept 7 days only.
+    from file_retention import NOTICE
+    story.append(Spacer(1, 0.1 * inch))
+    story.append(Paragraph(f"<b>A friendly reminder:</b> {_esc(NOTICE)}", small_style))
 
     doc.build(story)
     return output_path
